@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3.3 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
+# Purifica Tu Ambiente CRM — v5.3.4 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -25,6 +25,84 @@ multi-instancia**.
 > Sistema** (solo admin), el vigilante revisa DB y WhatsApp cada 5 min y
 > avisa por **Telegram** cuando algo se rompe o se recupera, y hay respaldo
 > diario automático a las 02:00. Ver "¿Cómo sé si algo se rompió?" más abajo.
+
+## WhatsApp QR: bloqueo de perfil de Chrome + remitentes LID v5.3.4 (2026-11-07)
+
+Dos problemas diagnosticados con el **log real de Railway** (deploy v5.3.3),
+no con suposiciones:
+
+### 1. Causa raíz del "Code: 21": bloqueo de perfil de Chrome, no la versión de puppeteer
+
+El stderr de Chrome en el log dice, literal:
+
+> "The profile appears to be in use by another Chromium process (54) on
+> another computer (600f0cb2d288). Chromium has locked the profile so that
+> it doesn't get corrupted."
+
+Al reemplazar el contenedor, el Chrome viejo muere sin liberar el bloqueo
+(`SingletonLock`) que queda en el volumen (`.wwebjs_auth`) y el Chrome nuevo
+se niega a arrancar. Por eso la v5.3.2 falló al lanzar Chrome y por eso el
+usuario lo "resolvió" borrando la instancia y creando una nueva (perfil
+fresco, sin bloqueo). La v5.3.3 (puppeteer fijado + `--single-process`) no
+era la causa ni la cura: solo cambió la versión del navegador.
+
+Arreglo (v5.3.4, `server.js`, función `clearWaSessionLocks`):
+
+- Antes de crear el `Client`, se borran los archivos de bloqueo
+  (`SingletonLock`, `SingletonSocket`, `SingletonCookie`) del directorio
+  de sesión LocalAuth de esa instancia
+  (`.wwebjs_auth/session-wa-session-<id>/`). Es defensivo (try/catch, si
+  no existe la carpeta no pasa nada) y registra en el log cuando elimina
+  un bloqueo obsoleto.
+- Si el arranque falla de todos modos con "profile appears to be in use",
+  se limpian los bloqueos y se reintenta la inicialización **una sola
+  vez**.
+- Es seguro en este despliegue porque solo hay un contenedor a la vez: un
+  bloqueo presente al arrancar es, por definición, de un Chrome muerto de
+  un contenedor ya reemplazado (el propio Chrome lo delata diciendo "on
+  another computer").
+
+### 2. Los mensajes no llegaban aunque la instancia estaba en 'ready'
+
+El log después del "está listo!" no tiene NI UNA línea "Mensaje recibido".
+Dos causas:
+
+- **Remitentes LID descartados en silencio.** El handler de `message`
+  filtraba `@lid` antes de registrar nada. Cada vez más remitentes
+  escriben con dirección LID (identidad vinculada de WhatsApp), así que
+  sus mensajes se descartaban aunque la instancia estaba lista. Ahora el
+  LID se resuelve con `msg.getContact()`: la librería sustituye el id por
+  el número real cuando WhatsApp Web conoce la correspondencia
+  (`getContactModel` en whatsapp-web.js); si no se puede resolver, el
+  descarte queda registrado en el log. Grupos (`@g.us`) y estados
+  (`@broadcast`) siguen ignorados.
+- **Sin rastro de lo filtrado.** Ahora cada mensaje que entrega WhatsApp
+  Web deja una línea de diagnóstico en el log ANTES de cualquier filtro
+  (`from`, `type`, `hasMedia`, `fromMe`, sin el contenido). Un mensaje
+  filtrado ya no es invisible.
+
+### 3. Hallazgo secundario: el 'authenticated' x5
+
+En el log, "WhatsApp alejo ochoa autenticado" apareció 5 veces en 4 ms
+con UN SOLO cliente. No eran varios clientes ni varias llamadas a
+`initWhatsApp`: es la librería (whatsapp-web.js 1.34.7, `Client.js`), que
+emite `authenticated` en cada cambio de `hasSynced` del socket de
+WhatsApp Web, y la sincronización inicial tras escanear el QR lo dispara
+en ráfaga. El handler ahora solo actúa en la transición a
+'authenticated' (antes dejaba 5 líneas de log y 5 filas en
+`system_events` por cada QR). Además, `initWhatsApp` ahora registra un
+aviso si se la llama cuando ya existe una instancia en memoria.
+
+### Qué comprobar tras desplegar
+
+1. Tras un redespliegue, que NO vuelva el Code 21: el log debe mostrar
+   la restauración automática y "está listo!" sin borrar la instancia ni
+   escanear QR nuevo.
+2. Que un mensaje nuevo de texto (1 a 1) deje la línea "mensaje entrante"
+   y luego "Mensaje recibido" en el log de Railway, y aparezca en
+   **Mensajes**.
+3. Si el remitente escribe con LID, que el log muestre "remitente LID …
+   resuelto al número …".
 
 ## WhatsApp QR: arreglo del fallo de Chrome v5.3.3 (2026-11-07)
 
@@ -1500,6 +1578,32 @@ real y seguro. Lo arriesgado quedó como pendiente documentado abajo.
   `--single-process` queda, por tanto, **sin probar aquí** y es lo primero
   que hay que comprobar tras desplegar (debe salir "QR recibido" y luego
   "WhatsApp pedro está listo!" en el log de Railway).
+
+## Verificación hecha en esta máquina (v5.3.4, 2026-11-07)
+
+- `npx tsc --noEmit` exit 0. `node --check server.js` OK. `npm run build`
+  OK en 13.46 s (solo el aviso habitual de chunk > 500 kB).
+- Arranque sin `DATABASE_URL` (puerto 3164, estilo Railway con `PORT`): <redacted>
+  `GET /` 200, `GET /api/health` 200
+  (`{"ok":true,"version":"5.3.4","db":false,"whatsapp":{"instances":0,"connected":0}}`),
+  `/api/wa/instances` sin token 401, `/server.js` 404. Log limpio (solo el
+  aviso esperado de DATABASE_URL no configurada).
+- Grep: limpieza de `SingletonLock` y manejo de `@lid` presentes en
+  `server.js`; `restoreWhatsAppInstances`, `armReadyWatchdog` y
+  `stopWaInstance` siguen presentes (11 referencias).
+- Prueba aislada de `clearWaSessionLocks` (misma lógica del servidor,
+  carpeta de sesión de prueba): eliminó los 3 archivos de bloqueo
+  (`SingletonLock`, `SingletonSocket`, `SingletonCookie` en raíz y en
+  `Default/`), dejó intacto el resto del perfil (`Preferences`) y con
+  carpeta inexistente devolvió 0 sin lanzar.
+- Hallazgo sobre el 'authenticated' x5: leído el código de
+  whatsapp-web.js 1.34.7 (`Client.js` + `Injected/Utils.js`): el evento
+  se emite en `onAppStateHasSyncedEvent`, que la página dispara en cada
+  cambio de `hasSynced` del socket; la sincronización inicial tras el QR
+  lo dispara en ráfaga. Y la resolución LID está respaldada por la
+  librería: `getContactModel` sustituye el id por `phoneNumber` cuando
+  WhatsApp Web conoce la correspondencia, así que `contact.number` es el
+  teléfono real cuando se puede resolver.
 - Sin probar (honesto): QR real y llegada a `ready` en Railway, mensajes
   reales entrantes/salientes por QR, restauración automática al arrancar
   con la sesión real del volumen, el vigilante de 120 s con su reintento

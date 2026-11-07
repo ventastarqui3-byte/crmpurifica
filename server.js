@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.3';
+const APP_VERSION = '5.3.4';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -428,6 +428,54 @@ function clearWaWatchdog(id) {
   if (t) { clearTimeout(t); if (waClients[id]) waClients[id].readyWatchdog = null; }
 }
 
+// v5.3.4 — Limpieza del bloqueo de perfil de Chrome (SingletonLock).
+// Causa raíz del "Failed to launch the browser process: Code: 21" en
+// producción (log real de Railway, deploy v5.3.3): al reemplazar el
+// contenedor, el Chrome viejo muere sin liberar el bloqueo del perfil y
+// el Chrome nuevo se niega a arrancar con:
+// "The profile appears to be in use by another Chromium process (54) on
+// another computer (600f0cb2d288). Chromium has locked the profile..."
+// NO era la versión de puppeteer. LocalAuth guarda la sesión en
+// .wwebjs_auth/session-wa-session-<id>/ y ese directorio ES el perfil
+// (userDataDir) de Chrome, así que los bloqueos viven ahí. Borrarlos es
+// seguro en este despliegue porque solo hay un contenedor a la vez: un
+// bloqueo presente al arrancar es, por definición, de un Chrome muerto
+// de un contenedor ya reemplazado (el propio Chrome lo delata diciendo
+// "on another computer"). Se llama antes de crear el Client y, si el
+// arranque falla por perfil en uso, una vez más antes de reintentar.
+// Nunca lanza: si la carpeta no existe o no se puede leer, no pasa nada.
+const WA_SESSION_LOCK_FILES = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+function clearWaSessionLocks(id) {
+  let removed = 0;
+  try {
+    const sessionDir = path.resolve('.wwebjs_auth', `session-wa-session-${id}`);
+    const stack = [[sessionDir, 0]];
+    while (stack.length > 0) {
+      const [dir, depth] = stack.pop();
+      if (depth > 3) continue;
+      let entries = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        try {
+          if (entry.isDirectory()) {
+            // Solo se baja a subcarpetas de perfil conocidas; el bloqueo
+            // vive en la raíz del perfil, pero se busca por si acaso.
+            if (entry.name === 'Default' || entry.name.startsWith('Profile ')) stack.push([full, depth + 1]);
+          } else if (WA_SESSION_LOCK_FILES.includes(entry.name)) {
+            fs.unlinkSync(full);
+            removed++;
+          }
+        } catch { /* un archivo que no se deja borrar no bloquea el arranque */ }
+      }
+    }
+  } catch { /* carpeta inexistente o ilegible: no hay nada que limpiar */ }
+  if (removed > 0) {
+    logger.warn(`WhatsApp (${id}): se eliminaron ${removed} archivo(s) de bloqueo de perfil de Chrome obsoletos (SingletonLock) de una sesión anterior.`);
+  }
+  return removed;
+}
+
 // Detiene una instancia: limpia el vigilante, destruye el cliente (con tope
 // de 10 s: un destroy colgado no puede bloquear un reconectar ni dejar un
 // Chrome zombi con la sesión abierta) y borra la entrada de memoria.
@@ -517,7 +565,15 @@ async function restoreWhatsAppInstances() {
 }
 
 const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
-  if (waClients[id]) return;
+  // v5.3.4: si ya existe una instancia en memoria, se ignora la llamada
+  // pero se deja constancia de quién la hizo (el 'authenticated' x5 del
+  // log de producción se investigó y NO era esto: es la librería, que
+  // emite 'authenticated' en cada cambio de hasSynced del socket; ver
+  // el handler de 'authenticated' más abajo).
+  if (waClients[id]) {
+    logger.warn(`initWhatsApp(${id}): ya existe una instancia en memoria (estado: ${waClients[id].status}, canal: ${waClients[id].channel || 'qr'}); se ignora la llamada.`);
+    return;
+  }
   channel = channel === 'meta' ? 'meta' : 'qr';
 
   // Instancia Meta (Cloud API): no hay navegador ni QR que escanear, solo
@@ -541,6 +597,11 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   }
 
   logger.info(`Inicializando WhatsApp para: ${name} (ID: ${id})`);
+
+  // v5.3.4: limpiar bloqueos de perfil obsoletos ANTES de arrancar Chrome
+  // (ver clearWaSessionLocks): sin esto, un SingletonLock heredado del
+  // contenedor anterior hace fallar el lanzamiento con Code: 21.
+  clearWaSessionLocks(id);
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: `wa-session-${id}` }),
@@ -614,6 +675,20 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
 
   client.on('authenticated', () => {
     if (!isCurrent()) return;
+    // v5.3.4 — Hallazgo del log real de producción: 'authenticated' se
+    // registró CINCO veces en 4 ms con UN SOLO cliente. No eran varios
+    // clientes ni varias llamadas a initWhatsApp: es la librería
+    // (whatsapp-web.js 1.34.7, Client.js): el evento se emite en
+    // 'onAppStateHasSyncedEvent', que la página dispara en CADA cambio
+    // de 'hasSynced' del socket de WhatsApp Web, y tras escanear el QR
+    // la sincronización inicial lo dispara en ráfaga. Por eso el handler
+    // solo actúa en la TRANSICIÓN a 'authenticated': si ya estaba en ese
+    // estado, solo refresca lastSeen y no vuelve a registrar nada (antes
+    // dejaba 5 líneas de log y 5 filas en system_events por cada QR).
+    if (waClients[id].status === 'authenticated') {
+      waClients[id].lastSeen = new Date().toISOString();
+      return;
+    }
     logger.info(`WhatsApp ${name} autenticado`);
     waClients[id].status = 'authenticated';
     waClients[id].lastSeen = new Date().toISOString();
@@ -644,16 +719,50 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
 
   client.on('message', async (msg) => {
     if (!isCurrent()) return;
-    // Solo mensajes de texto de chats 1 a 1. Antes solo se filtraban los
-    // grupos (@g.us): los estados (@broadcast) y los LID (@lid) creaban
-    // clientes basura, y los mensajes de imagen/audio (body vacío, type
-    // distinto de 'chat') guardaban mensajes vacíos.
-    if (msg.from.includes('@g.us') || msg.from.includes('@broadcast') || msg.from.includes('@lid')) return;
+    // v5.3.4 — Diagnóstico de entrada: se registra UNA línea ANTES de
+    // cualquier filtro, sin el contenido del mensaje. Antes, un mensaje
+    // filtrado (grupo, estado, LID, no-texto) no dejaba ningún rastro y
+    // era imposible saber si llegó o no. Con esta línea, el log de
+    // Railway muestra cada mensaje que WhatsApp Web entrega al CRM.
+    logger.info(`WhatsApp ${name}: mensaje entrante from=${msg.from} type=${msg.type} hasMedia=${!!msg.hasMedia} fromMe=${!!msg.fromMe}`);
+    // Solo mensajes de texto de chats 1 a 1. Los grupos (@g.us) y los
+    // estados (@broadcast) se ignoran; los remitentes LID (@lid) ya no se
+    // descartan: se resuelven al número real (ver abajo).
+    if (msg.from.includes('@g.us') || msg.from.includes('@broadcast')) return;
     if (msg.type !== 'chat') return;
     const content = (msg.body || '').trim();
     if (!content) return;
 
-    const phone = msg.from.replace('@c.us', '');
+    let phone;
+    let senderName = null;
+    if (msg.from.endsWith('@lid')) {
+      // v5.3.4 — Remitentes LID (identidad vinculada de WhatsApp, cada
+      // vez más común en 2025): antes se descartaban en silencio y el
+      // mensaje nunca llegaba al CRM aunque la instancia estaba en
+      // 'ready'. La librería resuelve el LID al número real en
+      // getContactModel (Utils.js): si WhatsApp Web conoce el número, el
+      // contacto viene con id <teléfono>@c.us y number = el teléfono.
+      // Si NO se puede resolver (el número no es conocido), number es
+      // el propio LID y el mensaje se descarta dejando constancia.
+      const lidDigits = String(msg.from || '').split('@')[0];
+      try {
+        const contact = await msg.getContact();
+        const candidate = String(contact?.number || '').replace(/\D/g, '');
+        senderName = (contact?.pushname || contact?.name || '').trim() || null;
+        if (candidate && candidate !== lidDigits && /^\d{7,15}$/.test(candidate)) {
+          phone = candidate;
+          logger.info(`WhatsApp ${name}: remitente LID ${msg.from} resuelto al número ${phone}`);
+        } else {
+          logger.warn(`WhatsApp ${name}: no se pudo resolver el número del remitente LID ${msg.from} (contacto: ${contact?.id?._serialized || 'desconocido'}); mensaje descartado.`);
+          return;
+        }
+      } catch (e) {
+        logger.warn(`WhatsApp ${name}: error resolviendo el remitente LID ${msg.from}; mensaje descartado.`, e?.message || e);
+        return;
+      }
+    } else {
+      phone = msg.from.replace('@c.us', '');
+    }
     waClients[id].lastSeen = new Date().toISOString();
     waClients[id].lastMessageAt = new Date().toISOString();
 
@@ -664,24 +773,41 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
       // normaliza el teléfono y crea cliente/conversación/mensaje. El id
       // serializado del mensaje va como external_id para deduplicar
       // (antes siempre era NULL en QR y no había deduplicación).
-      await handleIncomingWhatsApp({ phone, content, sourceName: `WhatsApp Directo (${name})`, channel: 'qr', externalId: msg.id?._serialized || null });
+      await handleIncomingWhatsApp({ phone, content, sourceName: `WhatsApp Directo (${name})`, channel: 'qr', externalId: msg.id?._serialized || null, senderName });
     } catch (err) {
       logger.error('Error procesando mensaje de WhatsApp', err);
     }
   });
 
-  client.initialize().catch(err => {
-    if (!isCurrent()) return;
-    clearWaWatchdog(id);
-    // v5.3.3: registrar el error COMPLETO (mensaje + stack + stderr de
-    // Chrome). En v5.3.2 el log solo mostró "Failed to launch the browser
-    // process: Code: 21" cortado, sin el stderr de Chrome, y no se pudo
-    // saber si faltaba una librería o fallaba la creación de procesos.
-    const detail = (err && err.stack) || (err && err.message) || String(err);
-    logger.error(`Error inicializando cliente ${name}: ${detail}`);
-    waClients[id].status = 'error';
-    recordEvent('error', 'whatsapp', `No se pudo iniciar WhatsApp (${name}): ${err?.message || err}`, { instance: id });
-  });
+  // v5.3.4: si el arranque falla porque el perfil está bloqueado por un
+  // Chrome muerto (SingletonLock heredado del contenedor anterior), se
+  // limpian los bloqueos y se reintenta UNA sola vez. Sin este reintento,
+  // un bloqueo que aparezca después de la limpieza previa (o que la
+  // limpieza no alcanzara) dejaría la instancia en 'error' hasta que el
+  // admin reconecte a mano.
+  let lockRetried = false;
+  const startClient = () => {
+    client.initialize().catch(err => {
+      if (!isCurrent()) return;
+      // v5.3.3: registrar el error COMPLETO (mensaje + stack + stderr de
+      // Chrome). En v5.3.2 el log solo mostró "Failed to launch the browser
+      // process: Code: 21" cortado, sin el stderr de Chrome, y no se pudo
+      // saber si faltaba una librería o fallaba la creación de procesos.
+      const detail = (err && err.stack) || (err && err.message) || String(err);
+      if (!lockRetried && /profile appears to be in use/i.test(detail)) {
+        lockRetried = true;
+        const removed = clearWaSessionLocks(id);
+        logger.warn(`WhatsApp ${name}: Chrome rechazó el perfil por un bloqueo de un proceso muerto (se limpiaron ${removed} archivo(s)); se reintenta el arranque una vez.`);
+        startClient();
+        return;
+      }
+      clearWaWatchdog(id);
+      logger.error(`Error inicializando cliente ${name}: ${detail}`);
+      waClients[id].status = 'error';
+      recordEvent('error', 'whatsapp', `No se pudo iniciar WhatsApp (${name}): ${err?.message || err}`, { instance: id });
+    });
+  };
+  startClient();
 
   // v5.3.2: si el cliente se queda colgado en 'authenticated' o
   // 'initializing' sin llegar a 'ready', el vigilante avisa y reintenta
