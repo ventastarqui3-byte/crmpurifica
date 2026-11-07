@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.2';
+const APP_VERSION = '5.3.3';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -553,11 +553,14 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
+        '--single-process',
         '--disable-gpu'
-        // v5.3.2: el flag de proceso único ELIMINADO de esta lista. En
-        // Docker hacía que la página de WhatsApp Web se quedara colgada
-        // tras autenticar (el cliente nunca emitía 'ready' y no entraba
-        // ningún mensaje).
+        // v5.3.3: '--single-process' VUELVE. En v5.3.2 se quitó pensando
+        // que colgaba la página tras autenticar, pero en producción la
+        // v5.3.2 no pudo ni arrancar Chrome ("Failed to launch the
+        // browser process: Code: 21"), mientras que la v5.3.1 CON este
+        // flag sí generaba el QR y se autenticaba. Se restaura la
+        // configuración exacta que lanzaba bien en v5.3.1.
       ]
     }
   });
@@ -670,7 +673,12 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   client.initialize().catch(err => {
     if (!isCurrent()) return;
     clearWaWatchdog(id);
-    logger.error(`Error inicializando cliente ${name}`, err);
+    // v5.3.3: registrar el error COMPLETO (mensaje + stack + stderr de
+    // Chrome). En v5.3.2 el log solo mostró "Failed to launch the browser
+    // process: Code: 21" cortado, sin el stderr de Chrome, y no se pudo
+    // saber si faltaba una librería o fallaba la creación de procesos.
+    const detail = (err && err.stack) || (err && err.message) || String(err);
+    logger.error(`Error inicializando cliente ${name}: ${detail}`);
     waClients[id].status = 'error';
     recordEvent('error', 'whatsapp', `No se pudo iniciar WhatsApp (${name}): ${err?.message || err}`, { instance: id });
   });

@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3.2 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
+# Purifica Tu Ambiente CRM — v5.3.3 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -25,6 +25,59 @@ multi-instancia**.
 > Sistema** (solo admin), el vigilante revisa DB y WhatsApp cada 5 min y
 > avisa por **Telegram** cuando algo se rompe o se recupera, y hay respaldo
 > diario automático a las 02:00. Ver "¿Cómo sé si algo se rompió?" más abajo.
+
+## WhatsApp QR: arreglo del fallo de Chrome v5.3.3 (2026-11-07)
+
+**Qué falló en v5.3.2 al desplegar en Railway (deploy fba06620):** la
+auto-restauración SÍ funcionó (el log mostró "Restaurando instancia de
+WhatsApp: hola" e "Inicializando WhatsApp para: hola"), pero justo después
+salió `[ERROR] Error inicializando cliente hola Error: Failed to launch
+the browser process: Code: 21` con stack en `@puppeteer/browsers`. En
+v5.3.1 el Chrome sí arrancaba (se generaba el QR y se autenticaba). La
+línea de error venía cortada en la captura, sin el stderr completo de
+Chrome, así que no se pudo saber si era una librería compartida que
+faltaba o un fallo al crear procesos.
+
+**Qué se revirtió y por qué (vuelta exacta a la configuración de
+lanzamiento de v5.3.1):**
+
+1. **`--single-process` vuelve** a los args de puppeteer en `initWhatsApp`
+   (`server.js`). En v5.3.2 se quitó pensando que colgaba la página tras
+   autenticar, pero la evidencia de producción dice lo contrario: con el
+   flag, v5.3.1 lanzaba Chrome bien; sin él, v5.3.2 no pudo ni arrancar
+   el navegador. La causa del "nunca llega a ready" de v5.3.1 queda por
+   tanto sin confirmar y se revisará aparte si reaparece con Chrome
+   arrancando.
+2. **Puppeteer fijado en la 24.37.5**, la versión exacta que lanzaba bien
+   en v5.3.1: dependencia directa exacta en `package.json` y `overrides`
+   (`"puppeteer": "24.37.5"`) para que `whatsapp-web.js` 1.34.7 use esa
+   misma copia. OJO: la dependencia directa sola NO bastaba —
+   `whatsapp-web.js` 1.34.7 fija `puppeteer` en `24.38.0` exacto en su
+   propio `package.json`, así que sin el override npm instalaba una copia
+   anidada 24.38.0 y el navegador que se lanzaba seguía siendo el nuevo.
+   Verificado con `npm ls puppeteer`: una sola copia 24.37.5
+   ("overridden" + "deduped" bajo whatsapp-web.js, sin copia anidada).
+3. **Dockerfile:** se añadieron las librerías de la lista estándar de
+   puppeteer para Debian 12 que faltaban: `libatk-bridge2.0-0`,
+   `libdrm2` y `libxkbcommon0`. El resto de la lista ya estaba.
+
+**Qué se conserva de v5.3.2 (sin tocar):** `whatsapp-web.js` 1.34.7, la
+auto-restauración de instancias al arrancar (`restoreWhatsAppInstances`),
+el vigilante de `ready` a 120 s con un reintento (`armReadyWatchdog`) y
+la parada centralizada (`stopWaInstance`).
+
+**Mejora de diagnóstico:** cuando `client.initialize()` falla, el log
+ahora muestra el mensaje de error COMPLETO (mensaje + stack + stderr de
+Chrome) en vez del objeto de error cortado, para que el próximo fallo se
+pueda diagnosticar sin adivinar.
+
+**Qué hacer tras desplegar esta versión en Railway:** nada especial. Al
+arrancar, la instancia "pedro" (ID HOLA) se levanta sola con la sesión
+guardada en el volumen `crmpurifica-volume` y debe llegar a `ready` sin
+pedir QR nuevo. Comprueba en el log que salga "WhatsApp pedro está
+listo!" y en Estado del Sistema que WhatsApp por QR pase a Bien (1 de 1).
+Si vuelve a fallar el lanzamiento, el log ahora mostrará el error
+completo de Chrome.
 
 ## WhatsApp QR: arreglos v5.3.2 (2026-11-07)
 
