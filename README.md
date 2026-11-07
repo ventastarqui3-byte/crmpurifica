@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3.6 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
+# Purifica Tu Ambiente CRM — v5.3.7 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -25,6 +25,51 @@ multi-instancia**.
 > Sistema** (solo admin), el vigilante revisa DB y WhatsApp cada 5 min y
 > avisa por **Telegram** cuando algo se rompe o se recupera, y hay respaldo
 > diario automático a las 02:00. Ver "¿Cómo sé si algo se rompió?" más abajo.
+
+## Un solo volumen en Railway: sesión de WhatsApp + archivos (v5.3.7, 2026-11-07)
+
+**Por qué existe esta versión:** Railway permite **un solo volumen por
+servicio** (documentación oficial: "Each service can only have a single
+volume"). El servicio ya tenía su volumen para la sesión de WhatsApp
+(`crmpurifica-volume` en `/app/.wwebjs_auth`) y NO se le puede añadir un
+segundo volumen para `/app/uploads`. La v5.3.6 pedía ese segundo volumen;
+esta versión lo hace innecesario: sesión y archivos viven en el **mismo**
+volumen.
+
+**Cómo funciona:** nueva variable `PERSIST_DIR` (en Railway: `/app/data`).
+Con ella definida, la sesión de WhatsApp se guarda en `PERSIST_DIR` tal
+cual y los archivos (logo, multimedia) en `PERSIST_DIR/uploads`. Sin ella,
+todo sigue exactamente igual que antes (sesión en `./.wwebjs_auth`,
+archivos en `<app>/uploads`): en VPS con docker-compose **no cambia nada**,
+sigue con sus dos volúmenes.
+
+### Pasos exactos en Railway (para el volumen que YA existe)
+
+1. En el proyecto → servicio **crmpurifica** → **Settings → Volumes**.
+2. Edita el volumen EXISTENTE (`crmpurifica-volume`): cambia el punto de
+   montaje de `/app/.wwebjs_auth` a **`/app/data`**. No lo borres ni crees
+   uno nuevo.
+3. En **Variables** del servicio añade `PERSIST_DIR=/app/data`.
+4. Redespliega (o haz push de esta versión: Railway despliega solo).
+
+**La sesión NO se pierde:** es el mismo volumen con los mismos archivos.
+Al remontarlo en `/app/data`, los archivos de sesión quedan en la raíz
+del volumen (`/app/data/session-wa-session-<id>/`), que es justo donde
+el servidor los busca ahora. No hay que reescanear el QR: tras el
+redespliegue la instancia se restaura sola como en la v5.3.2.
+
+**Advertencia de tamaño:** en Trial el volumen es de **0.5 GB en total**
+entre sesión y multimedia. La sesión pesa poco, pero cada foto/video puede
+pesar hasta 25 MB: con unas 20 fotos se llena. Vigila el uso en Railway
+→ servicio → Metrics/volumen. En Hobby el volumen pasa a 5 GB.
+
+### Qué comprobar tras desplegar
+
+1. Que el servicio arranque y `/api/health` diga versión **5.3.7**.
+2. Que WhatsApp siga en `ready` **sin escanear QR nuevo**.
+3. Que una foto enviada al número aparezca en Mensajes y que tras un
+   redespliegue siga ahí (volumen compartido funcionando).
+4. En VPS/docker-compose: sin `PERSIST_DIR` todo igual que en la v5.3.6.
 
 ## WhatsApp: multimedia y enviados desde el celular v5.3.6 (2026-11-07)
 
@@ -87,14 +132,14 @@ de la empresa aparezca en el CRM.
 - Media entrante por Meta (webhook) sigue sin guardarse: el webhook solo
   procesa texto. Media saliente por Meta necesita URL pública del
   servidor (ver arriba).
-- **Volumen `/app/uploads` en Railway: antes era opcional (solo el logo),
-  ahora es necesario para la media.** Sin ese volumen, cada redespliegue
-  borra las fotos, audios y documentos guardados (los mensajes y su texto
-  en base de datos NO se pierden). Pasos: en el proyecto → servicio de la
-  app → **Add → Volume** (o Settings → Volumes) → punto de montaje
-  `/app/uploads`. El volumen de la sesión `/app/.wwebjs_auth` sigue siendo
-  obligatorio como antes. En VPS con docker-compose el volumen `uploads`
-  ya viene en `docker-compose.yml`.
+- **Volumen en Railway: SUPERADO por la v5.3.7.** Esta versión pedía un
+  segundo volumen en `/app/uploads`, pero Railway solo permite **un
+  volumen por servicio**, así que ese segundo volumen no se puede crear.
+  La v5.3.7 lo resuelve con `PERSIST_DIR` (ver la sección de arriba): un
+  solo volumen compartido para sesión y archivos. Si ya creaste el volumen
+  `/app/uploads`, no pasa nada: simplemente no se usa; el que vale es el
+  volumen remontado en `/app/data`. En VPS con docker-compose el volumen
+  `uploads` ya viene en `docker-compose.yml`.
 
 ### Qué comprobar tras desplegar
 
@@ -105,7 +150,8 @@ de la empresa aparezca en el CRM.
 3. Que responder desde el celular de la empresa haga aparecer ese mensaje
    en el CRM como propio, sin duplicar los enviados desde el CRM.
 4. Que tras un redespliegue los archivos de media sigan ahí (volumen
-   `/app/uploads` creado).
+   compartido con `PERSIST_DIR`, ver v5.3.7; ya NO hace falta un segundo
+   volumen en `/app/uploads`).
 
 ## WhatsApp QR: bloqueo de perfil de Chrome + remitentes LID v5.3.4 (2026-11-07)
 
@@ -782,15 +828,18 @@ Express + Socket.io + sesión de WhatsApp + respaldo diario).
    `ADMIN_PASSWORD`, `TZ=America/Bogota`. Las demás son opcionales
    (Telegram, Wompi/PayU, Meta, Google Calendar — ver `.env.example`).
    `PORT` lo asigna Railway solo; NO lo pongas a mano.
-5. **Volúmenes (obligatorios):** en el
-   servicio → **Settings → Volumes → Add Volume**, punto de montaje
-   `/app/.wwebjs_auth` (sesión de WhatsApp: sin esto, cada despliegue
-   borra la sesión y hay que escanear el QR de nuevo). **Y otro volumen
-   en `/app/uploads`, obligatorio desde la v5.3.6 para la multimedia de
-   WhatsApp (fotos, audios, videos y documentos; antes solo guardaba el
-   logo y era opcional).** Sin este volumen, cada redespliegue borra los
-   archivos de media (los mensajes y su texto en base de datos no se
-   pierden).
+5. **Volumen (obligatorio, UNO solo):** en el
+   servicio → **Settings → Volumes**, el volumen EXISTENTE con punto de
+   montaje **`/app/data`** (sesión de WhatsApp + archivos: logo y
+   multimedia de la v5.3.6). Railway solo permite un volumen por servicio,
+   así que NO se crea un segundo volumen. Si el volumen todavía está en
+   `/app/.wwebjs_auth`, edítalo a `/app/data` y añade la variable
+   `PERSIST_DIR=/app/data` (ver la sección "Un solo volumen en Railway
+   (v5.3.7)"): la sesión no se pierde, queda en la raíz del mismo volumen.
+   Sin este volumen, cada redespliegue borra la sesión (hay que escanear
+   el QR de nuevo) y los archivos de media (los mensajes y su texto en
+   base de datos no se pierden). En Trial el volumen es de 0.5 GB en
+   total; en Hobby, 5 GB.
 6. Despliega: Railway construye la imagen y te da un dominio
    (`https://tu-app.up.railway.app`). Abre ese dominio, entra con el admin
    del paso 4 y conecta el QR en **Canales WhatsApp**.
@@ -820,7 +869,8 @@ cambia dónde corre.
   (`systemd` o `pm2`) para que el servidor se reinicie solo.
 - **Otros PaaS (Render, Fly.io, etc.):** igual que Railway: despliegan el
   `Dockerfile`, inyectan `DATABASE_URL` y `PORT`, y necesitan un volumen
-  persistente en `/app/.wwebjs_auth` para la sesión de WhatsApp. El
+  persistente para la sesión de WhatsApp y los archivos: un solo volumen
+  montado en `/app/data` con `PERSIST_DIR=/app/data` (ver v5.3.7). El
   chequeo de salud es `GET /api/health`.
 - **Qué NO cambió:** el `Dockerfile` solo cambió el chequeo de salud para
   usar `$PORT` en vez del 3000 fijo (en Docker Compose sigue siendo 3000).

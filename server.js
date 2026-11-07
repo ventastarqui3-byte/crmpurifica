@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.6';
+const APP_VERSION = '5.3.7';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -444,7 +444,36 @@ async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, ch
 // acepta menos en foto/video/audio (~16 MB), así que un envío grande puede
 // fallar en WhatsApp aunque el CRM lo guarde: el fallo queda en sent=false.
 const WA_MEDIA_MAX_BYTES = 25 * 1024 * 1024;
-function waMediaDir() { return path.join(__dirname, 'uploads', 'wa-media'); }
+// --- v5.3.7: UN SOLO VOLUMEN PERSISTENTE (PERSIST_DIR) ---
+// Railway permite UN solo volumen por servicio: la sesión de WhatsApp y
+// los archivos (logo, multimedia) tienen que vivir en el MISMO volumen.
+// PERSIST_DIR es la ruta de montaje de ese volumen (en Railway: /app/data).
+//  - Con PERSIST_DIR: LocalAuth usa PERSIST_DIR como dataPath (NO
+//    PERSIST_DIR/.wwebjs_auth): al remontar el volumen viejo en /app/data,
+//    los archivos de sesión quedan en la raíz del volumen, o sea en
+//    /app/data/session-wa-session-<id>/, justo donde LocalAuth los busca
+//    (verificado en whatsapp-web.js 1.34.7: LocalAuth acepta dataPath y la
+//    sesión es path.join(dataPath, 'session-' + clientId)). La sesión NO
+//    se pierde y no hay que reescanear el QR. Los archivos van a
+//    PERSIST_DIR/uploads.
+//  - Sin PERSIST_DIR: todo igual que siempre (sesión en ./.wwebjs_auth
+//    relativo al cwd, archivos en <app>/uploads). VPS/docker-compose no
+//    cambia nada: sigue con sus dos volúmenes.
+// Son funciones perezosas a propósito: __dirname se define más abajo en
+// este módulo ES y una const evaluada aquí daría ReferenceError (ver v5.3.6).
+function persistDir() {
+  const d = (process.env.PERSIST_DIR || '').trim();
+  return d || null;
+}
+function uploadsDir() {
+  const p = persistDir();
+  return p ? path.join(p, 'uploads') : path.join(__dirname, 'uploads');
+}
+function waDataDir() {
+  const p = persistDir();
+  return p || path.resolve('.wwebjs_auth');
+}
+function waMediaDir() { return path.join(uploadsDir(), 'wa-media'); }
 const WA_MEDIA_LABELS = { image: '📷 Imagen', audio: '🎤 Nota de voz', video: '🎬 Video', document: '📎 Documento', sticker: '😀 Sticker' };
 // Tipos de whatsapp-web.js que son media real (además de 'chat' = texto).
 // 'ptt' es nota de voz y se guarda como 'audio', igual que el composer.
@@ -606,8 +635,11 @@ async function processWaMessage(msg, opts) {
 // Solo acepta rutas dentro de uploads/wa-media (nunca fuera de uploads).
 function readWaAttachmentFile(attachmentUrl) {
   if (!attachmentUrl || !String(attachmentUrl).startsWith('/uploads/wa-media/')) return { error: 'Adjunto fuera de la carpeta de media' };
-  const full = path.join(__dirname, String(attachmentUrl).replace(/^\/+/, ''));
-  const base = path.join(__dirname, 'uploads', 'wa-media');
+  // La URL es /uploads/wa-media/<archivo>: se quita el prefijo /uploads/
+  // y se cuelga del uploadsDir() real (con PERSIST_DIR es /app/data/uploads).
+  const rel = String(attachmentUrl).replace(/^\/uploads\//, '');
+  const full = path.join(uploadsDir(), rel);
+  const base = waMediaDir();
   if (!full.startsWith(base + path.sep)) return { error: 'Adjunto fuera de la carpeta de media' };
   if (!fs.existsSync(full)) return { error: 'Archivo adjunto no encontrado en el servidor' };
   const buf = fs.readFileSync(full);
@@ -664,7 +696,7 @@ const WA_SESSION_LOCK_FILES = ['SingletonLock', 'SingletonSocket', 'SingletonCoo
 function clearWaSessionLocks(id) {
   let removed = 0;
   try {
-    const sessionDir = path.resolve('.wwebjs_auth', `session-wa-session-${id}`);
+    const sessionDir = path.join(waDataDir(), `session-wa-session-${id}`);
     const stack = [[sessionDir, 0]];
     while (stack.length > 0) {
       const [dir, depth] = stack.pop();
@@ -820,7 +852,7 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   clearWaSessionLocks(id);
 
   const client = new Client({
-    authStrategy: new LocalAuth({ clientId: `wa-session-${id}` }),
+    authStrategy: new LocalAuth({ clientId: `wa-session-${id}`, dataPath: waDataDir() }),
     puppeteer: {
       headless: true,
       args: [
@@ -1077,10 +1109,10 @@ app.use(helmet({ contentSecurityPolicy: false })); // CSP desactivada: el fronte
 // buffer crudo en req.rawBody solo para esa ruta, sin tocar las demás.
 app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (req.url.startsWith('/api/webhooks/meta')) req.rawBody = buf; } }));
 // Logos subidos (marca blanca): públicos, solo imágenes estáticas.
-fs.mkdirSync(path.join(__dirname, 'uploads'), { recursive: true });
+fs.mkdirSync(uploadsDir(), { recursive: true });
 // v5.3.6: adjuntos de WhatsApp (fotos, audios, videos, documentos).
 fs.mkdirSync(waMediaDir(), { recursive: true });
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(uploadsDir()));
 
 // Middleware de Logs de peticiones
 app.use((req, res, next) => {
@@ -1330,7 +1362,7 @@ async function getSystemStatus() {
   const mem = process.memoryUsage();
   let disk = null;
   try {
-    const s = await fs.promises.statfs(path.join(__dirname, 'uploads'));
+    const s = await fs.promises.statfs(uploadsDir());
     disk = { freeMB: Math.round(s.bfree * s.bsize / 1024 / 1024), totalMB: Math.round(s.blocks * s.bsize / 1024 / 1024) };
   } catch { disk = null; }
   // Cola de mensajes: la tabla messages de crm6 NO tiene columna status
@@ -1451,7 +1483,7 @@ app.post('/api/system/self-test', requireAdmin, async (req, res) => {
     return `${wa.connected} de ${wa.total} instancias conectadas`;
   });
   await run('Escritura en uploads/', async () => {
-    const tmp = path.join(__dirname, 'uploads', `.selftest-${Date.now()}.tmp`);
+    const tmp = path.join(uploadsDir(), `.selftest-${Date.now()}.tmp`);
     fs.writeFileSync(tmp, 'self-test');
     fs.unlinkSync(tmp);
     return 'Se pudo escribir y borrar un archivo temporal';
@@ -4476,10 +4508,10 @@ app.post('/api/settings/logo', requireAdmin, logoUpload.single('logo'), async (r
   const ext = req.file.mimetype === 'image/png' ? 'png' : 'jpg';
   try {
     for (const old of ['logo.png', 'logo.jpg']) {
-      const p = path.join(__dirname, 'uploads', old);
+      const p = path.join(uploadsDir(), old);
       if (fs.existsSync(p)) fs.unlinkSync(p);
     }
-    fs.writeFileSync(path.join(__dirname, 'uploads', `logo.${ext}`), req.file.buffer);
+    fs.writeFileSync(path.join(uploadsDir(), `logo.${ext}`), req.file.buffer);
     const logoUrl = `/uploads/logo.${ext}`;
     await pool.query("INSERT INTO settings (key, value) VALUES ('branding_logo_url', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [logoUrl]);
     notifyUpdate('settings');
