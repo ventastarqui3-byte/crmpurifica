@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {ChatConversation, StaffMember, ChatMessage, LeadStatus, CurrentUser, ChatTemplate} from '../types';
-import {Search, Send, ArrowLeft, MessageCircle, Globe, Plus, ClipboardList, X, Calculator, Save, Camera, Loader2, Zap, Instagram, Facebook, Info, Sparkles} from 'lucide-react';
+import {Search, Send, ArrowLeft, MessageCircle, Globe, Plus, ClipboardList, X, Calculator, Save, Camera, Loader2, Zap, Instagram, Facebook, Info, Sparkles, Paperclip, FileText, Download} from 'lucide-react';
 import { ClientIntelligence } from './ClientIntelligence';
 import { apiFetch } from '../lib/api';
 
@@ -59,6 +59,15 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
   const [city, setCity] = useState('Bogotá');
   const [advisor, setAdvisor] = useState('');
   const [isSyncing, setIsSyncing] = useState(false);
+
+  // v5.3.6 — Adjuntos: foto, audio, video o documento (tope 25 MB). El
+  // archivo se sube primero a /api/chats/:id/attachments y luego se envía
+  // el mensaje con su attachmentUrl; la vista previa es local.
+  const [attachFile, setAttachFile] = useState<File | null>(null);
+  const [attachPreview, setAttachPreview] = useState<string | null>(null);
+  const [attachError, setAttachError] = useState('');
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Grabación de voz y adjuntos: había refs e iconos (Mic, Paperclip...)
   // pero ningún botón ni <input type=file>: no se podía grabar ni adjuntar
@@ -134,18 +143,69 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
     }
   }, [selectedChatId, activeChat?.messages?.length]);
 
-  const handleSendMessage = () => {
+  // Textos que el servidor usa como contenido cuando un mensaje de media
+  // no trae caption: no se muestran como texto debajo del adjunto.
+  const MEDIA_LABELS = ['📷 Imagen', '🎤 Nota de voz', '🎬 Video', '📎 Documento', '😀 Sticker', '📎 Archivo'];
+
+  const handleAttachFile = (file: File | null) => {
+    setAttachError('');
+    if (!file) { setAttachFile(null); setAttachPreview(null); return; }
+    if (file.size > 25 * 1024 * 1024) { setAttachError('El archivo supera 25 MB'); return; }
+    const ok = file.type.startsWith('image/') || file.type.startsWith('audio/') || file.type.startsWith('video/') ||
+      ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/plain'].includes(file.type);
+    if (!ok) { setAttachError('Tipo de archivo no permitido (imagen, audio, video o documento)'); return; }
+    if (attachPreview) URL.revokeObjectURL(attachPreview);
+    setAttachFile(file);
+    setAttachPreview(file.type.startsWith('image/') ? URL.createObjectURL(file) : null);
+  };
+
+  const clearAttachment = () => {
+    if (attachPreview) URL.revokeObjectURL(attachPreview);
+    setAttachFile(null);
+    setAttachPreview(null);
+    setAttachError('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleSendMessage = async () => {
     if (readOnly) return;
-    if (!messageText.trim() || !activeChat) return;
-    onLocalMessage(activeChat.id, { 
-      id: Date.now().toString(), 
-      sender: 'agent', 
-      content: messageText, 
-      timestamp: new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' }), 
-      fullDate: new Date().toISOString(), 
-      type: 'text' 
-    });
+    if ((!messageText.trim() && !attachFile) || !activeChat) return;
+    const text = messageText;
+    const file = attachFile;
     setMessageText('');
+    clearAttachment();
+    try {
+      let type: ChatMessage['type'] = 'text';
+      let attachmentUrl: string | undefined;
+      if (file) {
+        setIsUploading(true);
+        const form = new FormData();
+        form.append('file', file);
+        const up = await apiFetch(`/api/chats/${activeChat.id}/attachments`, { method: 'POST', body: form });
+        const upData = await up.json().catch(() => null);
+        setIsUploading(false);
+        if (!up.ok || !upData?.attachmentUrl) {
+          setAttachError(upData?.error || 'No se pudo subir el archivo');
+          setMessageText(text);
+          return;
+        }
+        type = upData.type || 'document';
+        attachmentUrl = upData.attachmentUrl;
+      }
+      onLocalMessage(activeChat.id, {
+        id: Date.now().toString(),
+        sender: 'agent',
+        content: text,
+        timestamp: new Date().toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' }),
+        fullDate: new Date().toISOString(),
+        type,
+        attachmentUrl,
+      });
+    } catch (e) {
+      setIsUploading(false);
+      setAttachError('Sin conexión con el servidor');
+      setMessageText(text);
+    }
   };
 
   const toggleImageSelection = (url: string) => {
@@ -321,15 +381,24 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
                  <div key={msg.id} className={`flex ${msg.sender === 'client' ? 'justify-start' : 'justify-end'}`}>
                     <div className={`max-w-[75%] rounded-2xl p-3 shadow-sm text-sm relative group ${msg.sender === 'client' ? 'bg-white rounded-tl-none' : 'bg-[#dcf8c6] rounded-tr-none'}`}>
                         {msg.attachmentUrl ? (
-                           <div className="relative">
-                             {msg.type === 'audio' ? <audio controls src={msg.attachmentUrl} className="h-10 w-full" /> : (
-                                <>
-                                  <img src={msg.attachmentUrl} className="max-h-72 rounded-xl object-cover cursor-pointer hover:brightness-95" />
-                                  <button onClick={() => toggleImageSelection(msg.attachmentUrl!)} className={`absolute bottom-2 right-2 p-2 rounded-full shadow-xl transition-all ${techImages.includes(msg.attachmentUrl!) ? 'bg-red-500 text-white' : 'bg-white text-brand-600 opacity-0 group-hover:opacity-100 scale-90 hover:scale-100'}`}>
-                                    {techImages.includes(msg.attachmentUrl!) ? <X className="w-5 h-5" /> : <Plus className="w-5 h-5" />}
-                                  </button>
-                                </>
-                             )}
+                           <div>
+                             <div className="relative">
+                               {msg.type === 'audio' ? <audio controls src={msg.attachmentUrl} className="h-10 w-full" /> :
+                                msg.type === 'video' ? <video controls preload="metadata" src={msg.attachmentUrl} className="max-h-72 rounded-xl w-full bg-black" /> :
+                                msg.type === 'document' || msg.type === 'file' ? (
+                                  <a href={msg.attachmentUrl} target="_blank" rel="noreferrer" download className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-700 transition-colors">
+                                    <FileText className="w-5 h-5 text-brand-600" /> <span className="truncate">Descargar documento</span> <Download className="w-4 h-4 ml-auto flex-shrink-0" />
+                                  </a>
+                                ) : (
+                                  <>
+                                    <img src={msg.attachmentUrl} className="max-h-72 rounded-xl object-cover cursor-pointer hover:brightness-95" />
+                                    <button onClick={() => toggleImageSelection(msg.attachmentUrl!)} className={`absolute bottom-2 right-2 p-2 rounded-full shadow-xl transition-all ${techImages.includes(msg.attachmentUrl!) ? 'bg-red-500 text-white' : 'bg-white text-brand-600 opacity-0 group-hover:opacity-100 scale-90 hover:scale-100'}`}>
+                                      {techImages.includes(msg.attachmentUrl!) ? <X className="w-5 h-5" /> : <Plus className="w-5 h-5" />}
+                                    </button>
+                                  </>
+                               )}
+                             </div>
+                             {msg.content && !MEDIA_LABELS.includes(msg.content) && <p className="leading-relaxed whitespace-pre-wrap mt-2">{msg.content}</p>}
                            </div>
                         ) : <p className="leading-relaxed whitespace-pre-wrap">{msg.content}</p>}
                         <div className="text-[8px] text-right mt-1 opacity-40 font-black">{msg.timestamp}</div>
@@ -345,8 +414,18 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
               </div>
             ) : (
             <div className="p-4 bg-white border-t border-slate-200">
+               {attachFile && (
+                 <div className="max-w-5xl mx-auto mb-3 flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+                   {attachPreview ? <img src={attachPreview} className="w-10 h-10 rounded-lg object-cover" /> : <FileText className="w-5 h-5 text-brand-600 flex-shrink-0" />}
+                   <span className="text-xs font-bold text-slate-700 truncate flex-1">{attachFile.name} ({(attachFile.size / 1024).toFixed(0)} KB)</span>
+                   <button onClick={clearAttachment} className="p-1 text-slate-400 hover:text-red-500"><X className="w-4 h-4" /></button>
+                 </div>
+               )}
+               {attachError && <p className="max-w-5xl mx-auto mb-2 text-[11px] font-bold text-red-600">{attachError}</p>}
                <div className="flex items-center gap-3 max-w-5xl mx-auto">
                   <button onClick={() => setShowTemplates(!showTemplates)} className="p-2 text-slate-400 hover:text-amber-600 transition-colors"><Zap className={`w-5 h-5 ${showTemplates ? 'text-amber-600' : ''}`} /></button>
+                  <input ref={fileInputRef} type="file" accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.txt" className="hidden" onChange={e => handleAttachFile(e.target.files?.[0] || null)} />
+                  <button onClick={() => fileInputRef.current?.click()} title="Adjuntar foto, audio, video o documento (máx. 25 MB)" className="p-2 text-slate-400 hover:text-brand-600 transition-colors"><Paperclip className="w-5 h-5" /></button>
                   <div className="flex-1 relative">
                     {showTemplates && (
                       <div className="absolute bottom-full left-0 mb-4 w-64 bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden z-50">
@@ -363,7 +442,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
                     )}
                     <textarea value={messageText} onChange={e => setMessageText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSendMessage())} placeholder="Escribe un mensaje..." rows={1} className="w-full bg-slate-50 rounded-2xl px-5 py-3 border-none outline-none text-sm font-medium resize-none shadow-inner" />
                   </div>
-                  <button onClick={handleSendMessage} disabled={!messageText.trim()} className="p-3 bg-brand-600 text-white rounded-full shadow-lg hover:bg-brand-700 active:scale-95 transition-all disabled:opacity-50"><Send className="w-5 h-5" /></button>
+                  <button onClick={handleSendMessage} disabled={(!messageText.trim() && !attachFile) || isUploading} className="p-3 bg-brand-600 text-white rounded-full shadow-lg hover:bg-brand-700 active:scale-95 transition-all disabled:opacity-50">{isUploading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}</button>
                </div>
             </div>)}
           </>

@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3.5 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
+# Purifica Tu Ambiente CRM — v5.3.6 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -25,6 +25,87 @@ multi-instancia**.
 > Sistema** (solo admin), el vigilante revisa DB y WhatsApp cada 5 min y
 > avisa por **Telegram** cuando algo se rompe o se recupera, y hay respaldo
 > diario automático a las 02:00. Ver "¿Cómo sé si algo se rompió?" más abajo.
+
+## WhatsApp: multimedia y enviados desde el celular v5.3.6 (2026-11-07)
+
+Con los mensajes de texto ya llegando (v5.3.5), faltaban dos cosas que el
+usuario pidió al probar en producción: que lleguen y se puedan enviar
+fotos, audios, videos y documentos, y que lo respondido desde el celular
+de la empresa aparezca en el CRM.
+
+### 1. Multimedia entrante y saliente (QR)
+
+- **Entrante:** `client.on('message')` acepta además de texto (`chat`):
+  `image`, `audio`, `ptt` (nota de voz, se guarda como `audio`), `video`,
+  `document` y `sticker`. La media se descarga con `downloadMedia()` y se
+  guarda en `uploads/wa-media/` (tope 25 MB por archivo; si es mayor, se
+  registra en el log y se descarta sin tumbar nada). El mensaje queda con
+  su `type`, `attachment_url=/uploads/wa-media/...` y el caption como
+  contenido (o '📷 Imagen' / '🎤 Nota de voz' / '🎬 Video' /
+  '📎 Documento' / '😀 Sticker' si no trae). La resolución LID de la v5.3.5
+  aplica igual a la media. Se siguen ignorando grupos, estados, mensajes
+  de sistema (`e2e_notification`, `notification_template`) y `@bot`.
+- **Saliente desde el CRM:** el composer de `ChatInbox.tsx` tiene botón de
+  adjuntar (clip) con vista previa. El archivo se sube primero a
+  `POST /api/chats/:id/attachments` (multer, tope 25 MB) y luego se envía
+  el mensaje con su `attachmentUrl`. Por QR se envía con `MessageMedia`
+  (con caption si lo hay); por Meta se envía por enlace público
+  (`PUBLIC_BASE_URL` en .env o el dominio de Railway) y si no hay URL
+  pública devuelve el error claro "multimedia por Meta no soportado
+  todavía" sin romper el guardado. El contrato de respuesta no cambia
+  (`success`, `sent`, `error`) y sigue el aviso "guardado pero no
+  enviado" si falla el envío.
+- **Inbox:** `ChatInbox.tsx` ya recibía `type`/`attachmentUrl` del backend
+  pero solo pintaba imagen o audio. Ahora pinta imagen/sticker con `<img>`,
+  audio con controles, video con `<video>` y documento con enlace de
+  descarga, y muestra el caption debajo de la media cuando lo hay.
+
+### 2. Enviados desde el celular (message_create)
+
+- Nuevo handler `client.on('message_create')`: guarda los mensajes que se
+  envían DESDE el teléfono vinculado. Solo procesa los propios (`fromMe`),
+  ignora grupos/estados/notificaciones, el interlocutor es `msg.to` (con
+  la misma resolución LID) y la media se descarga igual que la entrante.
+- Se guardan como `sender='agent'` (así el inbox los pinta como propios),
+  **sin** sumar `unread_count`, y SÍ actualizan `last_message` /
+  `last_message_time`.
+- **Sin duplicados:** `sendWhatsAppMessage` ahora devuelve el id del
+  mensaje enviado (QR: `sent.id._serialized`; Meta: el id de la API) y
+  `POST /api/chats/:id/messages` lo guarda como `external_id` (se envía
+  ANTES de guardar, justo por eso). `message_create` dispara también por
+  los enviados desde el CRM, pero el INSERT con
+  `ON CONFLICT (external_id) DO NOTHING` los ignora.
+
+### Límites honestos
+
+- Tope de 25 MB por archivo (entrante y saliente). WhatsApp acepta menos
+  en foto/video/audio (~16 MB), así que un envío muy grande puede fallar
+  en WhatsApp aunque el CRM lo guarde (queda en `sent=false`).
+- **Sin historial de media vieja:** solo entra lo que llegue desde ahora;
+  los mensajes anteriores al despliegue no se recuperan (igual que el
+  texto, ver v5.3.5).
+- Media entrante por Meta (webhook) sigue sin guardarse: el webhook solo
+  procesa texto. Media saliente por Meta necesita URL pública del
+  servidor (ver arriba).
+- **Volumen `/app/uploads` en Railway: antes era opcional (solo el logo),
+  ahora es necesario para la media.** Sin ese volumen, cada redespliegue
+  borra las fotos, audios y documentos guardados (los mensajes y su texto
+  en base de datos NO se pierden). Pasos: en el proyecto → servicio de la
+  app → **Add → Volume** (o Settings → Volumes) → punto de montaje
+  `/app/uploads`. El volumen de la sesión `/app/.wwebjs_auth` sigue siendo
+  obligatorio como antes. En VPS con docker-compose el volumen `uploads`
+  ya viene en `docker-compose.yml`.
+
+### Qué comprobar tras desplegar
+
+1. Que una foto/audio/video/documento enviado al número de la empresa
+   aparezca en **Mensajes** con su vista previa y se pueda abrir/descargar.
+2. Que adjuntar un archivo desde el composer lo envíe por WhatsApp y
+   aparezca en el chat.
+3. Que responder desde el celular de la empresa haga aparecer ese mensaje
+   en el CRM como propio, sin duplicar los enviados desde el CRM.
+4. Que tras un redespliegue los archivos de media sigan ahí (volumen
+   `/app/uploads` creado).
 
 ## WhatsApp QR: bloqueo de perfil de Chrome + remitentes LID v5.3.4 (2026-11-07)
 
@@ -701,11 +782,15 @@ Express + Socket.io + sesión de WhatsApp + respaldo diario).
    `ADMIN_PASSWORD`, `TZ=America/Bogota`. Las demás son opcionales
    (Telegram, Wompi/PayU, Meta, Google Calendar — ver `.env.example`).
    `PORT` lo asigna Railway solo; NO lo pongas a mano.
-5. **Volumen (obligatorio para que el WhatsApp no se desconecte):** en el
+5. **Volúmenes (obligatorios):** en el
    servicio → **Settings → Volumes → Add Volume**, punto de montaje
-   `/app/.wwebjs_auth`. Opcional: otro volumen en `/app/uploads` para que
-   el logo no se pierda al redesplegar. Sin volumen, cada despliegue borra
-   la sesión de WhatsApp y hay que escanear el QR de nuevo.
+   `/app/.wwebjs_auth` (sesión de WhatsApp: sin esto, cada despliegue
+   borra la sesión y hay que escanear el QR de nuevo). **Y otro volumen
+   en `/app/uploads`, obligatorio desde la v5.3.6 para la multimedia de
+   WhatsApp (fotos, audios, videos y documentos; antes solo guardaba el
+   logo y era opcional).** Sin este volumen, cada redespliegue borra los
+   archivos de media (los mensajes y su texto en base de datos no se
+   pierden).
 6. Despliega: Railway construye la imagen y te da un dominio
    (`https://tu-app.up.railway.app`). Abre ese dominio, entra con el admin
    del paso 4 y conecta el QR en **Canales WhatsApp**.

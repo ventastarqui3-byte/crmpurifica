@@ -260,7 +260,7 @@ export interface ChatMessage {
   // El servidor no devuelve fullDate en /api/chats (solo timestamp);
   // el inbox lo genera al enviar. Opcional para no mentir en el tipo.
   fullDate?: string;
-  type?: 'text' | 'media' | 'image' | 'audio' | 'video' | 'file';
+  type?: 'text' | 'media' | 'image' | 'audio' | 'video' | 'file' | 'document' | 'sticker';
   attachmentUrl?: string;
 }
 

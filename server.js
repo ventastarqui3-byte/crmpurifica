@@ -26,7 +26,7 @@ const _require = createRequire(import.meta.url);
 let nodemailerAvailable = false;
 try { _require.resolve('nodemailer'); nodemailerAvailable = true; } catch { /* opcional */ }
 
-const { Client, LocalAuth } = pkgWA;
+const { Client, LocalAuth, MessageMedia } = pkgWA;
 
 // FORZAR ZONA HORARIA COLOMBIA A NIVEL PROCESO
 process.env.TZ = 'America/Bogota';
@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.5';
+const APP_VERSION = '5.3.6';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -311,13 +311,17 @@ async function getMetaConfig() {
 // canal 'qr' -> cliente whatsapp-web.js de la instancia indicada (o la
 // primera lista, si no se indica). Devuelve { ok, channel, ... } y nunca
 // lanza: el llamador registra el error en system_events.
-async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId = null }) {
+// v5.3.6: media opcional { type, mimetype, data (base64), filename,
+// attachmentUrl (relativa, para Meta) }. Devuelve además messageId (id del
+// mensaje enviado) para guardarlo como external_id y no duplicarlo cuando
+// llegue el evento message_create.
+async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId = null, media = null }) {
   // El número debe normalizar a móvil colombiano (10 dígitos 3... o 12
   // dígitos 57... con móvil): antes bastaba con que hubiera dígitos y un
   // fijo o un número corto se intentaba enviar igual.
   const { phone: normPhone, normalized } = normalizePhoneCO(phone);
   const digits = normPhone.replace(/\D/g, '');
-  if (!content) return { ok: false, channel, error: 'Contenido vacío' };
+  if (!content && !media) return { ok: false, channel, error: 'Contenido vacío' };
   if (!normalized || !digits) return { ok: false, channel, error: 'Teléfono vacío o inválido (se esperaba un móvil colombiano)' };
 
   if (channel === 'meta') {
@@ -328,10 +332,27 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 15000);
+      let payload;
+      if (media) {
+        // Meta solo acepta media por enlace público: el adjunto vive en
+        // /uploads/... y la URL pública es la del dominio del servidor.
+        const base = await getPublicBaseUrl();
+        if (!base || !media.attachmentUrl) {
+          clearTimeout(timer);
+          return { ok: false, channel: 'meta', error: 'Multimedia por Meta no soportado todavía: falta la URL pública del servidor (PUBLIC_BASE_URL en .env o dominio de Railway)' };
+        }
+        const link = `${base}${media.attachmentUrl}`;
+        const caption = content || undefined;
+        const mtype = media.type === 'video' ? 'video' : media.type === 'audio' ? 'audio' : media.type === 'document' ? 'document' : media.type === 'sticker' ? 'sticker' : 'image';
+        const mediaObj = mtype === 'document' ? { link, caption, filename: media.filename || 'documento' } : { link, ...(caption ? { caption } : {}) };
+        payload = { messaging_product: 'whatsapp', to: digits, type: mtype, [mtype]: mediaObj };
+      } else {
+        payload = { messaging_product: 'whatsapp', to: digits, type: 'text', text: { body: content } };
+      }
       const res = await fetch(`https://graph.facebook.com/v19.0/${meta.phoneNumberId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${meta.token}` },
-        body: JSON.stringify({ messaging_product: 'whatsapp', to: digits, type: 'text', text: { body: content } }),
+        body: JSON.stringify(payload),
         signal: ctrl.signal,
       });
       clearTimeout(timer);
@@ -348,8 +369,14 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   else target = Object.keys(waClients).find((k) => waClients[k].status === 'ready' && waClients[k].channel !== 'meta' && waClients[k].client);
   if (!target) return { ok: false, channel: 'qr', error: 'Ninguna instancia de WhatsApp por QR lista' };
   try {
-    await waClients[target].client.sendMessage(`${digits}@c.us`, content);
-    return { ok: true, channel: 'qr', instance: target };
+    let sent;
+    if (media) {
+      const waMedia = new MessageMedia(media.mimetype, media.data, media.filename || 'archivo');
+      sent = await waClients[target].client.sendMessage(`${digits}@c.us`, waMedia, { caption: content || undefined, sendMediaAsDocument: media.type === 'document' });
+    } else {
+      sent = await waClients[target].client.sendMessage(`${digits}@c.us`, content);
+    }
+    return { ok: true, channel: 'qr', instance: target, messageId: sent?.id?._serialized || null };
   } catch (e) {
     return { ok: false, channel: 'qr', error: e.message };
   }
@@ -361,12 +388,16 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
 // (sin el + para que no se rompa en la URL /api/chats/:id/messages); el
 // teléfono guardado sí lleva el +57. externalId (wamid de Meta) evita
 // duplicados: la columna messages.external_id es UNIQUE.
-async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, channel = 'qr', externalId = null, senderName = null }) {
+// v5.3.6: sender ('client' por defecto, 'agent' para los enviados desde el
+// teléfono), type ('text', 'image', 'audio', 'video', 'document', 'sticker'),
+// attachmentUrl y incrementUnread (false en los propios: no son no leídos).
+async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, channel = 'qr', externalId = null, senderName = null, sender = 'client', type = 'text', attachmentUrl = null, incrementUnread = true }) {
   const { phone } = normalizePhoneCO(rawPhone);
   if (!phone) return null;
   const digits = phone.replace(/\D/g, '');
   let conversationId = `wa_${digits}`;
   const displayName = (senderName || '').trim() || phone;
+  const unreadDelta = incrementUnread ? 1 : 0;
   // Las 3 escrituras (cliente, conversación, mensaje) van en una
   // transacción: antes, si fallaba la tercera, quedaban cliente y
   // conversación huérfanos sin mensaje.
@@ -381,20 +412,20 @@ async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, ch
     let convRes = await client.query('SELECT * FROM conversations WHERE client_phone = $1', [phone]);
     if (convRes.rows.length === 0) {
       await client.query(
-        'INSERT INTO conversations (id, client_phone, client_name, source, status, last_message, last_message_time, unread_count, channel) VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1, $7) ON CONFLICT (id) DO UPDATE SET last_message = EXCLUDED.last_message, last_message_time = NOW(), unread_count = conversations.unread_count + 1, channel = EXCLUDED.channel',
-        [conversationId, phone, displayName, sourceName, 'open', content, channel]
+        'INSERT INTO conversations (id, client_phone, client_name, source, status, last_message, last_message_time, unread_count, channel) VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8) ON CONFLICT (id) DO UPDATE SET last_message = EXCLUDED.last_message, last_message_time = NOW(), unread_count = conversations.unread_count + $7, channel = EXCLUDED.channel',
+        [conversationId, phone, displayName, sourceName, 'open', content, unreadDelta, channel]
       );
     } else {
       conversationId = convRes.rows[0].id;
       await client.query(
-        'UPDATE conversations SET last_message = $1, last_message_time = NOW(), unread_count = unread_count + 1, channel = $3 WHERE id = $2',
-        [content, conversationId, channel]
+        'UPDATE conversations SET last_message = $1, last_message_time = NOW(), unread_count = unread_count + $4, channel = $3 WHERE id = $2',
+        [content, conversationId, channel, unreadDelta]
       );
     }
 
     await client.query(
-      'INSERT INTO messages (conversation_id, sender, type, content, timestamp, external_id) VALUES ($1, $2, $3, $4, NOW(), $5) ON CONFLICT (external_id) DO NOTHING',
-      [conversationId, 'client', 'text', content, externalId]
+      'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, $2, $3, $4, $5, NOW(), $6) ON CONFLICT (external_id) DO NOTHING',
+      [conversationId, sender, type, content, attachmentUrl, externalId]
     );
     await client.query('COMMIT');
   } catch (e) {
@@ -406,6 +437,191 @@ async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, ch
 
   notifyUpdate('webhook_message');
   return conversationId;
+}
+
+// --- v5.3.6: MULTIMEDIA Y SINCRONIZACIÓN DE ENVIADOS ---
+// Tope de 25 MB por archivo de media (entrante y saliente). WhatsApp Web
+// acepta menos en foto/video/audio (~16 MB), así que un envío grande puede
+// fallar en WhatsApp aunque el CRM lo guarde: el fallo queda en sent=false.
+const WA_MEDIA_MAX_BYTES = 25 * 1024 * 1024;
+function waMediaDir() { return path.join(__dirname, 'uploads', 'wa-media'); }
+const WA_MEDIA_LABELS = { image: '📷 Imagen', audio: '🎤 Nota de voz', video: '🎬 Video', document: '📎 Documento', sticker: '😀 Sticker' };
+// Tipos de whatsapp-web.js que son media real (además de 'chat' = texto).
+// 'ptt' es nota de voz y se guarda como 'audio', igual que el composer.
+const WA_MEDIA_MSG_TYPES = ['image', 'audio', 'ptt', 'video', 'document', 'sticker'];
+function waMediaTypeFromMessage(msg) {
+  switch (msg.type) {
+    case 'image': return 'image';
+    case 'audio': case 'ptt': return 'audio';
+    case 'video': return 'video';
+    case 'document': return 'document';
+    case 'sticker': return 'sticker';
+    default: return null;
+  }
+}
+const WA_MIME_EXT = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+  'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac',
+  'audio/wav': 'wav', 'audio/x-wav': 'wav', 'video/mp4': 'mp4', 'video/quicktime': 'mov',
+  'video/webm': 'webm', 'application/pdf': 'pdf',
+  'application/msword': 'doc', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'text/plain': 'txt',
+};
+function waMediaExtFromMime(mimetype, filename) {
+  if (WA_MIME_EXT[mimetype]) return WA_MIME_EXT[mimetype];
+  const fromName = String(filename || '').split('.').pop();
+  if (fromName && /^[A-Za-z0-9]{2,5}$/.test(fromName)) return fromName.toLowerCase();
+  return 'bin';
+}
+function waMediaTypeFromMime(mimetype) {
+  const m = String(mimetype || '');
+  if (m.startsWith('image/')) return 'image';
+  if (m.startsWith('audio/')) return 'audio';
+  if (m.startsWith('video/')) return 'video';
+  return 'document';
+}
+// URL pública del servidor (para que Meta pueda bajar un adjunto por enlace).
+// Railway la expone como RAILWAY_PUBLIC_DOMAIN; en VPS se pone
+// PUBLIC_BASE_URL en .env. Sin URL pública, la media por Meta no se envía.
+async function getPublicBaseUrl() {
+  const envUrl = (process.env.PUBLIC_BASE_URL || '').trim();
+  if (envUrl) return envUrl.replace(/\/$/, '');
+  const railwayDomain = (process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
+  if (railwayDomain) return `https://${railwayDomain}`;
+  try {
+    const v = await getSettingValue('public_base_url', '');
+    if (v && String(v).trim()) return String(v).trim().replace(/\/$/, '');
+  } catch { /* sin URL pública */ }
+  return '';
+}
+
+// Resuelve el teléfono del interlocutor de un mensaje de WhatsApp Web.
+// peerId es msg.from (entrante) o msg.to (enviado desde el teléfono).
+// getContact es la forma de pedir el contacto: entrante usa msg.getContact()
+// (probado en v5.3.5); saliente usa client.getContactById(msg.to), porque
+// en message_create msg.getContact() devolvería el propio número.
+// Devuelve { phone, senderName } o null (con el motivo en el log).
+// La lógica LID es la de v5.3.5: 1º contact.id._serialized, 2º number.
+async function resolveWaPeerPhone(peerId, getContact, name) {
+  const raw = String(peerId || '');
+  if (!raw) return null;
+  if (raw.endsWith('@lid')) {
+    const lidDigits = raw.split('@')[0];
+    try {
+      const contact = await getContact();
+      const idSerialized = String(contact?.id?._serialized || '');
+      const numberField = String(contact?.number || '');
+      const senderName = (contact?.pushname || contact?.name || '').trim() || null;
+      const candidates = [];
+      if (idSerialized.endsWith('@c.us')) candidates.push(idSerialized.split('@')[0].replace(/\D/g, ''));
+      candidates.push(numberField.replace(/\D/g, ''));
+      const candidate = candidates.find((c) => c && c !== lidDigits && /^\d{7,15}$/.test(c));
+      if (candidate) {
+        logger.info(`WhatsApp ${name}: remitente LID ${raw} resuelto al número ${candidate}`);
+        return { phone: candidate, senderName };
+      }
+      logger.warn(`WhatsApp ${name}: no se pudo resolver el número del remitente LID ${raw} (contacto id=${idSerialized || 'desconocido'} number=${numberField || 'vacío'}); mensaje descartado.`);
+      return null;
+    } catch (e) {
+      logger.warn(`WhatsApp ${name}: error resolviendo el remitente LID ${raw}; mensaje descartado.`, e?.message || e);
+      return null;
+    }
+  }
+  if (raw.endsWith('@c.us')) return { phone: raw.replace('@c.us', ''), senderName: null };
+  return null;
+}
+
+// Descarga la media de un mensaje de WhatsApp Web y la guarda en
+// uploads/wa-media/. Devuelve { type, attachmentUrl } o null (sin media,
+// descarga fallida o archivo mayor de 25 MB — en ese caso deja constancia
+// en el log y no tumba nada).
+async function downloadWaMedia(msg, name) {
+  if (!msg.hasMedia) return null;
+  let media;
+  try {
+    media = await msg.downloadMedia();
+  } catch (e) {
+    logger.warn(`WhatsApp ${name}: no se pudo descargar la media del mensaje ${msg.id?._serialized || ''}: ${e?.message || e}`);
+    return null;
+  }
+  if (!media?.data) return null;
+  const size = Math.ceil((media.data.length * 3) / 4);
+  if (size > WA_MEDIA_MAX_BYTES) {
+    logger.warn(`WhatsApp ${name}: media de ${Math.round(size / 1024 / 1024)} MB supera el tope de 25 MB; mensaje descartado.`);
+    return { tooLarge: true };
+  }
+  const type = waMediaTypeFromMessage(msg) || waMediaTypeFromMime(media.mimetype);
+  const ext = waMediaExtFromMime(media.mimetype, media.filename);
+  const safeId = String(msg.id?._serialized || `${Date.now()}`).replace(/[^A-Za-z0-9]/g, '_');
+  const filename = `${safeId}.${ext}`;
+  try {
+    fs.mkdirSync(waMediaDir(), { recursive: true });
+    fs.writeFileSync(path.join(waMediaDir(), filename), Buffer.from(media.data, 'base64'));
+  } catch (e) {
+    logger.error(`WhatsApp ${name}: no se pudo guardar la media en disco`, e?.message || e);
+    return null;
+  }
+  return { type, attachmentUrl: `/uploads/wa-media/${filename}` };
+}
+
+// Procesa UN mensaje de WhatsApp Web (entrante o enviado desde el teléfono)
+// y lo guarda con handleIncomingWhatsApp. Devuelve true si se guardó
+// (o ya estaba guardado por external_id) y false si se ignoró.
+// opts: { id, name, sourceName, channel, sender ('client'|'agent'),
+//   incrementUnread (bool), getContact (fn) }.
+async function processWaMessage(msg, opts) {
+  const { id, name, sourceName, channel, sender, incrementUnread, getContact } = opts;
+  const peerId = sender === 'agent' ? msg.to : msg.from;
+  const resolved = await resolveWaPeerPhone(peerId, getContact, name);
+  if (!resolved) return false;
+  const { phone, senderName } = resolved;
+  let type = 'text';
+  let content = (msg.body || '').trim();
+  let attachmentUrl = null;
+  const mediaType = waMediaTypeFromMessage(msg);
+  if (mediaType) {
+    const dl = await downloadWaMedia(msg, name);
+    if (!dl || dl.tooLarge) return false;
+    type = dl.type;
+    attachmentUrl = dl.attachmentUrl;
+    if (!content) content = WA_MEDIA_LABELS[type] || '📎 Archivo';
+  } else if (msg.type !== 'chat') {
+    return false;
+  }
+  if (!content) return false;
+  waClients[id].lastSeen = new Date().toISOString();
+  waClients[id].lastMessageAt = new Date().toISOString();
+  logger.info(`Mensaje recibido en ${name} de ${phone}: ${content}`);
+  try {
+    await handleIncomingWhatsApp({ phone, content, type, attachmentUrl, sender, incrementUnread, sourceName, channel, externalId: msg.id?._serialized || null, senderName });
+  } catch (err) {
+    logger.error('Error procesando mensaje de WhatsApp', err);
+  }
+  return true;
+}
+
+// Lee un adjunto ya subido a uploads/wa-media/ para enviarlo por WhatsApp.
+// Devuelve { mimetype, data (base64), filename, size } o { error }.
+// Solo acepta rutas dentro de uploads/wa-media (nunca fuera de uploads).
+function readWaAttachmentFile(attachmentUrl) {
+  if (!attachmentUrl || !String(attachmentUrl).startsWith('/uploads/wa-media/')) return { error: 'Adjunto fuera de la carpeta de media' };
+  const full = path.join(__dirname, String(attachmentUrl).replace(/^\/+/, ''));
+  const base = path.join(__dirname, 'uploads', 'wa-media');
+  if (!full.startsWith(base + path.sep)) return { error: 'Adjunto fuera de la carpeta de media' };
+  if (!fs.existsSync(full)) return { error: 'Archivo adjunto no encontrado en el servidor' };
+  const buf = fs.readFileSync(full);
+  if (buf.length > WA_MEDIA_MAX_BYTES) return { error: 'El archivo supera 25 MB' };
+  const ext = path.extname(full).toLowerCase().slice(1);
+  const mimeByExt = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif',
+    ogg: 'audio/ogg', mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav',
+    mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', pdf: 'application/pdf',
+    doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    txt: 'text/plain',
+  };
+  return { mimetype: mimeByExt[ext] || 'application/octet-stream', data: buf.toString('base64'), filename: path.basename(full), size: buf.length };
 }
 
 // --- CONFIGURACIÓN DE MULTI-WHATSAPP ---
@@ -717,6 +933,12 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
     maybeAlert(`whatsapp-down-${id}`, `🚨 WhatsApp desconectado (${name}): ${reason || 'sin motivo'}. Revisa Estado del Sistema en el CRM.`);
   });
 
+  // v5.3.6 — Multimedia entrante: además de texto ('chat') se aceptan
+  // image, audio, ptt (nota de voz), video, document y sticker. La media se
+  // descarga y se guarda en uploads/wa-media/ (tope 25 MB). Los grupos
+  // (@g.us), estados (@broadcast) y mensajes de sistema (e2e_notification,
+  // notification_template) se siguen ignorando; la resolución LID y el
+  // diagnóstico de entrada viven en processWaMessage.
   client.on('message', async (msg) => {
     if (!isCurrent()) return;
     // v5.3.4 — Diagnóstico de entrada: se registra UNA línea ANTES de
@@ -725,64 +947,28 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
     // era imposible saber si llegó o no. Con esta línea, el log de
     // Railway muestra cada mensaje que WhatsApp Web entrega al CRM.
     logger.info(`WhatsApp ${name}: mensaje entrante from=${msg.from} type=${msg.type} hasMedia=${!!msg.hasMedia} fromMe=${!!msg.fromMe}`);
-    // Solo mensajes de texto de chats 1 a 1. Los grupos (@g.us) y los
-    // estados (@broadcast) se ignoran; los remitentes LID (@lid) ya no se
-    // descartan: se resuelven al número real (ver abajo).
-    if (msg.from.includes('@g.us') || msg.from.includes('@broadcast')) return;
-    if (msg.type !== 'chat') return;
-    const content = (msg.body || '').trim();
-    if (!content) return;
+    if (msg.from.includes('@g.us') || msg.from.includes('@broadcast') || msg.from.includes('@bot')) return;
+    if (msg.type === 'e2e_notification' || msg.type === 'notification_template') return;
+    await processWaMessage(msg, { id, name, sourceName: `WhatsApp Directo (${name})`, channel: 'qr', sender: 'client', incrementUnread: true, getContact: () => msg.getContact() });
+  });
 
-    let phone;
-    let senderName = null;
-    if (msg.from.endsWith('@lid')) {
-      // v5.3.5 — CORRECCIÓN del bug de v5.3.4: en remitentes LID el código
-      // leía `contact.number` para resolver el número, pero en contactos
-      // LID ese campo trae el propio LID (o vacío), NO el teléfono. El
-      // número real que WhatsApp Web ya resolvió viene en
-      // `contact.id._serialized` (forma <teléfono>@c.us). Prueba del log
-      // real (22:52:24, deploy v5.3.4): el mensaje de 265076942618676@lid
-      // se descartó aunque el contacto ya traía 573116040943@c.us en su
-      // id — el número estaba ahí, se leyó la variable equivocada.
-      // Orden de resolución: 1º id._serialized, 2º number como respaldo.
-      const lidDigits = String(msg.from || '').split('@')[0];
-      try {
-        const contact = await msg.getContact();
-        const idSerialized = String(contact?.id?._serialized || '');
-        const numberField = String(contact?.number || '');
-        senderName = (contact?.pushname || contact?.name || '').trim() || null;
-        const candidates = [];
-        if (idSerialized.endsWith('@c.us')) candidates.push(idSerialized.split('@')[0].replace(/\D/g, ''));
-        candidates.push(numberField.replace(/\D/g, ''));
-        const candidate = candidates.find((c) => c && c !== lidDigits && /^\d{7,15}$/.test(c));
-        if (candidate) {
-          phone = candidate;
-          logger.info(`WhatsApp ${name}: remitente LID ${msg.from} resuelto al número ${phone}`);
-        } else {
-          logger.warn(`WhatsApp ${name}: no se pudo resolver el número del remitente LID ${msg.from} (contacto id=${idSerialized || 'desconocido'} number=${numberField || 'vacío'}); mensaje descartado.`);
-          return;
-        }
-      } catch (e) {
-        logger.warn(`WhatsApp ${name}: error resolviendo el remitente LID ${msg.from}; mensaje descartado.`, e?.message || e);
-        return;
-      }
-    } else {
-      phone = msg.from.replace('@c.us', '');
-    }
-    waClients[id].lastSeen = new Date().toISOString();
-    waClients[id].lastMessageAt = new Date().toISOString();
-
-    logger.info(`Mensaje recibido en ${name} de ${phone}: ${content}`);
-
-    try {
-      // Misma lógica que el webhook de Meta (ver handleIncomingWhatsApp):
-      // normaliza el teléfono y crea cliente/conversación/mensaje. El id
-      // serializado del mensaje va como external_id para deduplicar
-      // (antes siempre era NULL en QR y no había deduplicación).
-      await handleIncomingWhatsApp({ phone, content, sourceName: `WhatsApp Directo (${name})`, channel: 'qr', externalId: msg.id?._serialized || null, senderName });
-    } catch (err) {
-      logger.error('Error procesando mensaje de WhatsApp', err);
-    }
+  // v5.3.6 — Sincronización de enviados desde el teléfono: 'message_create'
+  // dispara por cada mensaje que crea el cliente, incluidos los que se
+  // envían DESDE el celular vinculado. Sin esto, lo que el asesor responde
+  // desde el teléfono nunca aparecía en el CRM y nadie sabía qué se había
+  // contestado. Solo se procesan los propios (fromMe): los entrantes ya
+  // los guarda client.on('message'). El interlocutor es msg.to (con la
+  // misma resolución LID). Se guarda como sender 'agent' (así lo pinta el
+  // inbox como propio), sin sumar no leídos, y con dedup por external_id:
+  // los enviados DESDE el CRM ya quedan guardados con su external_id en
+  // POST /api/chats/:id/messages, así que el evento los ignora.
+  client.on('message_create', async (msg) => {
+    if (!isCurrent()) return;
+    if (!msg.fromMe) return;
+    logger.info(`WhatsApp ${name}: mensaje propio desde el teléfono to=${msg.to} type=${msg.type} hasMedia=${!!msg.hasMedia}`);
+    if (String(msg.to || '').includes('@g.us') || String(msg.to || '').includes('@broadcast') || String(msg.to || '').includes('@bot')) return;
+    if (msg.type === 'e2e_notification' || msg.type === 'notification_template') return;
+    await processWaMessage(msg, { id, name, sourceName: `WhatsApp Directo (${name})`, channel: 'qr', sender: 'agent', incrementUnread: false, getContact: () => client.getContactById(msg.to) });
   });
 
   // v5.3.4: si el arranque falla porque el perfil está bloqueado por un
@@ -892,6 +1078,8 @@ app.use(helmet({ contentSecurityPolicy: false })); // CSP desactivada: el fronte
 app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (req.url.startsWith('/api/webhooks/meta')) req.rawBody = buf; } }));
 // Logos subidos (marca blanca): públicos, solo imágenes estáticas.
 fs.mkdirSync(path.join(__dirname, 'uploads'), { recursive: true });
+// v5.3.6: adjuntos de WhatsApp (fotos, audios, videos, documentos).
+fs.mkdirSync(waMediaDir(), { recursive: true });
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Middleware de Logs de peticiones
@@ -2430,33 +2618,25 @@ app.post('/api/chats/:id/messages', async (req, res) => {
     return res.status(403).json({ error: 'Solo lectura: los operadores no pueden enviar mensajes' });
   }
   const { content, type, attachmentUrl } = req.body;
+  const msgType = ['text', 'image', 'audio', 'video', 'document', 'sticker'].includes(type) ? type : 'text';
   try {
-    // 1. Guardar mensaje localmente
-    await pool.query(
-      'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp) VALUES ($1, $2, $3, $4, $5, NOW())',
-      [id, 'agent', type || 'text', content || '', attachmentUrl || null]
-    );
-
     let lastMsgPreview = content;
     if (!lastMsgPreview) {
-      if (type === 'image') lastMsgPreview = '📷 Imagen';
-      else if (type === 'audio') lastMsgPreview = '🎤 Nota de voz';
+      if (msgType === 'image') lastMsgPreview = '📷 Imagen';
+      else if (msgType === 'audio') lastMsgPreview = '🎤 Nota de voz';
+      else if (msgType === 'video') lastMsgPreview = '🎬 Video';
+      else if (msgType === 'document') lastMsgPreview = '📎 Documento';
+      else if (msgType === 'sticker') lastMsgPreview = '😀 Sticker';
       else lastMsgPreview = '📎 Archivo';
     }
 
-    // 2. Actualizar conversación
-    await pool.query(`UPDATE conversations SET last_message = $1, last_message_time = NOW(), unread_count = 0 WHERE id = $2`, [lastMsgPreview, id]);
-
-    // 3. Enviar a WhatsApp: por Meta Cloud API si la conversación es Meta,
-    // por QR si es QR. El teléfono se normaliza dentro de
-    // sendWhatsAppMessage; si el envío falla, el mensaje queda guardado y
-    // el fallo queda en system_events (antes solo se registraba si no había
-    // ninguna instancia lista; un error de envío se perdía en silencio).
-    // La respuesta incluye sent/error (contrato con el frontend): el
-    // mensaje SÍ quedó guardado, así que success sigue true y HTTP 200,
-    // pero el frontend muestra "guardado pero no enviado" si sent=false.
+    // 1. Conversación y canal (para saber por dónde enviar). La respuesta
+    // incluye sent/error (contrato con el frontend): el mensaje SÍ queda
+    // guardado, así que success sigue true y HTTP 200, pero el frontend
+    // muestra "guardado pero no enviado" si sent=false.
     let sent = true;
     let sendError = null;
+    let messageId = null;
     const convRes = await pool.query('SELECT client_phone, channel, source FROM conversations WHERE id = $1', [id]);
     if (convRes.rows.length > 0 && convRes.rows[0].client_phone) {
       const phone = convRes.rows[0].client_phone;
@@ -2467,13 +2647,32 @@ app.post('/api/chats/:id/messages', async (req, res) => {
         const metaInst = Object.values(waClients).find((w) => w.channel === 'meta' && convRes.rows[0].source && convRes.rows[0].source.includes(w.name));
         if (metaInst) channel = 'meta';
       }
-      if (content) {
-        const result = await sendWhatsAppMessage({ phone, content, channel });
-        if (!result.ok) {
-          sent = false;
-          sendError = result.error;
-          logger.error('Error enviando mensaje via WA', result.error);
-          recordEvent('error', 'whatsapp', `No se pudo enviar el mensaje del chat a ${phone} (${channel}): ${result.error}`, { conversation: id, channel });
+      // 2. Enviar a WhatsApp (texto y/o media). v5.3.6: se envía ANTES de
+      // guardar para obtener el id del mensaje enviado y guardarlo como
+      // external_id: el evento message_create dispara también por los
+      // mensajes enviados desde el CRM, y sin ese id se guardarían dos
+      // veces (una por este POST y otra por el evento).
+      if (content || attachmentUrl) {
+        let media = null;
+        if (attachmentUrl) {
+          const file = readWaAttachmentFile(attachmentUrl);
+          if (file.error) {
+            sent = false;
+            sendError = file.error;
+          } else {
+            media = { type: msgType, mimetype: file.mimetype, data: file.data, filename: file.filename, attachmentUrl };
+          }
+        }
+        if (sent) {
+          const result = await sendWhatsAppMessage({ phone, content, channel, media });
+          if (!result.ok) {
+            sent = false;
+            sendError = result.error;
+            logger.error('Error enviando mensaje via WA', result.error);
+            recordEvent('error', 'whatsapp', `No se pudo enviar el mensaje del chat a ${phone} (${channel}): ${result.error}`, { conversation: id, channel });
+          } else {
+            messageId = result.messageId || null;
+          }
         }
       }
     } else {
@@ -2482,12 +2681,59 @@ app.post('/api/chats/:id/messages', async (req, res) => {
       sendError = 'Conversación sin teléfono: el mensaje quedó guardado pero no se envió';
     }
 
+    // 3. Guardar mensaje localmente con su external_id (o NULL si no se
+    // envió). ON CONFLICT DO NOTHING: si message_create ya lo guardó
+    // (el evento puede llegar antes que este INSERT), no se duplica.
+    await pool.query(
+      'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, $2, $3, $4, $5, NOW(), $6) ON CONFLICT (external_id) DO NOTHING',
+      [id, 'agent', msgType, content || '', attachmentUrl || null, messageId]
+    );
+
+    // 4. Actualizar conversación
+    await pool.query(`UPDATE conversations SET last_message = $1, last_message_time = NOW(), unread_count = 0 WHERE id = $2`, [lastMsgPreview, id]);
+
     const advisorRes = await pool.query("SELECT e.id FROM employees e JOIN leads l ON e.name = l.advisor WHERE l.conversation_id = $1", [id]);
     notifyUpdate('chat', advisorRes.rows.map(r => r.id));
     res.json({ success: true, sent, error: sendError });
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
   }
+});
+
+// v5.3.6 — Subida de adjuntos para el chat (imagen/audio/video/documento).
+// El frontend sube primero el archivo aquí y luego envía el mensaje con el
+// attachmentUrl devuelto. Tope 25 MB por archivo; los archivos quedan en
+// uploads/wa-media/ (públicos por /uploads, como el logo).
+const waMediaUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => { fs.mkdirSync(waMediaDir(), { recursive: true }); cb(null, waMediaDir()); },
+    filename: (req, file, cb) => {
+      const ext = waMediaExtFromMime(file.mimetype, file.originalname);
+      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
+    },
+  }),
+  limits: { fileSize: WA_MEDIA_MAX_BYTES },
+});
+app.post('/api/chats/:id/attachments', async (req, res) => {
+  if (normalizeRoleValue(req.user?.role) === 'operator') {
+    return res.status(403).json({ error: 'Solo lectura: los operadores no pueden enviar mensajes' });
+  }
+  waMediaUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) return res.status(400).json({ error: 'Sube un archivo' });
+    const mimetype = req.file.mimetype || '';
+    const okMime = mimetype.startsWith('image/') || mimetype.startsWith('audio/') || mimetype.startsWith('video/') ||
+      ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'text/plain'].includes(mimetype);
+    if (!okMime) {
+      try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
+      return res.status(400).json({ error: 'Tipo de archivo no permitido (imagen, audio, video o documento)' });
+    }
+    const type = waMediaTypeFromMime(mimetype);
+    res.json({ success: true, attachmentUrl: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
+  });
 });
 
 app.get('/api/ranking', async (req, res) => {
