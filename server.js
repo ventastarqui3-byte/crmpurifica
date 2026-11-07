@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.4';
+const APP_VERSION = '5.3.5';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -736,24 +736,30 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
     let phone;
     let senderName = null;
     if (msg.from.endsWith('@lid')) {
-      // v5.3.4 — Remitentes LID (identidad vinculada de WhatsApp, cada
-      // vez más común en 2025): antes se descartaban en silencio y el
-      // mensaje nunca llegaba al CRM aunque la instancia estaba en
-      // 'ready'. La librería resuelve el LID al número real en
-      // getContactModel (Utils.js): si WhatsApp Web conoce el número, el
-      // contacto viene con id <teléfono>@c.us y number = el teléfono.
-      // Si NO se puede resolver (el número no es conocido), number es
-      // el propio LID y el mensaje se descarta dejando constancia.
+      // v5.3.5 — CORRECCIÓN del bug de v5.3.4: en remitentes LID el código
+      // leía `contact.number` para resolver el número, pero en contactos
+      // LID ese campo trae el propio LID (o vacío), NO el teléfono. El
+      // número real que WhatsApp Web ya resolvió viene en
+      // `contact.id._serialized` (forma <teléfono>@c.us). Prueba del log
+      // real (22:52:24, deploy v5.3.4): el mensaje de 265076942618676@lid
+      // se descartó aunque el contacto ya traía 573116040943@c.us en su
+      // id — el número estaba ahí, se leyó la variable equivocada.
+      // Orden de resolución: 1º id._serialized, 2º number como respaldo.
       const lidDigits = String(msg.from || '').split('@')[0];
       try {
         const contact = await msg.getContact();
-        const candidate = String(contact?.number || '').replace(/\D/g, '');
+        const idSerialized = String(contact?.id?._serialized || '');
+        const numberField = String(contact?.number || '');
         senderName = (contact?.pushname || contact?.name || '').trim() || null;
-        if (candidate && candidate !== lidDigits && /^\d{7,15}$/.test(candidate)) {
+        const candidates = [];
+        if (idSerialized.endsWith('@c.us')) candidates.push(idSerialized.split('@')[0].replace(/\D/g, ''));
+        candidates.push(numberField.replace(/\D/g, ''));
+        const candidate = candidates.find((c) => c && c !== lidDigits && /^\d{7,15}$/.test(c));
+        if (candidate) {
           phone = candidate;
           logger.info(`WhatsApp ${name}: remitente LID ${msg.from} resuelto al número ${phone}`);
         } else {
-          logger.warn(`WhatsApp ${name}: no se pudo resolver el número del remitente LID ${msg.from} (contacto: ${contact?.id?._serialized || 'desconocido'}); mensaje descartado.`);
+          logger.warn(`WhatsApp ${name}: no se pudo resolver el número del remitente LID ${msg.from} (contacto id=${idSerialized || 'desconocido'} number=${numberField || 'vacío'}); mensaje descartado.`);
           return;
         }
       } catch (e) {

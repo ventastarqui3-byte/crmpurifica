@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3.4 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
+# Purifica Tu Ambiente CRM — v5.3.5 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -103,6 +103,57 @@ aviso si se la llama cuando ya existe una instancia en memoria.
    **Mensajes**.
 3. Si el remitente escribe con LID, que el log muestre "remitente LID …
    resuelto al número …".
+
+## WhatsApp QR: corrección de la resolución LID v5.3.5 (2026-11-07)
+
+El diagnóstico de la v5.3.4 funcionó: el log real de Railway (deploy
+v5.3.4, 22:48–22:52 UTC) muestra que los mensajes SÍ llegan al evento
+`message`. Tras el ready (22:51:52) llegaron varios `type=e2e_notification`
+y `type=notification_template` desde @lid (mensajes de sistema, bien
+ignorados) y un `type=rich_response` desde @bot (bien ignorado). Y llegó
+UN mensaje real: 22:52:24, `from=265076942618676@lid type=chat hasMedia=false
+fromMe=false`.
+
+Ese mensaje real fue **descartado por la resolución LID de la v5.3.4**. La
+línea del log dice, literal:
+
+> "no se pudo resolver el número del remitente LID 265076942618676@lid
+> (contacto: 573116040943@c.us); mensaje descartado."
+
+El contacto YA traía el número real en su id (`573116040943@c.us`), pero
+el código leía la variable equivocada: `contact.number` (que en contactos
+LID trae el propio LID o vacío) en vez de `contact.id._serialized`. La
+validación (7–15 dígitos, distinto de los dígitos del LID) falló por leer
+el campo equivocado, no porque el número no se pudiera resolver. **Sí hay
+una variable mal en el código, y era esta.**
+
+Corrección (v5.3.5, `server.js`, handler `client.on('message')`):
+
+- El número resuelto se saca PRIMERO de `contact.id._serialized` (si
+  termina en `@c.us`, sus dígitos son el número real que WhatsApp Web ya
+  resolvió) y solo como respaldo de `contact.number`.
+- Se acepta el primer candidato con 7–15 dígitos y distinto de los
+  dígitos del LID. El resto del flujo no cambia (`handleIncomingWhatsApp`
+  con dedup por `external_id`, `senderName` del pushname).
+- En el log de descarte ahora quedan registrados AMBOS valores
+  (`id` serializado y `number`) para que un próximo fallo no sea a ciegas.
+- No se tocó nada más de WhatsApp (diagnóstico de entrada, limpieza de
+  bloqueos SingletonLock, vigilante de ready, auto-restauración, envío,
+  canal Meta: todo intacto). No se añadió sincronización de historial en
+  esta versión.
+
+> **El mensaje de prueba descartado no se puede recuperar**: su contenido
+> no quedó en el log (el diagnóstico de entrada no registra contenido) y
+> WhatsApp Web no re-entrega mensajes pasados. Hay que reenviarlo tras
+> desplegar la v5.3.5.
+
+### Qué comprobar tras desplegar
+
+1. Que un mensaje nuevo de texto (1 a 1) deje "mensaje entrante" y luego
+   "remitente LID … resuelto al número …" y "Mensaje recibido" en el log
+   de Railway, y aparezca en **Mensajes**.
+2. Que tras un redespliegue no vuelva el Code 21 (la limpieza de
+   SingletonLock de la v5.3.4 sigue activa).
 
 ## WhatsApp QR: arreglo del fallo de Chrome v5.3.3 (2026-11-07)
 
@@ -1609,3 +1660,21 @@ real y seguro. Lo arriesgado quedó como pendiente documentado abajo.
   con la sesión real del volumen, el vigilante de 120 s con su reintento
   automático (solo verificado en código), Meta real, DB real, Wompi/PayU
   real, DIAN real.
+
+## Verificación hecha en esta máquina (v5.3.5, 2026-11-07)
+
+- `npx tsc --noEmit` exit 0. `npm run build` OK en 12.90 s (solo el aviso
+  habitual de chunk > 500 kB).
+- Arranque sin `DATABASE_URL` (puerto 3166, estilo Railway con `PORT`):
+  `GET /` 200, `GET /api/health` 200
+  (`{"ok":true,"version":"5.3.5","db":false,"whatsapp":{"instances":0,"connected":0}}`),
+  `/api/wa/instances` sin token 401, `/server.js` 404. Log sin errores.
+- Grep: la resolución LID lee primero `contact.id._serialized` (línea 751)
+  y solo usa `contact.number` como respaldo (línea 756); el log de
+  descarte registra ambos valores. `clearWaSessionLocks`,
+  `restoreWhatsAppInstances`, `armReadyWatchdog` y `stopWaInstance`
+  siguen presentes (15 referencias).
+- Sin probar (honesto): QR real y llegada a `ready` en Railway, un mensaje
+  real de remitente LID entrando al CRM (la corrección solo se puede
+  comprobar con un mensaje LID real), Meta real, DB real, Wompi/PayU real,
+  DIAN real.
