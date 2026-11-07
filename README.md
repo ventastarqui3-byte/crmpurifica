@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3.1 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS)
+# Purifica Tu Ambiente CRM — v5.3.2 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -25,6 +25,71 @@ multi-instancia**.
 > Sistema** (solo admin), el vigilante revisa DB y WhatsApp cada 5 min y
 > avisa por **Telegram** cuando algo se rompe o se recupera, y hay respaldo
 > diario automático a las 02:00. Ver "¿Cómo sé si algo se rompió?" más abajo.
+
+## WhatsApp QR: arreglos v5.3.2 (2026-11-07)
+
+**El problema en producción (Railway, v5.3.1):** la instancia QR se
+autenticaba por QR (el celular decía vinculado, el log decía "WhatsApp
+pedro autenticado") pero **nunca llegaba a `ready`**: el log nunca mostró
+"WhatsApp pedro está listo!", Estado del Sistema decía WhatsApp por QR:
+Roto (0 de 1), y no llegaba ningún mensaje. Reconectar re-inicializaba y
+autenticaba en ~1 s sin pedir QR nuevo (la sesión del volumen servía),
+pero tampoco llegaba a ready. No había errores en el log: se quedaba
+colgado. Además el evento `authenticated` se registró DOS veces en el log
+al mismo segundo, señal de doble inicialización.
+
+**Qué se corrigió (todo en `server.js`, salvo la versión de la librería):**
+
+1. **Librería actualizada:** `whatsapp-web.js` 1.34.6 → **1.34.7** (última
+   estable; la 2.0.0 es solo alpha). `qrcode` ya estaba en la última
+   (1.5.4). El cambio 1.34.6→1.34.7 es pequeño (correcciones de
+   `markSeen`/`sendSeen`, llamadas y Channels para los cambios recientes
+   de WhatsApp Web); el peso del arreglo está en los puntos siguientes.
+2. **`--single-process` eliminado** de los args de puppeteer en
+   `initWhatsApp`. En Docker ese flag hacía que la página de WhatsApp Web
+   se quedara colgada tras autenticar: el cliente nunca emitía `ready`.
+3. **Las instancias se restauran solas al arrancar.** Antes `initWhatsApp`
+   estaba comentado en el arranque y tras cada redespliegue había que
+   darle a Reconectar a mano. Ahora, al terminar `initDB`, se leen las
+   instancias guardadas en `settings` (`wa_channel_<id>` y `wa_name_<id>`)
+   y se levanta cada una (QR con la sesión del volumen, sin QR nuevo;
+   Meta como entrada virtual). Si la DB no está, no se restaura nada y el
+   arranque sigue igual. Un fallo restaurando una instancia se registra y
+   no rompe el arranque.
+4. **Vigilante de `ready` (120 s).** Si una instancia QR lleva más de 120 s
+   en `authenticated` o `initializing` sin llegar a `ready`, queda un
+   warning claro en el log y en `system_events` ("autenticado pero sin
+   quedar listo...") e intenta **una sola** re-inicialización automática
+   por instancia y arranque (con guarda anti-bucle: después del reintento
+   solo deja el estado visible para reconectar a mano).
+5. **Doble inicialización corregida.** La parada de una instancia ahora es
+   centralizada (`stopWaInstance`: limpia el vigilante, destruye el
+   cliente con tope de 10 s para que un `destroy()` colgado no deje un
+   Chrome zombi, borra la entrada) y la usan Reconectar, cambio de canal
+   y borrado. En el borrado, si `logout()` fallaba, `destroy()` nunca se
+   llamaba y el Chrome quedaba vivo: ahora el logout se intenta y la
+   parada siempre ocurre. Además cada handler de eventos (`qr`, `ready`,
+   `authenticated`, `auth_failure`, `disconnected`, `message`) ignora
+   eventos de un cliente que ya no es el vigente para ese id, así un
+   cliente viejo no puede pisar el estado de la instancia nueva.
+6. **Nombre de instancia persistido** (`wa_name_<id>` en settings) para que
+   la restauración al arrancar muestre el mismo nombre y no solo el id.
+
+**Sin cambios en el canal Meta:** sigue intacto (entrada virtual, webhook
+con firma HMAC, envío por Graph API v19.0). La recepción por QR sigue
+igual: solo texto de chats 1 a 1 (se ignoran grupos `@g.us`, estados
+`@broadcast`, LID `@lid` y mensajes no-texto). El envío desde el inbox
+sigue exigiendo una instancia en `ready` y devuelve `sent: false` con el
+error visible si no hay ninguna lista.
+
+**Qué hacer tras desplegar esta versión en Railway:** nada especial. Al
+arrancar, la instancia "pedro" (ID HOLA) se levanta sola con la sesión
+guardada en el volumen `crmpurifica-volume` y debe llegar a `ready` sin
+pedir QR nuevo. Comprueba en el log que salga "WhatsApp pedro está
+listo!" y en Estado del Sistema que WhatsApp por QR pase a Bien (1 de 1).
+Si el vigilante actúa, verás en el log "autenticado pero sin quedar listo
+después de 120 s". Si aun así no llega a listo, la alternativa que no
+depende del navegador es el canal Meta (ver "WhatsApp Meta Cloud API").
 
 ## Limpieza v5 — Parte 1 (quitar lo que sobra)
 
@@ -517,8 +582,10 @@ API en `http://localhost:3000` — arranca `npm start` en otra terminal con
    entran al inbox y los que envíes desde el chat salen por esa misma
    conexión. Puedes tener varias instancias (varios números) a la vez.
 5. La sesión queda guardada en `.wwebjs_auth/` (volumen `wa-auth` en Docker),
-   así no hay que escanear el QR en cada reinicio. Si se desconecta, vuelve
-   a **Canales WhatsApp** y escanea de nuevo.
+   así no hay que escanear el QR en cada reinicio. Desde la v5.3.2, tras un
+   redespliegue la instancia se levanta sola con esa sesión (ver
+   "WhatsApp QR: arreglos v5.3.2"). Si se desconecta, vuelve a **Canales
+   WhatsApp** y escanea de nuevo.
 
 > Es una conexión **no oficial** (WhatsApp Web). Meta la tolera pero puede
 > bloquear el número si se envían mensajes masivos o spam: no uses tu número
@@ -1029,7 +1096,12 @@ registros y las comisiones dejan de estimarse.
   upsert de `POST /api/staff` sin contraseña.
 - **WhatsApp QR real:** no se escaneó ningún QR ni se conectó ninguna cuenta
   real. El envío y la recepción por QR quedan pendientes de escanear el QR en
-  el despliegue.
+  el despliegue. En particular, los arreglos v5.3.2 (quitar
+  `--single-process`, restauración al arrancar, vigilante de `ready` con
+  reintento automático, parada centralizada) solo se verificaron en código
+  y con arranque sin DB: que el cliente llegue a `ready` en Railway con
+  la sesión real guardada es lo primero que hay que comprobar tras el
+  despliegue (ver "WhatsApp QR: arreglos v5.3.2").
 - **WhatsApp Meta real (v5 Parte 2B):** no hay cuenta de Meta for Developers
   ni número real aquí, así que no se probaron: el envío real por
   `graph.facebook.com`, la recepción real por webhook (firma HMAC con
@@ -1347,3 +1419,36 @@ real y seguro. Lo arriesgado quedó como pendiente documentado abajo.
   real, Wompi/PayU real, DIAN real, eventos reales de Google
   Calendar (sin credenciales de la empresa no se puede probar el
   evento real), usuarios reales por rol, Socket.io en navegador real.
+
+## Verificación hecha en esta máquina (v5.3.2, 2026-11-07)
+
+- `npm install` OK (460 paquetes; whatsapp-web.js **1.34.7**, qrcode 1.5.4
+  ya era la última, puppeteer 24.38.0). `npx tsc --noEmit` exit 0.
+  `node --check server.js` OK. `npm run build` OK en 15.43 s (2049
+  módulos; solo el aviso habitual de chunk > 500 kB).
+- Arranque sin `DATABASE_URL` (puerto 3160, estilo Railway con `PORT`):
+  `GET /` 200, `GET /api/health` 200
+  (`{"ok":true,"version":"5.3.2","db":false,"whatsapp":{"instances":0,"connected":0}}`),
+  `/api/wa/instances` sin token 401, `POST /api/system/whatsapp/reconnect`
+  sin token 401, `/api/system/status` sin token 401, `/server.js` 404.
+  Sin errores en el log (solo los avisos esperados de JWT_SECRET efímero
+  y DATABASE_URL no configurada). Grep: 0 ocurrencias de `single-process`
+  y 0 llamadas comentadas a `initWhatsApp` en el arranque.
+- Prueba de humo de la instancia QR (con JWT de admin de prueba, sin DB):
+  `POST /api/wa/instances` crea la instancia, `DELETE` la elimina y la
+  lista queda vacía (la parada centralizada `stopWaInstance` funciona por
+  API). Pero el cliente cayó a `error` en ~4 s con
+  `net::ERR_TUNNEL_CONNECTION_FAILED at https://web.whatsapp.com/`: Chrome
+  arranca bien, pero **esta máquina de pruebas no deja salir a Chrome hacia
+  web.whatsapp.com** (su proxy de salida rechaza el túnel; incluso con el
+  flag de proxy da `ERR_NO_SUPPORTED_PROXIES`). Es un límite de esta
+  máquina, no del código: en Railway la v5.3.1 sí generaba el QR y
+  autenticaba. La generación del QR con la librería 1.34.7 y sin
+  `--single-process` queda, por tanto, **sin probar aquí** y es lo primero
+  que hay que comprobar tras desplegar (debe salir "QR recibido" y luego
+  "WhatsApp pedro está listo!" en el log de Railway).
+- Sin probar (honesto): QR real y llegada a `ready` en Railway, mensajes
+  reales entrantes/salientes por QR, restauración automática al arrancar
+  con la sesión real del volumen, el vigilante de 120 s con su reintento
+  automático (solo verificado en código), Meta real, DB real, Wompi/PayU
+  real, DIAN real.

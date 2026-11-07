@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.1';
+const APP_VERSION = '5.3.2';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -411,6 +411,111 @@ async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, ch
 // --- CONFIGURACIÓN DE MULTI-WHATSAPP ---
 const waClients = {}; // Almacén de instancias activas
 
+// v5.3.2 — Vigilante de "ready" y parada centralizada.
+// En producción (Railway) una instancia QR se autenticaba por QR pero NUNCA
+// llegaba a 'ready': sin error en el log, sin mensajes entrantes, y Estado
+// del Sistema en Roto. Las causas que se corrigieron aquí:
+//  (1) el flag de proceso único en puppeteer colgaba la carga de WhatsApp Web;
+//  (2) al reconectar/borrar, el cliente viejo no siempre se destruía y dos
+//      Chrome compartían la misma sesión LocalAuth (el 'authenticated' se
+//      registró DOS veces en el log al mismo segundo);
+//  (3) el servidor no restauraba las instancias al arrancar.
+const waReadyAutoRetried = new Set(); // 1 reintento automático por instancia y arranque
+let waWatchdogSeq = 0; // generación del vigilante: ignora temporizadores viejos
+
+function clearWaWatchdog(id) {
+  const t = waClients[id]?.readyWatchdog;
+  if (t) { clearTimeout(t); if (waClients[id]) waClients[id].readyWatchdog = null; }
+}
+
+// Detiene una instancia: limpia el vigilante, destruye el cliente (con tope
+// de 10 s: un destroy colgado no puede bloquear un reconectar ni dejar un
+// Chrome zombi con la sesión abierta) y borra la entrada de memoria.
+// Nunca lanza.
+async function stopWaInstance(id) {
+  const inst = waClients[id];
+  if (!inst) return;
+  clearWaWatchdog(id);
+  if (inst.client) {
+    try {
+      await Promise.race([
+        inst.client.destroy(),
+        new Promise((resolve) => setTimeout(resolve, 10000)),
+      ]);
+    } catch { /* ya estaba muerto */ }
+  }
+  delete waClients[id];
+}
+
+// Si una instancia QR lleva más de 120 s en 'authenticated' o
+// 'initializing' sin llegar a 'ready', avisa en log y system_events e
+// intenta UNA sola re-inicialización automática por arranque. Después de
+// ese reintento, solo deja el estado visible para que el admin reconecte
+// a mano. El token de generación evita que un temporizador viejo actúe
+// sobre una instancia nueva con el mismo id.
+function armReadyWatchdog(id, name) {
+  const entry = waClients[id];
+  if (!entry || (entry.channel || 'qr') !== 'qr') return;
+  clearWaWatchdog(id);
+  const seq = ++waWatchdogSeq;
+  entry.watchdogSeq = seq;
+  entry.readyWatchdog = setTimeout(async () => {
+    const cur = waClients[id];
+    if (!cur || cur.watchdogSeq !== seq) return; // instancia reemplazada o borrada
+    if (!['authenticated', 'initializing'].includes(cur.status)) return;
+    const msg = `WhatsApp ${name} autenticado pero sin quedar listo después de 120 s (estado: ${cur.status}). Se intenta una re-inicialización automática.`;
+    logger.warn(msg);
+    await recordEvent('warn', 'whatsapp', msg, { instance: id, status: cur.status });
+    if (waReadyAutoRetried.has(id)) {
+      logger.warn(`WhatsApp ${name}: ya se hizo el reintento automático de este arranque; queda en estado visible (${cur.status}). Usa Reconectar en Estado del Sistema.`);
+      await recordEvent('warn', 'whatsapp', `WhatsApp ${name} sigue sin quedar listo tras el reintento automático. Reconecta a mano en Estado del Sistema.`, { instance: id, status: cur.status });
+      return;
+    }
+    waReadyAutoRetried.add(id);
+    try {
+      await stopWaInstance(id);
+      await initWhatsApp(id, name, 'qr');
+    } catch (e) {
+      logger.error(`WhatsApp ${name}: falló la re-inicialización automática`, e);
+    }
+  }, 120000);
+  if (entry.readyWatchdog.unref) entry.readyWatchdog.unref();
+}
+
+// Restaura las instancias guardadas (settings wa_channel_<id>) al arrancar
+// el servidor: tras un redespliegue el cliente QR vuelve a levantarse solo
+// con la sesión guardada en el volumen, sin pedir QR nuevo; las instancias
+// Meta son entradas virtuales sin navegador. Nunca rompe el arranque:
+// cada fallo se registra y se sigue con la siguiente instancia.
+async function restoreWhatsAppInstances() {
+  if (!dbOk) return;
+  let rows = [];
+  try {
+    const r = await pool.query("SELECT key, value FROM settings WHERE key LIKE 'wa_channel_%'");
+    rows = r.rows || [];
+  } catch (e) {
+    logger.warn('No se pudieron leer las instancias de WhatsApp guardadas para restaurarlas', e);
+    return;
+  }
+  for (const row of rows) {
+    const id = String(row.key || '').replace(/^wa_channel_/, '');
+    const channel = row.value === 'meta' ? 'meta' : 'qr';
+    if (!id || waClients[id]) continue;
+    let name = id;
+    try { name = (await getSettingValue(`wa_name_${id}`, id)) || id; } catch { /* nombre = id */ }
+    try {
+      logger.info(`Restaurando instancia de WhatsApp: ${name} (ID: ${id}, canal ${channel})`);
+      await initWhatsApp(id, name, channel);
+      // Levantar los Chrome de uno en uno: varios a la vez saturan la
+      // memoria del contenedor en Railway.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    } catch (e) {
+      logger.error(`No se pudo restaurar la instancia de WhatsApp ${name}`, e);
+      await recordEvent('error', 'whatsapp', `No se pudo restaurar la instancia ${name} al arrancar: ${e?.message || e}`, { instance: id });
+    }
+  }
+}
+
 const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   if (waClients[id]) return;
   channel = channel === 'meta' ? 'meta' : 'qr';
@@ -448,8 +553,11 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
         '--disable-gpu'
+        // v5.3.2: el flag de proceso único ELIMINADO de esta lista. En
+        // Docker hacía que la página de WhatsApp Web se quedara colgada
+        // tras autenticar (el cliente nunca emitía 'ready' y no entraba
+        // ningún mensaje).
       ]
     }
   });
@@ -463,9 +571,19 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
     lastSeen: new Date().toISOString(),
     lastMessageAt: null,
     channel: 'qr',
+    readyWatchdog: null, // temporizador del vigilante de 'ready' (v5.3.2)
+    watchdogSeq: 0, // generación del vigilante (ignora temporizadores viejos)
   };
 
+  // v5.3.2: cada handler ignora eventos de un cliente que ya no es el
+  // vigente para este id. Sin este guardia, un Chrome zombi (cliente viejo
+  // no destruido del todo) podía pisar el estado de la instancia nueva y
+  // dejarla en 'authenticated' para siempre, o romper el flujo interno de
+  // la librería con un TypeError al escribir sobre una entrada borrada.
+  const isCurrent = () => waClients[id] && waClients[id].client === client;
+
   client.on('qr', async (qr) => {
+    if (!isCurrent()) return;
     logger.info(`QR recibido para ${name}`);
     const qrDataUrl = await qrcode.toDataURL(qr);
     waClients[id].qr = qrDataUrl;
@@ -476,7 +594,9 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   });
 
   client.on('ready', () => {
+    if (!isCurrent()) return;
     logger.info(`WhatsApp ${name} está listo!`);
+    clearWaWatchdog(id);
     waClients[id].status = 'ready';
     waClients[id].qr = null;
     waClients[id].lastSeen = new Date().toISOString();
@@ -490,6 +610,7 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   });
 
   client.on('authenticated', () => {
+    if (!isCurrent()) return;
     logger.info(`WhatsApp ${name} autenticado`);
     waClients[id].status = 'authenticated';
     waClients[id].lastSeen = new Date().toISOString();
@@ -497,6 +618,8 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   });
 
   client.on('auth_failure', (msg) => {
+    if (!isCurrent()) return;
+    clearWaWatchdog(id);
     logger.error(`Error de autenticación en ${name}`, msg);
     waClients[id].status = 'auth_failure';
     waClients[id].lastSeen = new Date().toISOString();
@@ -506,6 +629,8 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   });
 
   client.on('disconnected', (reason) => {
+    if (!isCurrent()) return;
+    clearWaWatchdog(id);
     logger.warn(`WhatsApp ${name} desconectado: ${reason}`);
     waClients[id].status = 'disconnected';
     waClients[id].lastSeen = new Date().toISOString();
@@ -515,6 +640,7 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   });
 
   client.on('message', async (msg) => {
+    if (!isCurrent()) return;
     // Solo mensajes de texto de chats 1 a 1. Antes solo se filtraban los
     // grupos (@g.us): los estados (@broadcast) y los LID (@lid) creaban
     // clientes basura, y los mensajes de imagen/audio (body vacío, type
@@ -542,10 +668,17 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
   });
 
   client.initialize().catch(err => {
+    if (!isCurrent()) return;
+    clearWaWatchdog(id);
     logger.error(`Error inicializando cliente ${name}`, err);
     waClients[id].status = 'error';
     recordEvent('error', 'whatsapp', `No se pudo iniciar WhatsApp (${name}): ${err?.message || err}`, { instance: id });
   });
+
+  // v5.3.2: si el cliente se queda colgado en 'authenticated' o
+  // 'initializing' sin llegar a 'ready', el vigilante avisa y reintenta
+  // una sola vez por arranque (ver armReadyWatchdog).
+  armReadyWatchdog(id, name);
 };
 
 // --- FIN CONFIGURACIÓN WHATSAPP ---
@@ -1041,12 +1174,10 @@ app.post('/api/system/whatsapp/reconnect', requireAdmin, async (req, res) => {
       } catch { /* se queda el canal en memoria */ }
     }
     try {
-      if (inst?.client) {
-        try { await inst.client.destroy(); } catch { /* ya estaba muerto */ }
-      }
-      // Borrar la entrada ANTES de recrear: initWhatsApp retorna sin hacer
-      // nada si waClients[tid] ya existe.
-      delete waClients[tid];
+      // v5.3.2: parada centralizada (limpia el vigilante de ready y
+      // destruye el cliente viejo con tope de 10 s) ANTES de recrear:
+      // initWhatsApp retorna sin hacer nada si waClients[tid] ya existe.
+      await stopWaInstance(tid);
       await initWhatsApp(tid, name, channel);
       results.push({ id: tid, ok: true, detail: channel === 'meta' ? 'Instancia Meta reconectada' : 'Reconectando: escanea el QR nuevo en Canales WhatsApp si aparece' });
       recordEvent('info', 'whatsapp', `Reconexión manual de WhatsApp: ${name} (${channel})`, { instance: tid });
@@ -1762,6 +1893,11 @@ const initDB = async () => {
     eventsTableReady = true;
     await flushEventBuffer();
     dbOk = true;
+    // v5.3.2: levantar las instancias de WhatsApp guardadas (QR con la
+    // sesión del volumen y Meta virtuales). Antes no se hacía: tras cada
+    // redespliegue había que darle a Reconectar a mano. No bloquea el
+    // arranque si falla.
+    try { await restoreWhatsAppInstances(); } catch (e) { logger.warn('No se pudieron restaurar las instancias de WhatsApp al arrancar', e); }
   } catch (err) { console.error('DB Init Error:', err); } finally { if (client) client.release(); }
 };
 initDB();
@@ -1814,6 +1950,9 @@ app.post('/api/wa/instances', async (req, res) => {
     wanted = wanted === 'meta' ? 'meta' : 'qr';
     if (dbOk) {
       try { await pool.query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [`wa_channel_${id}`, wanted]); } catch { /* solo memoria */ }
+      // v5.3.2: guardar también el nombre, para que la restauración al
+      // arrancar muestre el mismo nombre y no solo el id.
+      try { await pool.query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [`wa_name_${id}`, name || id]); } catch { /* solo memoria */ }
     }
 
     await initWhatsApp(id, name || id, wanted);
@@ -1833,8 +1972,7 @@ app.patch('/api/wa/instances/:id/channel', async (req, res) => {
   if ((inst.channel || 'qr') === channel) return res.json({ success: true, channel, message: 'La instancia ya usaba ese canal' });
   const name = inst.name || id;
   try {
-    if (inst.client) { try { await inst.client.destroy(); } catch { /* ya estaba muerto */ } }
-    delete waClients[id];
+    await stopWaInstance(id); // v5.3.2: parada centralizada (vigilante + destroy con tope)
     if (dbOk) {
       try { await pool.query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [`wa_channel_${id}`, channel]); } catch { /* solo memoria */ }
     }
@@ -1858,16 +1996,20 @@ app.delete('/api/wa/instances/:id', async (req, res) => {
   const { id } = req.params;
   if (waClients[id]) {
     try {
+      // v5.3.2: logout primero (cierra la sesión en el teléfono) y luego
+      // parada centralizada; antes, si logout() fallaba, destroy() nunca se
+      // llamaba y el Chrome quedaba vivo como zombi con la sesión abierta.
       if (waClients[id].client) {
         try { await waClients[id].client.logout(); } catch { /* sin sesión que cerrar */ }
-        await waClients[id].client.destroy();
       }
-      delete waClients[id];
+      await stopWaInstance(id);
       if (dbOk) {
         try { await pool.query('DELETE FROM settings WHERE key = $1', [`wa_channel_${id}`]); } catch { /* noop */ }
+        try { await pool.query('DELETE FROM settings WHERE key = $1', [`wa_name_${id}`]); } catch { /* noop */ }
       }
       res.json({ success: true });
     } catch (e) {
+      clearWaWatchdog(id);
       delete waClients[id];
       res.json({ success: true, warning: 'Error al cerrar sesión, pero instancia removida' });
     }
@@ -3979,8 +4121,8 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'index.html
 
 server.listen(PORT, () => {
   console.log(`🚀 Purifica CRM Real-Time ON :${PORT}`);
-  
-  // Inicializar instancias guardadas (esto se podría cargar de la DB en el futuro)
-  // Por ahora, si quieres que se auto-inicien, podrías tener una lista aquí
-  // initWhatsApp('principal', 'Línea Principal');
+
+  // v5.3.2: las instancias guardadas se restauran al final de initDB
+  // (restoreWhatsAppInstances), no aquí: así solo se levantan cuando la
+  // DB ya está lista y con su canal guardado.
 });
