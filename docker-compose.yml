@@ -1,0 +1,69 @@
+# Purifica Tu Ambiente CRM — v5.3
+# Instalación:  docker compose up -d --build
+# La app queda en http://localhost:${APP_PORT:-8080}
+# WhatsApp por QR (whatsapp-web.js): la sesión vive en el volumen wa-auth,
+# así no hay que escanear el QR en cada reinicio.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-America/Bogota}
+      POSTGRES_USER: ${POSTGRES_USER:-purifica}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cambia-esta-clave}
+      POSTGRES_DB: ${POSTGRES_DB:-purifica}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-purifica} -d ${POSTGRES_DB:-purifica}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # DATABASE_URL se construye solo en server.js con POSTGRES_* (clave
+      # URL-escapada). Si prefieres ponerla a mano, defínela en .env.
+      TZ: ${TZ:-America/Bogota}
+      PORT: 3000
+    ports:
+      - "${APP_PORT:-8080}:3000"
+    volumes:
+      # Logo subido (uploads/logo.png) y sesión de WhatsApp QR sobreviven a reconstrucciones.
+      - uploads:/app/uploads
+      - wa-auth:/app/.wwebjs_auth
+      # Respaldos (backups/*.sql.gz) y estado del sistema en la carpeta local.
+      - ./backups:/app/backups
+
+  # Respaldo manual bajo demanda (no arranca con `up`, solo a propósito):
+  #   docker compose --profile backup run --rm backup
+  # Hace un pg_dump y lo deja en ./backups/. El respaldo diario automático
+  # (02:00) ya lo hace el propio servidor, esto es solo para hacerlo a mano.
+  backup:
+    image: postgres:16-alpine
+    profiles: ["backup"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-cambia-esta-clave}
+    volumes:
+      - ./backups:/backups
+    command: >
+      sh -c 'set -e; mkdir -p /backups;
+      F=/backups/purifica-$(date +%F-%H%M).sql.gz;
+      pg_dump -h db -U ${POSTGRES_USER:-purifica} -d ${POSTGRES_DB:-purifica} | gzip > "$$F";
+      echo "Respaldo guardado en $$F";
+      find /backups -name "purifica-*.sql.gz" -mtime +${BACKUP_KEEP_DAYS:-7} -delete'
+
+volumes:
+  pgdata:
+  uploads:
+  wa-auth:

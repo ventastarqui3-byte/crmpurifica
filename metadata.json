@@ -1,0 +1,7 @@
+{
+  "name": "Remix: 6 Purifica Tu Ambiente CRM",
+  "description": "Sistema de gestión integral para servicios de limpieza, incluyendo seguimiento operativo y financiero. Listo con todo final",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
