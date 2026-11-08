@@ -59,14 +59,8 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({ invoice, onClose }) 
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md p-4 overflow-y-auto">
-      <style>{`
-        @media print {
-          body * { visibility: hidden !important; }
-          .invoice-print-area, .invoice-print-area * { visibility: visible !important; }
-          .invoice-print-area { position: absolute !important; inset: 0 !important; width: 100% !important; max-height: none !important; overflow: visible !important; border: none !important; box-shadow: none !important; border-radius: 0 !important; }
-          .no-print { display: none !important; }
-        }
-      `}</style>
+      {/* v5.3.24 (A5): el <style> de impresión vivía aquí en línea y la
+          CSP lo bloquearía; ahora está en index.css (@media print). */}
       <div className="invoice-print-area bg-white rounded-[2rem] shadow-2xl w-full max-w-2xl max-h-[95vh] overflow-y-auto border border-slate-200">
         <div className="p-8 space-y-6">
           <div className="flex items-start justify-between gap-4">

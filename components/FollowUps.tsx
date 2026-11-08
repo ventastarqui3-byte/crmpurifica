@@ -16,7 +16,7 @@ import { apiFetch } from '../lib/api';
 import type { FollowupRow, FollowupStatus } from '../types';
 import { Campaigns } from './Campaigns';
 
-const DEFAULT_MESSAGE = 'Hola {{nombre}}, soy de Purifica Tu Ambiente. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?';
+const DEFAULT_MESSAGE = 'Hola {{nombre}}, soy de {{empresa}}. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?';
 
 // Las fechas llegan como ISO (DATE de Postgres a medianoche UTC): se toma
 // solo la parte de la fecha para no restar un día por la zona horaria.
@@ -285,7 +285,7 @@ export const FollowUps: React.FC = () => {
           )}
         </div>
         <label className="block text-sm text-slate-700 mt-4">
-          Mensaje (puedes cambiarlo; variables: {'{{nombre}}'} {'{{servicio}}'} {'{{fecha}}'} {'{{meses}}'})
+          Mensaje (puedes cambiarlo; variables: {'{{nombre}}'} {'{{servicio}}'} {'{{fecha}}'} {'{{meses}}'} {'{{empresa}}'})
           <textarea
             value={template} onChange={(e) => setTemplate(e.target.value)}
             placeholder={DEFAULT_MESSAGE}

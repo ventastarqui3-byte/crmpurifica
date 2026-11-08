@@ -1,6 +1,6 @@
 {
   "name": "purifica-crm",
-  "version": "5.3.23",
+  "version": "5.3.24",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -21,7 +21,7 @@
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.475.0",
-    "multer": "^1.4.5-lts.1",
+    "multer": "^2.0.0",
     "pg": "^8.13.1",
     "puppeteer": "24.37.5",
     "qrcode": "^1.5.4",
@@ -41,6 +41,9 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
     "terser": "^5.31.0",
     "typescript": "^5.6.2",
     "vite": "^5.4.8"

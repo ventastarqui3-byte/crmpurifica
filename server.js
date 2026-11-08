@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.23';
+const APP_VERSION = '5.3.24';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -1278,12 +1278,28 @@ function waMediaExtFromMime(mimetype, filename) {
   // v5.3.13 — el mimetype efectivo puede llevar parámetros (p. ej.
   // 'audio/ogg; codecs=opus' de las notas de voz): se quitan para la
   // búsqueda de la extensión, si no la nota se guardaba como .bin.
+  // v5.3.24 (A1, XSS por subida): la extensión sale SOLO de la lista
+  // blanca de mimetypes. Antes, si el mimetype no estaba en el mapa, se
+  // usaba la extensión del nombre original: un asesor subía un .html
+  // con Content-Type audio/x-aac y quedaba servido como HTML en el
+  // origen del CRM. Ahora devuelve null y el fileFilter de multer
+  // rechaza el archivo antes de escribirlo a disco.
   const base = String(mimetype || '').split(';')[0].trim();
   if (WA_MIME_EXT[base]) return WA_MIME_EXT[base];
-  const fromName = String(filename || '').split('.').pop();
-  if (fromName && /^[A-Za-z0-9]{2,5}$/.test(fromName)) return fromName.toLowerCase();
-  return 'bin';
+  return null;
 }
+// Mimetypes permitidos en subidas (chat, campañas, seguimiento). Es la
+// unión de lo que usa la app: imagen, audio, video y documentos de
+// oficina/texto. Cualquier otro tipo se rechaza en el fileFilter de
+// multer con 400, antes de escribir a disco (v5.3.24, A1).
+const WA_ALLOWED_UPLOAD_MIMES = new Set(Object.keys(WA_MIME_EXT));
+// Extensión -> mimetype (lista blanca) para servir /uploads con el
+// Content-Type correcto y X-Content-Type-Options: nosniff (v5.3.24, A1).
+const WA_EXT_MIME = {};
+for (const [mime, ext] of Object.entries(WA_MIME_EXT)) {
+  if (!WA_EXT_MIME[ext]) WA_EXT_MIME[ext] = mime;
+}
+WA_EXT_MIME.png = 'image/png'; WA_EXT_MIME.jpg = 'image/jpeg';
 function waMediaTypeFromMime(mimetype) {
   const m = String(mimetype || '');
   if (m.startsWith('image/')) return 'image';
@@ -1591,7 +1607,11 @@ async function downloadWaMedia(msg, name, client) {
         return { tooLarge: true };
       }
       const dlType = waMediaTypeFromMessage(msg) || waMediaTypeFromMime(media.mimetype);
-      const ext = waMediaExtFromMime(media.mimetype, media.filename);
+      // v5.3.24 (A1): waMediaExtFromMime devuelve null si el mimetype no
+      // está en la lista blanca. En la descarga ENTRANTE (media que manda
+      // WhatsApp, no el usuario) se guarda con .bin antes que perder el
+      // archivo; las SUBIDAS del usuario se rechazan en el fileFilter.
+      const ext = waMediaExtFromMime(media.mimetype, media.filename) || 'bin';
       const safeId = String(waMsgSerializedId(msg) || `${Date.now()}`).replace(/[^A-Za-z0-9]/g, '_');
       const filename = `${safeId}.${ext}`;
       try {
@@ -1969,7 +1989,10 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry
     waClients[id].qr = qrDataUrl;
     waClients[id].status = 'qr_ready';
     waClients[id].lastSeen = new Date().toISOString();
-    io.emit('wa_qr', { id, qr: qrDataUrl, status: 'qr_ready' });
+    // v5.3.24 (A2): el QR solo a la sala de administradores. Antes se
+    // emitía a TODOS los sockets conectados y cualquier empleado podía
+    // escanearlo con su teléfono y quedarse con el WhatsApp de la empresa.
+    io.to('global_admin').emit('wa_qr', { id, qr: qrDataUrl, status: 'qr_ready' });
     recordEvent('info', 'whatsapp', `QR generado para ${name}: escanea el código en Canales WhatsApp`, { instance: id });
   });
 
@@ -2214,7 +2237,30 @@ pool.on('connect', (client) => {
 
 // CORS: mismo origen por defecto; solo se abre otro origen si CORS_ORIGIN está definido.
 app.use(cors({ origin: CORS_ORIGIN || false }));
-app.use(helmet({ contentSecurityPolicy: false })); // CSP desactivada: el frontend usa Tailwind CDN e importmap con scripts inline.
+// v5.3.24 (A5): CSP activa. Antes estaba desactivada porque el frontend
+// usaba el CDN de Tailwind con un script inline. Ahora Tailwind es
+// compilado y no hay scripts inline: script-src 'self' basta. style-src
+// lleva 'unsafe-inline' porque React y framer-motion ponen estilos en
+// línea (style={{...}}) y sin él se rompe la interfaz; los <style> en
+// línea se eliminaron (la hoja de impresión de la factura vive en
+// index.css y los colores de marca van por variables CSS). img-src
+// admite data: (el QR de WhatsApp) y https: (logos externos).
+// frame-ancestors 'none': el CRM nunca se incrusta en otra página.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'", 'wss:'],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      frameAncestors: ["'none'"],
+    },
+  },
+}));
 // El webhook de Meta verifica la firma HMAC sobre el body CRUDO
 // (X-Hub-Signature-256): express.json lo parsea, así que se guarda el
 // buffer crudo en req.rawBody solo para esa ruta, sin tocar las demás.
@@ -2223,7 +2269,22 @@ app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (req.url.
 fs.mkdirSync(uploadsDir(), { recursive: true });
 // v5.3.6: adjuntos de WhatsApp (fotos, audios, videos, documentos).
 fs.mkdirSync(waMediaDir(), { recursive: true });
-app.use('/uploads', express.static(uploadsDir()));
+// v5.3.24 (A1): /uploads con cabeceras seguras. X-Content-Type-Options:
+// nosniff + Content-Type forzado desde la lista blanca de extensiones
+// (nunca el que declare quien sube) + CSP sandbox: aunque un .html o
+// .svg llegara a disco, al abrirlo directo no ejecuta scripts en el
+// origen del CRM (el sandbox lo deja sin origen y sin scripts). Sin
+// Content-Disposition: attachment, para no romper la vista previa de
+// imágenes y videos en Mensajes (los <img>/<video> no aplican el
+// sandbox; el documento navegado directamente sí).
+app.use('/uploads', express.static(uploadsDir(), {
+  setHeaders: (res, filePath) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', 'sandbox');
+    const ext = path.extname(filePath).slice(1).toLowerCase();
+    res.setHeader('Content-Type', WA_EXT_MIME[ext] || 'application/octet-stream');
+  },
+}));
 
 // v5.3.10 — Diagnóstico de arranque en UNA línea: el PERSIST_DIR
 // efectivo, las rutas reales de sesión y archivos, y cuántas sesiones
@@ -2267,11 +2328,38 @@ const isPublicApi = (req) => PUBLIC_API.some(r => r.method === req.method && r.p
 const DB_FREE = [/^\/api\/health$/, /^\/api\/wa\//, /^\/api\/system\//];
 const needsDb = (req) => !DB_FREE.some(rx => rx.test(req.path));
 
+// v5.3.24 (A5): el JWT ya NO vive en localStorage (cualquier script en
+// el origen lo leía). El servidor lo emite en cookie HttpOnly y el
+// frontend ya no guarda el token en ningún lado. La cabecera
+// Authorization: Bearer se sigue aceptando como respaldo para clientes
+// de API externos; la interfaz web usa solo la cookie.
+const AUTH_COOKIE = 'crm_token';
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers?.cookie || '';
+  for (const part of String(raw).split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+// Opciones de la cookie de sesión: HttpOnly (JS no la lee), SameSite
+// Strict (ninguna petición de otro origen la lleva, anti-CSRF), 24 h
+// (igual que el JWT). Secure solo cuando la petición llega por HTTPS
+// (Railway) para no romper el desarrollo local por HTTP.
+function authCookieOptions(req) {
+  const secure = req.secure === true || (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  return { httpOnly: true, sameSite: 'strict', secure, path: '/', maxAge: 24 * 60 * 60 * 1000 };
+}
+
 async function authMiddleware(req, res, next) {
   if (!req.path.startsWith('/api')) return next();
   if (isPublicApi(req)) return next();
+  // v5.3.24 (A5): primero la cookie HttpOnly, luego Bearer (compatibilidad
+  // con clientes de API). Sin ninguno de los dos -> 401.
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const token = parseCookies(req)[AUTH_COOKIE]
+    || (header.startsWith('Bearer ') ? header.slice(7) : null);
   if (!token) return res.status(401).json({ error: 'No autorizado' });
   try {
     req.user = jwt.verify(token, jwtSecret);
@@ -2307,10 +2395,19 @@ function requireAdmin(req, res, next) {
 // con employees.parent_id = su propio id. El campo real de jerarquía es
 // parent_id (no existe manager_id ni supervisor en employees; el JWT
 // trae id como string, así que se compara con String()). Cualquier otro
-// rol (advisor, operator) -> 403. Para POST /api/staff (upsert por
-// email): si el correo ya existe, el objetivo es ese empleado; si no,
-// el parentId del body. Un líder tampoco puede cambiar el director de
-// un empleado ni ascenderlo a Admin.
+// rol (advisor, operator) -> 403.
+// v5.3.24 (C1, CRÍTICO): el control anterior solo bloqueaba crear con
+// rol 'admin' y comprobaba el parent_id del objetivo, pero dejaba tres
+// huecos: (1) el líder podía crear cuentas sales_agent u operator con
+// parent_id propio; (2) podía ascender a sus asesores a sales_agent
+// (PUT con role distinto de 'admin' pasaba); (3) podía editar y
+// cambiarle la contraseña a un operator o sales_agent que colgara de
+// él, porque solo se miraba el parent_id y no el rol del objetivo. Con
+// eso un líder construía su propia rama con privilegios. Ahora la regla
+// es cerrada: el líder SOLO gestiona asesores (advisor) de su red
+// directa — nunca admin, sales_agent ni operator, ni como objetivo ni
+// como rol nuevo — y nunca puede cambiar el director (parent_id) de
+// nadie. El admin no tiene estas restricciones.
 async function requireAdminOrLeader(req, res, next) {
   const role = (req.user?.role || '').toLowerCase();
   if (role === 'admin') return next();
@@ -2319,15 +2416,25 @@ async function requireAdminOrLeader(req, res, next) {
   }
   const leaderId = req.user?.id;
   if (!leaderId) return res.status(403).json({ error: 'Solo administradores o el director del empleado' });
+  // Un líder solo puede crear/editar con rol 'advisor': si el cuerpo trae
+  // otro rol (admin, sales_agent, operator) o un rol inválido, 403. Si no
+  // trae rol (DELETE), el rol del objetivo se comprueba abajo.
+  if (req.body?.role !== undefined && req.body?.role !== null) {
+    const bodyRole = normalizeRoleValue(req.body.role);
+    if (bodyRole !== 'advisor') {
+      return res.status(403).json({ error: 'Un líder solo puede gestionar asesores' });
+    }
+  }
   try {
     let targetParentId = null;
+    let targetRole = null;
     let found = false;
     if (req.params?.id) {
-      const r = await pool.query('SELECT parent_id FROM employees WHERE id = $1', [req.params.id]);
-      if (r.rows[0]) { found = true; targetParentId = r.rows[0].parent_id; }
+      const r = await pool.query('SELECT parent_id, role FROM employees WHERE id = $1', [req.params.id]);
+      if (r.rows[0]) { found = true; targetParentId = r.rows[0].parent_id; targetRole = r.rows[0].role; }
     } else if (req.body?.email) {
-      const r = await pool.query('SELECT parent_id FROM employees WHERE email = $1', [req.body.email]);
-      if (r.rows[0]) { found = true; targetParentId = r.rows[0].parent_id; }
+      const r = await pool.query('SELECT parent_id, role FROM employees WHERE email = $1', [req.body.email]);
+      if (r.rows[0]) { found = true; targetParentId = r.rows[0].parent_id; targetRole = r.rows[0].role; }
       else if (req.body.parentId !== undefined && req.body.parentId !== null && req.body.parentId !== '') {
         found = true; targetParentId = Number(req.body.parentId);
       }
@@ -2337,11 +2444,13 @@ async function requireAdminOrLeader(req, res, next) {
     if (!found || targetParentId === null || targetParentId === undefined || String(targetParentId) !== String(leaderId)) {
       return res.status(403).json({ error: 'Solo puedes gestionar a tus subordinados directos' });
     }
+    // El objetivo existente debe ser un asesor: un líder no toca al
+    // admin, a otro líder ni a un operador, aunque cuelgue de él.
+    if (targetRole !== null && targetRole !== undefined && normalizeRoleValue(targetRole) !== 'advisor') {
+      return res.status(403).json({ error: 'Un líder solo puede gestionar asesores' });
+    }
     if (req.body?.parentId !== undefined && req.body.parentId !== null && req.body.parentId !== '' && String(req.body.parentId) !== String(leaderId)) {
       return res.status(403).json({ error: 'No puedes cambiar el director de un empleado' });
-    }
-    if (typeof req.body?.role === 'string' && req.body.role.toLowerCase() === 'admin') {
-      return res.status(403).json({ error: 'Solo un administrador puede crear administradores' });
     }
     next();
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3530,7 +3639,7 @@ initDB();
 // Endpoints Escalafones
 // --- ENDPOINTS DE WHATSAPP ---
 
-app.get('/api/wa/instances', (req, res) => {
+app.get('/api/wa/instances', requireAdmin, (req, res) => {
   const instances = Object.keys(waClients).map(id => ({
     id,
     name: waClients[id].name,
@@ -3543,7 +3652,7 @@ app.get('/api/wa/instances', (req, res) => {
 
 // Estado de Meta Cloud API (JWT; el token NUNCA sale del servidor, solo
 // booleanos: configurado o no, y el phone number id, que no es secreto).
-app.get('/api/wa/meta/status', async (req, res) => {
+app.get('/api/wa/meta/status', requireAdmin, async (req, res) => {
   try {
     const meta = await getMetaConfig();
     res.json({
@@ -3557,7 +3666,10 @@ app.get('/api/wa/meta/status', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/wa/instances', async (req, res) => {
+// v5.3.24 (A2): crear instancias de WhatsApp solo lo hace el admin.
+// Antes cualquier empleado autenticado podía crear instancias y enviar
+// WhatsApp desde su propio número con el CRM.
+app.post('/api/wa/instances', requireAdmin, async (req, res) => {
   try {
     const { id, name, channel } = req.body;
     if (!id) return res.status(400).json({ error: 'ID requerido' });
@@ -3588,7 +3700,9 @@ app.post('/api/wa/instances', async (req, res) => {
 // Cambiar el canal de una instancia (QR <-> Meta). Re-inicializa la
 // instancia: al pasar a Meta se destruye el cliente de WhatsApp Web; al
 // volver a QR se genera un QR nuevo para escanear.
-app.patch('/api/wa/instances/:id/channel', async (req, res) => {
+// v5.3.24 (A2): cambiar el canal solo lo hace el admin (destruye y
+// re-inicializa la instancia).
+app.patch('/api/wa/instances/:id/channel', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { channel } = req.body || {};
   if (channel !== 'qr' && channel !== 'meta') return res.status(400).json({ error: "channel debe ser 'qr' o 'meta'" });
@@ -3610,14 +3724,20 @@ app.patch('/api/wa/instances/:id/channel', async (req, res) => {
   }
 });
 
-app.get('/api/wa/qr/:id', (req, res) => {
+// v5.3.24 (A2): leer el QR solo lo hace el admin. Antes cualquier
+// empleado podía leerlo y escanearlo con su teléfono, quedándose con
+// la instancia de la empresa.
+app.get('/api/wa/qr/:id', requireAdmin, (req, res) => {
   const instance = waClients[req.params.id];
   if (!instance) return res.status(404).json({ error: 'Instancia no encontrada' });
   if ((instance.channel || 'qr') === 'meta') return res.status(400).json({ error: 'Esta instancia usa Meta Cloud API y no tiene QR' });
   res.json({ qr: instance.qr, status: instance.status });
 });
 
-app.delete('/api/wa/instances/:id', async (req, res) => {
+// v5.3.24 (A2): borrar la instancia solo lo hace el admin. Antes
+// cualquier empleado podía hacer logout() y dejar sin WhatsApp a toda
+// la empresa con una sola petición.
+app.delete('/api/wa/instances/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   if (waClients[id]) {
     try {
@@ -3759,10 +3879,11 @@ app.delete('/api/commission-tiers/:id', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Socket autenticado: el cliente envía el JWT en handshake.auth.token.
-// Sin token válido no hay conexión en tiempo real.
+// Socket autenticado: el cliente envía el JWT en la cookie HttpOnly
+// (v5.3.24, A5); se sigue aceptando handshake.auth.token como respaldo
+// para clientes viejos. Sin token válido no hay conexión en tiempo real.
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
+  const token = parseCookies(socket.handshake)?.[AUTH_COOKIE] || socket.handshake.auth?.token;
   if (!token) return next(new Error('No autorizado: falta token'));
   try {
     socket.user = jwt.verify(token, jwtSecret);
@@ -3893,9 +4014,9 @@ app.delete('/api/reminders/:id', async (req, res) => {
 // la página Seguimiento. Un servicio genera UN solo pendiente (service_id
 // UNIQUE + chequeo previo): nunca se le escribe dos veces al mismo cliente
 // por el mismo trabajo.
-const FOLLOWUP_DEFAULT_MESSAGE = 'Hola {{nombre}}, soy de Purifica Tu Ambiente. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?';
+const FOLLOWUP_DEFAULT_MESSAGE = 'Hola {{nombre}}, soy de {{empresa}}. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?';
 
-function renderFollowupMessage(template, { name, service, date, months }) {
+function renderFollowupMessage(template, { name, service, date, months, empresa }) {
   // La fecha llega como DATE de Postgres (medianoche UTC): se formatea en
   // UTC para no restar un día por la zona horaria de Bogotá.
   let dateStr = '';
@@ -3907,6 +4028,11 @@ function renderFollowupMessage(template, { name, service, date, months }) {
     .replaceAll('{{nombre}}', name || '')
     .replaceAll('{{servicio}}', service || 'limpieza')
     .replaceAll('{{fecha}}', dateStr)
+    // v5.3.24 (M8): {{empresa}} es el nombre de la marca configurada
+    // (o 'CRM' si no hay marca): antes el mensaje por defecto decía
+    // "Purifica Tu Ambiente" y llegaba así a los clientes de un
+    // revendido que no lo había cambiado.
+    .replace(/\{\{\s*empresa\s*\}\}/gi, empresa || 'CRM')
     .replaceAll('{{meses}}', String(months));
 }
 
@@ -4003,11 +4129,15 @@ async function runFollowupScan() {
     );
     let created = 0;
     const createdRows = [];
+    // v5.3.24 (M8): el nombre de la empresa para {{empresa}} se lee una
+    // vez por escaneo, de la marca configurada.
+    const companyForMsg = await getCompanySettings().catch(() => ({}));
+    const empresaName = companyForMsg.branding_company_name || 'CRM';
     for (const s of r.rows) {
       const exists = await pool.query('SELECT id FROM followups WHERE service_id = $1', [s.id]);
       if (exists.rows.length > 0) continue; // idempotente: un servicio, un pendiente
       const serviceName = (s.service_performed || '').trim() || (s.items_to_clean || '').trim() || 'limpieza';
-      const message = renderFollowupMessage(cfg.message, { name: s.client_name, service: serviceName, date: s.date, months: cfg.months });
+      const message = renderFollowupMessage(cfg.message, { name: s.client_name, service: serviceName, date: s.date, months: cfg.months, empresa: empresaName });
       const id = `fu_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const ins = await pool.query(
         `INSERT INTO followups (id, service_id, client_phone, client_name, service_name, service_date, due_date, message, status)
@@ -4166,7 +4296,9 @@ const campaignSending = new Set();
 function renderCampaignMessage(template, clientName, companyName) {
   return String(template || '')
     .replace(/\{\{\s*nombre\s*\}\}/gi, clientName || 'cliente')
-    .replace(/\{\{\s*empresa\s*\}\}/gi, companyName || 'Purifica Tu Ambiente');
+    // v5.3.24 (M8): sin marca configurada, neutro ('CRM'), nunca el
+    // nombre de otra empresa.
+    .replace(/\{\{\s*empresa\s*\}\}/gi, companyName || 'CRM');
 }
 
 // Envía la campaña a UN destinatario por el mismo flujo que el inbox y el
@@ -4192,7 +4324,7 @@ async function sendCampaignMessage(campaign, recipient) {
     }
   }
   const company = await getCompanySettings().catch(() => ({}));
-  const companyName = company.branding_company_name || 'Purifica Tu Ambiente';
+  const companyName = company.branding_company_name || 'CRM';
   const text = renderCampaignMessage(campaign.message, recipient.client_name, companyName);
   const result = await sendWhatsAppMessage({ phone, content: text, channel, media });
   if (!result.ok) return { ok: false, error: result.error };
@@ -4516,10 +4648,22 @@ const waMediaUpload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => { fs.mkdirSync(waMediaDir(), { recursive: true }); cb(null, waMediaDir()); },
     filename: (req, file, cb) => {
-      const ext = waMediaExtFromMime(file.mimetype, file.originalname);
+      // v5.3.24 (A1): la extensión sale solo de la lista blanca; el
+      // fileFilter ya rechazó lo que no está en ella, así que aquí nunca
+      // es null (el 'bin' es solo cinturón de seguridad).
+      const ext = waMediaExtFromMime(file.mimetype, file.originalname) || 'bin';
       cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
     },
   }),
+  // v5.3.24 (A1, XSS por subida): rechazar ANTES de escribir a disco
+  // cualquier mimetype fuera de la lista blanca. Sin esto, el mimetype lo
+  // declara el cliente y un .html con Content-Type audio/x-aac quedaba
+  // guardado como .html y servido en el origen del CRM.
+  fileFilter: (req, file, cb) => {
+    const base = String(file.mimetype || '').split(';')[0].trim();
+    if (WA_ALLOWED_UPLOAD_MIMES.has(base)) return cb(null, true);
+    cb(new Error('Tipo de archivo no permitido (imagen, audio, video o documento)'));
+  },
   limits: { fileSize: WA_MEDIA_MAX_BYTES },
 });
 app.post('/api/chats/:id/attachments', async (req, res) => {
@@ -5250,6 +5394,37 @@ app.post('/api/leads/update', async (req, res) => {
   const advisor = b.advisor ?? null;
   const lostReason = b.lostReason ?? b.status_reason ?? b.statusReason ?? null;
   const source = b.source ?? null;
+  // v5.3.24 (A6): alcance ANTES de abrir la transacción (así los 403/404
+  // no dejan una transacción abierta). Antes cualquier asesor podía
+  // actualizar cualquier prospecto por id y cambiarle el asesor por su
+  // propio nombre, robándolo con su comisión. Ahora: si el prospecto
+  // existe, debe pertenecer al alcance del llamante; si se reasigna
+  // (cambia el asesor), solo el admin o el líder de esa red, y el nuevo
+  // asesor debe ser de su equipo.
+  const leadScope = await getRoleScope(req);
+  let existingAdvisor = null;
+  let existingLeadId = leadId;
+  if (!existingLeadId && conversationId) {
+    const chk = await pool.query('SELECT id, advisor FROM leads WHERE conversation_id = $1', [conversationId]);
+    if (chk.rows.length > 0) { existingLeadId = chk.rows[0].id; existingAdvisor = chk.rows[0].advisor; }
+  } else if (existingLeadId) {
+    const chk = await pool.query('SELECT advisor FROM leads WHERE id = $1', [existingLeadId]);
+    if (chk.rows.length > 0) existingAdvisor = chk.rows[0].advisor;
+    else return res.status(404).json({ error: 'Prospecto no encontrado' });
+  }
+  if (existingLeadId) {
+    if (leadScope.role !== 'admin' && !(leadScope.names || []).includes(existingAdvisor)) {
+      return res.status(403).json({ error: 'No puedes modificar un prospecto de otro asesor' });
+    }
+    if (advisor && advisor !== existingAdvisor) {
+      if (leadScope.role === 'advisor') {
+        return res.status(403).json({ error: 'Solo el administrador o tu director pueden reasignar un prospecto' });
+      }
+      if (leadScope.role === 'sales_agent' && !(leadScope.names || []).includes(advisor)) {
+        return res.status(403).json({ error: 'El asesor debe ser de tu equipo' });
+      }
+    }
+  }
   try {
     const client = await pool.connect();
     try {
@@ -5266,6 +5441,10 @@ app.post('/api/leads/update', async (req, res) => {
         if (!finalAdvisor) finalAdvisor = currentLead.rows[0]?.advisor;
         await client.query(`UPDATE leads SET status = COALESCE($1, status), client_name = COALESCE($2, client_name), technical_images = COALESCE($3, technical_images), items_to_clean = COALESCE($4, items_to_clean), estimated_value = COALESCE($5, estimated_value), address = COALESCE($6, address), location = COALESCE($7, location), advisor = COALESCE($8, advisor), lost_reason = COALESCE($9, lost_reason), source = COALESCE($10, source), updated_at = NOW() WHERE id = $11`, [status, clientName, technicalImages, itemsToClean, estimatedValue, address, location, finalAdvisor, lostReason, source, finalLeadId]);
       } else if (conversationId) {
+        // v5.3.24 (A6): al crear, el asesor se fuerza desde el JWT (el
+        // asesor no puede crear prospectos a nombre de otro).
+        if (leadScope.role === 'advisor') finalAdvisor = leadScope.userName;
+        else if (leadScope.role === 'sales_agent' && !finalAdvisor) finalAdvisor = leadScope.userName;
         await client.query(`INSERT INTO leads (conversation_id, client_name, status, technical_images, items_to_clean, estimated_value, address, location, advisor, source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, [conversationId, clientName || 'Cliente Nuevo', status || 'NUEVO', technicalImages || [], itemsToClean, estimatedValue || 0, address, location, finalAdvisor, source]);
       }
       
@@ -5297,9 +5476,25 @@ app.delete('/api/leads/:id', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// v5.3.24 (A4): la lista de personal estaba sin alcance — cualquier
+// empleado veía a todo el personal (correos, roles, porcentajes de
+// comisión, jefes). Ahora: admin ve todo; el líder, a sí mismo y a su
+// red directa; el asesor y el operario, solo a sí mismos. (Los otros
+// cuatro GET de A4 — leads, services, ranking y comisiones — ya
+// aplicaban getRoleScope en v5.2; verificado en el código, no se tocan.)
 app.get('/api/staff', async (req, res) => {
   try {
-    const r = await pool.query(`SELECT e.id, e.name, e.email, e.role, e.phone, e.commission_pct as "commissionPct", e.parent_id as "parentId", p.name as "parentName", e.is_online as "isOnline", e.last_assigned_at as "lastAssignedAt" FROM employees e LEFT JOIN employees p ON e.parent_id = p.id WHERE e.active = true ORDER BY e.role, e.name`);
+    const scope = await getRoleScope(req);
+    let where = 'WHERE e.active = true';
+    const params = [];
+    if (scope.role === 'sales_agent') {
+      params.push(scope.userId);
+      where += ` AND (e.id = $${params.length} OR e.parent_id = $${params.length})`;
+    } else if (scope.role !== 'admin') {
+      params.push(scope.userId);
+      where += ` AND e.id = $${params.length}`;
+    }
+    const r = await pool.query(`SELECT e.id, e.name, e.email, e.role, e.phone, e.commission_pct as "commissionPct", e.parent_id as "parentId", p.name as "parentName", e.is_online as "isOnline", e.last_assigned_at as "lastAssignedAt" FROM employees e LEFT JOIN employees p ON e.parent_id = p.id ${where} ORDER BY e.role, e.name`, params);
     res.json(r.rows.map(row => ({ ...row, id: row.id.toString(), parentId: row.parentId ? row.parentId.toString() : undefined })));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5401,6 +5596,10 @@ app.post('/api/auth/login', async (req, res) => {
       loginBlocks.delete(blockKey);
       const user = { id: r.rows[0].id.toString(), name: r.rows[0].name, role: (r.rows[0].role || 'operator').toLowerCase(), email: r.rows[0].email, isOnline: r.rows[0].is_online };
       const token = jwt.sign(user, jwtSecret, { expiresIn: '24h' });
+      // v5.3.24 (A5): el token va en cookie HttpOnly; el frontend ya no
+      // lo guarda en localStorage. El token sigue en el JSON para
+      // clientes de API externos (la interfaz web lo ignora).
+      res.cookie(AUTH_COOKIE, token, authCookieOptions(req));
       res.json({ success: true, user, token });
     } else {
       // Login fallido: queda registrado. 5 fallos en 10 min con el mismo
@@ -5424,6 +5623,19 @@ app.post('/api/auth/login', async (req, res) => {
     logger.error('Error en login', err);
     res.status(500).json({ error: 'Error de base de datos' });
   }
+});
+
+// v5.3.24 (A5): cerrar sesión (borra la cookie HttpOnly) y restaurar la
+// sesión al recargar (el usuario ya no vive en localStorage: la app
+// pregunta quién es con la cookie). /api/auth/me pasa por
+// authMiddleware, así que req.user ya está verificado aquí.
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie(AUTH_COOKIE, { path: '/' });
+  res.json({ success: true });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  res.json({ user: req.user });
 });
 
 app.get('/api/services', async (req, res) => {
@@ -5533,10 +5745,51 @@ app.post('/api/services', async (req, res) => {
   if ((Number.isFinite(totalValueNum) && totalValueNum < 0) || (Number.isFinite(advancesNum) && advancesNum < 0)) {
     return res.status(400).json({ error: 'total_value y advances no pueden ser negativos' });
   }
+  // v5.3.24 (A3): el upsert no tenía control de rol ni de alcance: un
+  // operario podía crear o sobrescribir cualquier servicio (montos,
+  // asesor, estado) con solo su id. Ahora el operario no crea ni edita
+  // servicios (403), el estado debe ser válido y todos los montos deben
+  // ser números no negativos.
+  if (normalizeRoleValue(req.user?.role) === 'operator') {
+    return res.status(403).json({ error: 'Solo lectura: los operadores no pueden crear ni editar servicios' });
+  }
+  const VALID_DEAL_STATUSES = ['AGENDADO', 'CONFIRMADO', 'REAGENDADO', 'REALIZADO', 'PAGADO', 'CANCELADO'];
+  if (s.dealStatus !== undefined && s.dealStatus !== null && s.dealStatus !== '' && !VALID_DEAL_STATUSES.includes(s.dealStatus)) {
+    return res.status(400).json({ error: `deal_status inválido: debe ser uno de ${VALID_DEAL_STATUSES.join(', ')}` });
+  }
+  const moneyFields = ['initialValue', 'additionalValue', 'totalValue', 'advances', 'expenses', 'operatorPayment', 'netProfit'];
+  for (const f of moneyFields) {
+    const v = s[f];
+    if (v !== undefined && v !== null && v !== '') {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: `${f} debe ser un número no negativo` });
+    }
+  }
   // El teléfono del cliente se guarda normalizado (+57...) para que el
   // mismo cliente no se duplique con '300...' en un lado y '+57300...' en otro.
   const clientPhone = normalizePhoneString(s.clientPhone);
   try {
+    // v5.3.24 (A3): alcance del upsert. Si el id ya existe, el servicio
+    // debe pertenecer al alcance del llamante; si es nuevo, el asesor se
+    // fuerza desde el JWT (asesor: su propio nombre; líder: alguien de
+    // su red; admin: el que venga en el cuerpo).
+    const scope = await getRoleScope(req);
+    const svcRole = normalizeRoleValue(req.user?.role);
+    let advisor = s.advisor;
+    if (svcRole === 'advisor') advisor = scope.userName;
+    else if (svcRole === 'sales_agent') {
+      if (advisor && !(scope.names || []).includes(advisor)) {
+        return res.status(403).json({ error: 'El asesor debe ser de tu equipo' });
+      }
+      if (!advisor) advisor = scope.userName;
+    }
+    if (s.id) {
+      const existing = await pool.query('SELECT advisor FROM services WHERE id = $1', [s.id]);
+      if (existing.rows.length > 0) {
+        const inScope = svcRole === 'admin' || (scope.names || []).includes(existing.rows[0].advisor);
+        if (!inScope) return res.status(403).json({ error: 'No puedes modificar un servicio de otro asesor' });
+      }
+    }
     const query = `
     INSERT INTO services (
       id, date, time, client_name, client_phone, city, neighborhood, address, advisor,
@@ -5556,13 +5809,13 @@ app.post('/api/services', async (req, res) => {
       reschedule_count=EXCLUDED.reschedule_count, cancellation_reason=EXCLUDED.cancellation_reason
     RETURNING id`;
     const r = await pool.query(query, [
-      s.id, s.date, s.time, s.clientName, clientPhone, s.city, s.neighborhood, s.address, s.advisor,
+      s.id, s.date, s.time, s.clientName, clientPhone, s.city, s.neighborhood, s.address, advisor,
       s.operators, s.itemsToClean, s.servicePerformed || '', s.observations || '', s.initialValue, s.additionalItems, s.additionalValue, s.totalValue,
       s.paymentMethod, s.expenses || 0, s.expensesNote || '', s.operatorPayment || 0, s.advances || 0, s.netProfit || 0, s.isWarranty || false, s.dealStatus || 'AGENDADO',
       s.technicalImages || [], s.afterImages || [], s.clientSignature || '', s.source, s.rescheduleCount || 0, s.cancellationReason || null
     ]);
 
-    const peopleInvolved = [s.advisor, ...(s.operators || [])];
+    const peopleInvolved = [advisor, ...(s.operators || [])];
     const idsRes = await pool.query("SELECT id FROM employees WHERE name = ANY($1)", [peopleInvolved]);
     notifyUpdate('service', idsRes.rows.map(r => r.id));
 
@@ -5598,8 +5851,20 @@ app.post('/api/services/update-deal', async (req, res) => {
   if (status === 'REAGENDADO' && (!date || !String(date).trim() || !time || !String(time).trim())) {
     return res.status(400).json({ error: 'Para reprogramar, date y time son obligatorios' });
   }
+  // v5.3.24 (A3): el operario no cambia estados (solo lectura) y nadie
+  // cambia el estado de un servicio fuera de su alcance. Antes cualquier
+  // usuario marcaba cualquier servicio como PAGADO o CANCELADO con solo
+  // su id (el servicio solo se leía para notificar, no para autorizar).
+  if (normalizeRoleValue(req.user?.role) === 'operator') {
+    return res.status(403).json({ error: 'Solo lectura: los operadores no pueden cambiar el estado de servicios' });
+  }
   try {
     const serviceInfo = await pool.query("SELECT advisor, operators, reschedule_count FROM services WHERE id = $1", [id]);
+    if (serviceInfo.rows.length === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
+    const scope = await getRoleScope(req);
+    if (scope.role !== 'admin' && !(scope.names || []).includes(serviceInfo.rows[0].advisor)) {
+      return res.status(403).json({ error: 'No puedes modificar un servicio de otro asesor' });
+    }
     
     // cancellation_reason solo se toca al CANCELAR: antes, cualquier cambio
     // de estado (p. ej. AGENDADO -> CONFIRMADO) borraba el motivo guardado.
@@ -6013,7 +6278,7 @@ app.get('/api/invoices/:id/export', requireAdmin, async (req, res) => {
     res.json({
       nota: 'Datos listos para un proveedor de facturación electrónica certificado (Siigo/Alegra). Este JSON NO es una factura electrónica ni se envió a la DIAN.',
       empresa: {
-        nombre: company.branding_company_name || 'Purifica Tu Ambiente',
+        nombre: company.branding_company_name || 'CRM',
         nit: company.company_nit || null,
         regimen: company.company_regime || null,
         resolucion_facturacion: {
@@ -6048,6 +6313,10 @@ app.post('/api/invoices/:id/payment-link', requireBilling, async (req, res) => {
     if (inv.status === 'pagado' || Number(inv.balance) <= 0) return res.status(400).json({ error: 'La factura ya está pagada' });
     const amount = Number(inv.balance);
     let url = null;
+    // v5.3.24 (M8): la descripción del pago lleva el nombre de la marca
+    // configurada, no "Purifica Tu Ambiente" fijo.
+    const payCompany = await getCompanySettings().catch(() => ({}));
+    const payCompanyName = payCompany.branding_company_name || 'CRM';
 
     if (provider === 'wompi') {
       const publicKey = (process.env.WOMPI_PUBLIC_KEY || '').trim();
@@ -6075,7 +6344,7 @@ app.post('/api/invoices/:id/payment-link', requireBilling, async (req, res) => {
       const signature = crypto.createHash('md5').update(`${apiKey}~${merchantId}~${inv.number}~${amountStr}~COP`).digest('hex');
       const params = new URLSearchParams({
         merchantId, accountId,
-        description: `Pago factura ${inv.number} - Purifica Tu Ambiente`,
+        description: `Pago factura ${inv.number} - ${payCompanyName}`,
         referenceCode: inv.number,
         amount: amountStr, tax: '0', taxReturnBase: '0', currency: 'COP',
         signature, test: '0',
@@ -6305,7 +6574,11 @@ app.post('/api/settings', async (req, res) => {
 // ---------- MARCA BLANCA ----------
 // Se guarda en la tabla settings (key/value) con claves branding_*.
 const BRANDING_DEFAULTS = {
-  company_name: 'Purifica Tu Ambiente',
+  // v5.3.24 (M8): valor por defecto NEUTRO. La marca real de Purifica
+  // vive en la tabla settings (branding_*) de su instalación; una
+  // instalación revendida sin personalizar muestra "CRM", no el nombre
+  // de otra empresa.
+  company_name: 'CRM',
   tagline: 'Sistema Integrado de Gestión CRM',
   logo_url: '',
   primary_color: '#0284c7',

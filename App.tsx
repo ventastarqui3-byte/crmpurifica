@@ -19,22 +19,32 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { io } from 'socket.io-client';
 import { ServiceRecord, ViewState, StaffMember, ChatConversation, CurrentUser, ChatMessage, LeadRecord, LeadStatus, DealStatus, ClientSummary, ClientReminder } from './types';
 import { notificationService } from './utils/NotificationService';
-import { apiFetch, getToken, clearAuth } from './lib/api';
+import { apiFetch, clearAuth } from './lib/api';
 import { loadBranding } from './lib/branding';
 import { BrandingSettings } from './components/BrandingSettings';
 import { SystemStatus } from './components/SystemStatus';
 import { Invoices } from './components/Invoices';
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(() => {
-    try {
-      const savedUser = localStorage.getItem('purifica_session');
-      return savedUser ? JSON.parse(savedUser) : null;
-    } catch (e) {
-      console.error("Error recuperando sesión", e);
-      return null;
-    }
-  });
+  // v5.3.24 (A5): el usuario ya NO se guarda en localStorage
+  // ('purifica_session' con el usuario completo). La sesión vive en la
+  // cookie HttpOnly del servidor y al recargar se restaura preguntando
+  // quién es a /api/auth/me. Mientras se comprueba, sessionChecked es
+  // false y no se muestra el login (para que no parpadee).
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
+
+  useEffect(() => {
+    apiFetch('/api/auth/me')
+      .then(async (res) => {
+        if (res.ok) {
+          const data = await res.json().catch(() => null);
+          if (data?.user) setCurrentUser(data.user);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setSessionChecked(true));
+  }, []);
 
   const [currentView, setCurrentView] = useState<ViewState>('dashboard');
   const [isLoading, setIsLoading] = useState(true);
@@ -84,9 +94,9 @@ export default function App() {
 
   useEffect(() => {
     if (currentUser) {
-      localStorage.setItem('purifica_session', JSON.stringify(currentUser));
-      
-      const socket = io(window.location.origin, { auth: { token: getToken() } });
+      // v5.3.24 (A5): el socket se autentica con la cookie HttpOnly
+      // (withCredentials); ya no se manda el token en handshake.auth.
+      const socket = io(window.location.origin, { withCredentials: true });
       socket.on('connect', () => {
         socket.emit('identify', { id: currentUser.id, role: currentUser.role });
       });
@@ -102,8 +112,6 @@ export default function App() {
       return () => {
         socket.disconnect();
       };
-    } else {
-      localStorage.removeItem('purifica_session');
     }
   }, [currentUser]);
 
@@ -401,6 +409,9 @@ export default function App() {
 
   useEffect(() => { loadBranding().catch(() => {}); }, []);
 
+  // v5.3.24 (A5): mientras se comprueba la sesión no se muestra el
+  // login (evita el parpadeo login -> app al recargar con sesión).
+  if (!sessionChecked) return <DashboardSkeleton />;
   if (!currentUser) return <LoginScreen onLogin={setCurrentUser} />;
 
   const renderView = () => {

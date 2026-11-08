@@ -1,0 +1,35 @@
+/* Tailwind compilado en local (v5.3.24, A5): antes venía del CDN con un
+   script inline; ahora el build genera estas utilidades y la CSP puede
+   ser estricta (script-src 'self'). */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Colores de marca por defecto (azul cielo de Purifica), como canales
+   RGB separados ("14 165 233"): Tailwind los usa como
+   rgb(var(--brand-500) / <alpha-value>) para que funcionen los
+   modificadores de opacidad (bg-brand-500/20, etc.). lib/branding.ts
+   sobrescribe estas variables con el color primario que el admin elige
+   en Personalización. */
+:root {
+  --brand-50: 240 249 255;
+  --brand-100: 224 242 254;
+  --brand-200: 186 230 253;
+  --brand-300: 125 211 252;
+  --brand-400: 56 189 248;
+  --brand-500: 14 165 233;
+  --brand-600: 2 132 199;
+  --brand-700: 3 105 161;
+  --brand-800: 7 89 133;
+  --brand-900: 12 74 110;
+  --brand-secondary: #0ea5e9;
+}
+
+/* Impresión de facturas (antes vivía en un <style> en línea dentro de
+   InvoiceModal.tsx; la CSP lo bloquearía). */
+@media print {
+  body * { visibility: hidden !important; }
+  .invoice-print-area, .invoice-print-area * { visibility: visible !important; }
+  .invoice-print-area { position: absolute !important; inset: 0 !important; width: 100% !important; max-height: none !important; overflow: visible !important; border: none !important; box-shadow: none !important; border-radius: 0 !important; }
+  .no-print { display: none !important; }
+}

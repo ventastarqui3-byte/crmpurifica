@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {Smartphone, Plus, Trash2, RefreshCw, QrCode, Loader2, Info, ShieldCheck, Zap, X, Cloud, KeyRound, Save, CheckCircle2} from 'lucide-react';
 import { WhatsAppInstance, CurrentUser } from '../types';
 import { io } from 'socket.io-client';
-import { apiFetch, getToken } from '../lib/api';
+import { apiFetch } from '../lib/api';
 
 interface MetaStatus {
   configured: boolean;
@@ -74,7 +74,9 @@ export const WhatsAppChannels: React.FC<{ currentUser: CurrentUser }> = ({ curre
     fetchInstances();
     fetchMetaStatus();
 
-    const socket = io(window.location.origin, { auth: { token: getToken() } });
+    // v5.3.24 (A5): el socket se autentica con la cookie HttpOnly
+    // (withCredentials); ya no se manda el token en handshake.auth.
+    const socket = io(window.location.origin, { withCredentials: true });
     
     socket.on('wa_qr', (data: { id: string; qr: string; status: string }) => {
       setInstances(prev => prev.map(inst => 

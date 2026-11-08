@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import './index.css'; // v5.3.24 (A5): Tailwind compilado en local.
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {

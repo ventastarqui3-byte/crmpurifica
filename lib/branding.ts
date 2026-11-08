@@ -12,7 +12,10 @@ export interface Branding {
 }
 
 export const DEFAULT_BRANDING: Branding = {
-  company_name: 'Purifica Tu Ambiente',
+  // v5.3.24 (M8): valor por defecto NEUTRO. La marca real de Purifica
+  // vive en la tabla settings (branding_*) de su instalación; una
+  // instalación revendida sin personalizar muestra "CRM".
+  company_name: 'CRM',
   tagline: 'Sistema Integrado de Gestión CRM',
   logo_url: '',
   primary_color: '#0284c7',
@@ -42,8 +45,17 @@ function mix(hex: string, target: string, amount: number): string {
   return `#${[r, g, b].map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')).join('')}`;
 }
 
-/** Aplica nombre (título), colores primarios (variables CSS + overrides de las
- *  clases brand-* de Tailwind CDN) y avisa al resto de la app. */
+/** Hex #RRGGBB -> canales "R G B" (p. ej. "#0284c7" -> "2 132 199").
+ *  Las variables --brand-* guardan canales separados, no hex, para que
+ *  Tailwind pueda aplicarles opacidad (rgb(var(--brand-500) / 0.2)). */
+function hexToChannels(hex: string): string {
+  const m = /^#([0-9a-fA-F]{6})$/.exec(hex || '');
+  if (!m) return hex;
+  return `${parseInt(m[1].slice(0, 2), 16)} ${parseInt(m[1].slice(2, 4), 16)} ${parseInt(m[1].slice(4, 6), 16)}`;
+}
+
+/** Aplica nombre (título) y colores primarios (variables CSS --brand-*
+ *  que Tailwind compilado usa para las clases brand-*). */
 export function applyBranding(b: Branding): void {
   cached = b;
   try { localStorage.setItem(CACHE_KEY, JSON.stringify(b)); } catch { /* noop */ }
@@ -62,41 +74,16 @@ export function applyBranding(b: Branding): void {
     '800': mix(p, '#000000', 0.30),
     '900': mix(p, '#000000', 0.45),
   };
-  Object.entries(shades).forEach(([k, v]) => root.style.setProperty(`--brand-${k}`, v));
+  Object.entries(shades).forEach(([k, v]) => root.style.setProperty(`--brand-${k}`, hexToChannels(v)));
   root.style.setProperty('--brand-secondary', b.secondary_color || DEFAULT_BRANDING.secondary_color);
-  let style = document.getElementById('branding-style') as HTMLStyleElement | null;
-  if (!style) {
-    style = document.createElement('style');
-    style.id = 'branding-style';
-    document.head.appendChild(style);
-  }
-  style.textContent = `
-    .bg-brand-600{background-color:var(--brand-600)!important}
-    .bg-brand-500{background-color:var(--brand-500)!important}
-    .bg-brand-50{background-color:var(--brand-50)!important}
-    .bg-brand-100{background-color:var(--brand-100)!important}
-    .bg-brand-200{background-color:var(--brand-200)!important}
-    .bg-brand-300{background-color:var(--brand-300)!important}
-    .bg-brand-400{background-color:var(--brand-400)!important}
-    .bg-brand-700{background-color:var(--brand-700)!important}
-    .bg-brand-800{background-color:var(--brand-800)!important}
-    .bg-brand-900{background-color:var(--brand-900)!important}
-    .text-brand-100{color:var(--brand-100)!important}
-    .text-brand-200{color:var(--brand-200)!important}
-    .text-brand-300{color:var(--brand-300)!important}
-    .text-brand-600{color:var(--brand-600)!important}
-    .text-brand-700{color:var(--brand-700)!important}
-    .text-brand-500{color:var(--brand-500)!important}
-    .text-brand-400{color:var(--brand-400)!important}
-    .text-brand-800{color:var(--brand-800)!important}
-    .text-brand-900{color:var(--brand-900)!important}
-    .border-brand-200{border-color:var(--brand-200)!important}
-    .border-brand-500{border-color:var(--brand-500)!important}
-    .border-brand-600{border-color:var(--brand-600)!important}
-    .hover\\:bg-brand-700:hover{background-color:var(--brand-700)!important}
-    .focus\\:ring-brand-500:focus{--tw-ring-color:var(--brand-500)!important}
-    .focus\\:border-brand-500:focus{border-color:var(--brand-500)!important}
-  `;
+  // v5.3.24 (A5): ya NO se inyecta un <style> con las clases brand-*
+  // (la CSP bloquearía el <style> en línea y era la única pieza de
+  // estilo en línea). Las clases brand-* de Tailwind compilado leen
+  // estas mismas variables --brand-* (ver tailwind.config.js), así que
+  // basta con actualizarlas aquí; index.css trae los valores por
+  // defecto. Si una versión vieja inyectó el <style>, se elimina.
+  const old = document.getElementById('branding-style');
+  if (old) old.remove();
   window.dispatchEvent(new CustomEvent('branding-updated', { detail: b }));
 }
 

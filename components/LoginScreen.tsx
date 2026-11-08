@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiFetch, setToken } from '../lib/api';
+import { apiFetch } from '../lib/api';
 import { getCachedBranding, loadBranding, Branding } from '../lib/branding';
 import { CurrentUser } from '../types';
 import { Droplets, Mail, Lock, Loader2, AlertCircle } from 'lucide-react';
@@ -32,7 +32,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
       const data = await response.json();
 
       if (response.ok && data.success) {
-        if (data.token) setToken(data.token);
+        // v5.3.24 (A5): el servidor ya dejó el token en cookie HttpOnly;
+        // el frontend ya no guarda nada en localStorage.
         onLogin(data.user);
       } else {
         setError(data.error || 'Credenciales inválidas');

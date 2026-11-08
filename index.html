@@ -1,30 +1,14 @@
-
 <!DOCTYPE html>
 <html lang="es">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Purifica Tu Ambiente CRM</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              brand: {
-                50: '#f0f9ff',
-                100: '#e0f2fe',
-                500: '#0ea5e9',
-                600: '#0284c7',
-                700: '#0369a1',
-                900: '#0c4a6e',
-              }
-            }
-          }
-        }
-      }
-    </script>
-</head>
+    <!-- v5.3.24 (A5): Tailwind ya no viene del CDN (ese script externo
+         corría con plenos privilegios en el origen y la CSP lo bloquea).
+         Ahora es Tailwind compilado en local (ver tailwind.config.js y
+         index.css); el título lo reescribe la marca al cargar. -->
+  </head>
   <body class="bg-slate-50 text-slate-900 antialiased">
     <div id="root"></div>
     <script type="module" src="/index.tsx"></script>
