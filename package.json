@@ -1,6 +1,6 @@
 {
   "name": "purifica-crm",
-  "version": "5.3.24",
+  "version": "5.3.25",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,6 +16,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "express-rate-limit": "^8.7.3",
     "framer-motion": "^12.34.4",
     "googleapis": "^189.0.0",
     "helmet": "^8.3.0",
@@ -35,7 +36,15 @@
     "xlsx": "^0.18.5"
   },
   "overrides": {
-    "puppeteer": "24.37.5"
+    "puppeteer": "24.37.5",
+    "qs": "^6.17.1",
+    "body-parser": "^1.20.9",
+    "path-to-regexp": "0.1.13",
+    "engine.io": "^6.6.11",
+    "socket.io-parser": "^4.2.7",
+    "ws": "^8.22.2",
+    "lodash": "^4.18.1",
+    "glob": "^14.0.4"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

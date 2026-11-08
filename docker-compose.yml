@@ -1,4 +1,4 @@
-# Purifica Tu Ambiente CRM — v5.3
+# CRM — v5.3.25 (marca blanca)
 # Instalación:  docker compose up -d --build
 # La app queda en http://localhost:${APP_PORT:-8080}
 # WhatsApp por QR (whatsapp-web.js): la sesión vive en el volumen wa-auth,
@@ -58,10 +58,10 @@ services:
       - ./backups:/backups
     command: >
       sh -c 'set -e; mkdir -p /backups;
-      F=/backups/purifica-$(date +%F-%H%M).sql.gz;
+      F=/backups/crm-backup-$(date +%F-%H%M).sql.gz;
       pg_dump -h db -U ${POSTGRES_USER:-purifica} -d ${POSTGRES_DB:-purifica} | gzip > "$$F";
       echo "Respaldo guardado en $$F";
-      find /backups -name "purifica-*.sql.gz" -mtime +${BACKUP_KEEP_DAYS:-7} -delete'
+      find /backups -name "crm-backup-*.sql.gz" -mtime +${BACKUP_KEEP_DAYS:-7} -delete'
 
 volumes:
   pgdata:

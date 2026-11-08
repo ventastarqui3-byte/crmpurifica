@@ -4,6 +4,7 @@ import {ChatConversation, StaffMember, ChatMessage, LeadStatus, CurrentUser, Cha
 import {Search, Send, ArrowLeft, MessageCircle, Globe, Plus, ClipboardList, X, Calculator, Save, Camera, Loader2, Zap, Instagram, Facebook, Info, Sparkles, Paperclip, FileText, Download} from 'lucide-react';
 import { ClientIntelligence } from './ClientIntelligence';
 import { apiFetch } from '../lib/api';
+import { isSafeUrl, isSafeImageSrc } from '../lib/safeUrl';
 
 interface ChatInboxProps {
   conversations: ChatConversation[];
@@ -386,12 +387,23 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
                                {msg.type === 'audio' ? <audio controls src={msg.attachmentUrl} className="h-10 w-full" /> :
                                 msg.type === 'video' ? <video controls preload="metadata" src={msg.attachmentUrl} className="max-h-72 rounded-xl w-full bg-black" /> :
                                 msg.type === 'document' || msg.type === 'file' ? (
-                                  <a href={msg.attachmentUrl} target="_blank" rel="noreferrer" download className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-700 transition-colors">
-                                    <FileText className="w-5 h-5 text-brand-600" /> <span className="truncate">Descargar documento</span> <Download className="w-4 h-4 ml-auto flex-shrink-0" />
-                                  </a>
+                                  // v5.3.25 (M13): el enlace solo se renderiza si la URL es
+                                  // segura (/uploads/ o https://); nunca javascript: ni rutas
+                                  // fuera del CRM. Y rel con noopener.
+                                  isSafeUrl(msg.attachmentUrl) ? (
+                                    <a href={msg.attachmentUrl} target="_blank" rel="noopener noreferrer" download className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-700 transition-colors">
+                                      <FileText className="w-5 h-5 text-brand-600" /> <span className="truncate">Descargar documento</span> <Download className="w-4 h-4 ml-auto flex-shrink-0" />
+                                    </a>
+                                  ) : (
+                                    <span className="flex items-center gap-2 bg-slate-100 rounded-xl px-3 py-2 text-xs font-bold text-slate-500">
+                                      <FileText className="w-5 h-5 text-slate-400" /> <span className="truncate">Documento no disponible</span>
+                                    </span>
+                                  )
                                 ) : (
                                   <>
-                                    <img src={msg.attachmentUrl} className="max-h-72 rounded-xl object-cover cursor-pointer hover:brightness-95" />
+                                    {isSafeImageSrc(msg.attachmentUrl) ? (
+                                      <img src={msg.attachmentUrl} className="max-h-72 rounded-xl object-cover cursor-pointer hover:brightness-95" />
+                                    ) : null}
                                     <button onClick={() => toggleImageSelection(msg.attachmentUrl!)} className={`absolute bottom-2 right-2 p-2 rounded-full shadow-xl transition-all ${techImages.includes(msg.attachmentUrl!) ? 'bg-red-500 text-white' : 'bg-white text-brand-600 opacity-0 group-hover:opacity-100 scale-90 hover:scale-100'}`}>
                                       {techImages.includes(msg.attachmentUrl!) ? <X className="w-5 h-5" /> : <Plus className="w-5 h-5" />}
                                     </button>

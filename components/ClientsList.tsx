@@ -6,6 +6,7 @@ import * as XLSX from 'xlsx';
 import { apiFetch } from '../lib/api';
 import { formatCurrency } from '../lib/format';
 import { formatPhoneCO } from '../lib/phone';
+import { getCachedBranding } from '../lib/branding';
 
 // Fecha del último servicio en zona Bogotá: el servidor devuelve un
 // timestamp y `split('T')[0]` tomaba la fecha UTC (un día más en
@@ -103,7 +104,9 @@ export const ClientsList: React.FC<ClientsListProps> = ({
         })));
         const workbook = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(workbook, worksheet, "Base_Clientes");
-        XLSX.writeFile(workbook, `DB_Clientes_Purifica_${new Date().toISOString().split('T')[0]}.xlsx`);
+        // v5.3.25 (M8): el nombre del archivo sale de la marca configurada.
+        const brandSlug = getCachedBranding().company_name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'CRM';
+        XLSX.writeFile(workbook, `DB_Clientes_${brandSlug}_${new Date().toISOString().split('T')[0]}.xlsx`);
       }
     } catch (e) {
       console.error('Error exporting to excel:', e);

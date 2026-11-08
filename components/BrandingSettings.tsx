@@ -4,6 +4,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Palette, Upload, Save, Loader2, CheckCircle2, AlertCircle, Image as ImageIcon } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { isSafeImageSrc } from '../lib/safeUrl';
 import { getCachedBranding, loadBranding, applyBranding, Branding } from '../lib/branding';
 
 export const BrandingSettings: React.FC = () => {
@@ -109,7 +110,8 @@ export const BrandingSettings: React.FC = () => {
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1">Logo (PNG o JPG, máx. 2 MB)</label>
           <div className="flex items-center gap-4">
-            {logoPreview ? (
+            {/* v5.3.25 (M13): el logo solo se previsualiza si la URL es segura. */}
+            {logoPreview && isSafeImageSrc(logoPreview) ? (
               <img src={logoPreview} alt="Logo" className="h-16 w-16 object-contain bg-slate-50 border border-slate-200 rounded-xl p-1" />
             ) : (
               <div className="h-16 w-16 flex items-center justify-center bg-slate-50 border border-slate-200 rounded-xl text-slate-400">

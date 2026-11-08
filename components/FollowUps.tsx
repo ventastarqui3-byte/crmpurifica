@@ -13,6 +13,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Clock, Send, X, RefreshCw, Play, Loader2, CheckCircle2, XCircle, Save, BellRing, Upload, Trash2, Megaphone } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { isSafeUrl } from '../lib/safeUrl';
 import type { FollowupRow, FollowupStatus } from '../types';
 import { Campaigns } from './Campaigns';
 
@@ -299,7 +300,8 @@ export const FollowUps: React.FC = () => {
           <p className="text-xs text-slate-500 mt-1">
             Este medio se manda con todos los avisos de seguimiento. Cámbialo cuando quieras, por ejemplo para una promoción.
           </p>
-          {mediaUrl ? (
+          {/* v5.3.25 (M13): el medio solo se previsualiza si la URL es segura. */}
+          {mediaUrl && isSafeUrl(mediaUrl) ? (
             <div className="mt-3">
               {mediaType === 'video' ? (
                 <video src={mediaUrl} controls className="max-h-40 rounded-lg border border-slate-200" />
@@ -367,7 +369,7 @@ export const FollowUps: React.FC = () => {
           <Clock className="w-5 h-5 text-slate-500" /> Pendientes ({pending.length})
         </h2>
         <p className="text-xs text-slate-500 mt-1 flex items-center gap-2">
-          {mediaUrl ? (
+          {mediaUrl && isSafeUrl(mediaUrl) ? (
             <>
               Se enviará con:
               {mediaType === 'video' ? (

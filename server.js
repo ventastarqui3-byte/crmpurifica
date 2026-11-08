@@ -11,6 +11,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import helmet from 'helmet';
 import crypto from 'crypto';
+import rateLimit from 'express-rate-limit';
 import { spawn } from 'child_process';
 import zlib from 'zlib';
 import { Server } from 'socket.io';
@@ -46,12 +47,21 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.24';
+const APP_VERSION = '5.3.25';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 const BACKUP_ENABLED = (process.env.BACKUP_ENABLED || 'true').toLowerCase() !== 'false';
 const BACKUP_KEEP_DAYS = parseInt(process.env.BACKUP_KEEP_DAYS || '7', 10) || 7;
+// v5.3.25 (M12): clave para cifrar los respaldos (AES-256-GCM). Debe ser
+// 64 caracteres hex (32 bytes), p. ej. `openssl rand -hex 32`. Sin ella
+// el respaldo se guarda SIN cifrar y queda registrado el aviso.
+const BACKUP_ENCRYPTION_KEY_HEX = (process.env.BACKUP_ENCRYPTION_KEY || '').trim();
+const BACKUP_ENCRYPTION_KEY = /^[0-9a-fA-F]{64}$/.test(BACKUP_ENCRYPTION_KEY_HEX)
+  ? Buffer.from(BACKUP_ENCRYPTION_KEY_HEX, 'hex') : null;
+if (BACKUP_ENCRYPTION_KEY_HEX && !BACKUP_ENCRYPTION_KEY) {
+  logger.warn('BACKUP_ENCRYPTION_KEY inválida (debe ser 64 caracteres hex): los respaldos quedarán SIN cifrar');
+}
 
 // ---------- GOOGLE CALENDAR v5.3 ----------
 // OAuth2 con refresh token (NO llave de API pública: esa solo lee, no
@@ -2176,6 +2186,12 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry
 // --- FIN CONFIGURACIÓN WHATSAPP ---
 
 const app = express();
+// v5.3.25 (M6): confiar SOLO en el primer proxy (el router de Railway o
+// el proxy inverso del VPS). Sin esto, req.ip sería la IP del proxy y el
+// rate limiting y el bloqueo de login verían a todos los usuarios como
+// una sola IP. Con '1', Express toma la IP que el proxy añade al final
+// de X-Forwarded-For, que es la del cliente real.
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 // CORS del socket: mismo origen salvo CORS_ORIGIN. La autenticación real del
 // socket se hace con JWT en el handshake (io.use más abajo).
@@ -2265,26 +2281,85 @@ app.use(helmet({
 // (X-Hub-Signature-256): express.json lo parsea, así que se guarda el
 // buffer crudo en req.rawBody solo para esa ruta, sin tocar las demás.
 app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (req.url.startsWith('/api/webhooks/meta')) req.rawBody = buf; } }));
+
+// ---------- v5.3.25 (M6): RATE LIMITING ----------
+// Antes solo el login tenía bloqueo (fuerza bruta). Un usuario
+// autenticado podía inundar los endpoints que envían WhatsApp o crean
+// datos y tumbar el proceso (un solo proceso Node, sin clustering).
+// Límite global suave para toda /api y límites estrictos en los
+// endpoints sensibles. El login NO lleva limiter (mantiene su bloqueo
+// por correo+IP de 5 fallos/10 min -> 429 por 15 min).
+const rateLimitMessage = (msg) => (req, res) => res.status(429).json({ error: msg });
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 600,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: rateLimitMessage('Demasiadas peticiones. Inténtalo de nuevo en unos minutos.'),
+});
+app.use('/api', apiLimiter);
+// Envíos de WhatsApp (chat, campañas, seguimiento): 30 peticiones/15 min
+// por IP. Un humano no manda más; un script que inunde queda frenado.
+// El envío masivo de una campaña es UNA petición (el bucle es del servidor).
+const waSendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 30,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: rateLimitMessage('Demasiados envíos de WhatsApp en poco tiempo. Espera unos minutos.'),
+});
+// Subida de archivos: 60/15 min por IP.
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 60,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: rateLimitMessage('Demasiadas subidas en poco tiempo. Espera unos minutos.'),
+});
+// Cambios de contraseña y creación de usuarios: 20/15 min por IP.
+const accountLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 20,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: rateLimitMessage('Demasiados intentos en poco tiempo. Espera unos minutos.'),
+});
+// Webhooks públicos (Meta/Wompi/PayU): 300/15 min por IP. Los proveedores
+// mandan pocas peticiones; un flood queda frenado sin bloquear lo legítimo.
+const webhookLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 300,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: rateLimitMessage('Demasiadas peticiones al webhook.'),
+});
+// Cambios de ajustes: 60/15 min por IP.
+const settingsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, limit: 60,
+  standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: rateLimitMessage('Demasiados cambios de ajustes en poco tiempo. Espera unos minutos.'),
+});
 // Logos subidos (marca blanca): públicos, solo imágenes estáticas.
 fs.mkdirSync(uploadsDir(), { recursive: true });
 // v5.3.6: adjuntos de WhatsApp (fotos, audios, videos, documentos).
 fs.mkdirSync(waMediaDir(), { recursive: true });
-// v5.3.24 (A1): /uploads con cabeceras seguras. X-Content-Type-Options:
-// nosniff + Content-Type forzado desde la lista blanca de extensiones
-// (nunca el que declare quien sube) + CSP sandbox: aunque un .html o
-// .svg llegara a disco, al abrirlo directo no ejecuta scripts en el
-// origen del CRM (el sandbox lo deja sin origen y sin scripts). Sin
-// Content-Disposition: attachment, para no romper la vista previa de
-// imágenes y videos en Mensajes (los <img>/<video> no aplican el
-// sandbox; el documento navegado directamente sí).
-app.use('/uploads', express.static(uploadsDir(), {
-  setHeaders: (res, filePath) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Security-Policy', 'sandbox');
-    const ext = path.extname(filePath).slice(1).toLowerCase();
-    res.setHeader('Content-Type', WA_EXT_MIME[ext] || 'application/octet-stream');
-  },
-}));
+// v5.3.25 (M9): /uploads ya NO es público. Antes cualquiera con la URL
+// descargaba las fotos y vídeos de los clientes sin iniciar sesión.
+// Ahora /uploads/wa-media exige sesión válida (cookie HttpOnly o Bearer,
+// igual que la API): el frontend manda la cookie en cada <img>/<video>
+// (same-origin), así que las vistas previas de Mensajes siguen cargando.
+// El logo sí queda público: la página de login lo muestra sin sesión.
+// Las cabeceras seguras de la v5.3.24 (nosniff + Content-Type de la lista
+// blanca + CSP sandbox) se mantienen en ambos montajes.
+function uploadAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = parseCookies(req)[AUTH_COOKIE]
+    || (header.startsWith('Bearer ') ? header.slice(7) : null);
+  if (!token) return res.status(401).json({ error: 'No autorizado' });
+  try { jwt.verify(token, jwtSecret); return next(); }
+  catch { return res.status(401).json({ error: 'Token inválido o expirado' }); }
+}
+const uploadStaticHeaders = (res, filePath) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', 'sandbox');
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  res.setHeader('Content-Type', WA_EXT_MIME[ext] || 'application/octet-stream');
+};
+// Primero el montaje protegido (Express prueba los montajes en orden:
+// /uploads/wa-media/... cae aquí y nunca llega al montaje público).
+app.use('/uploads/wa-media', uploadAuth, express.static(waMediaDir(), { setHeaders: uploadStaticHeaders }));
+// Logo de marca blanca: público, solo imágenes estáticas (login sin sesión).
+app.use('/uploads', express.static(uploadsDir(), { setHeaders: uploadStaticHeaders }));
 
 // v5.3.10 — Diagnóstico de arranque en UNA línea: el PERSIST_DIR
 // efectivo, las rutas reales de sesión y archivos, y cuántas sesiones
@@ -2309,6 +2384,10 @@ app.use((req, res, next) => {
 // ---------- SEGURIDAD v3: JWT ----------
 const PUBLIC_API = [
   { method: 'POST', path: '/api/auth/login' },
+  // v5.3.25 Presencia: el logout debe correr aunque el token ya esté
+  // expirado (para apagar el flag y borrar la cookie); el handler
+  // verifica el token él mismo y nunca falla por eso.
+  { method: 'POST', path: '/api/auth/logout' },
   { method: 'GET', path: '/api/health' },
   { method: 'GET', path: '/api/settings/branding' },
   // Webhooks de pasarelas de pago: públicos por diseño (los verifica la
@@ -2471,6 +2550,18 @@ function normalizeRoleValue(v) {
   const r = String(v ?? '').toLowerCase().trim();
   return VALID_ROLES.includes(r) ? r : null;
 }
+// v5.3.25 (M11): política de contraseñas. Mínimo 8 caracteres, al menos
+// una letra y un número; rechaza las contraseñas más comunes. Se aplica
+// al crear y al cambiar contraseñas (empleados y cambio propio).
+// Devuelve el mensaje de error o null si la contraseña vale.
+const COMMON_PASSWORDS = new Set(['123456', '12345678', 'password', 'contraseña', 'admin', 'admin123', '123456789', 'qwerty', '12345', '1234567', '000000', '111111', 'abc123', 'password1', 'admin1234', 'purifica', 'purifica123', '1234567890', 'qwerty123']);
+function validatePassword(pw) {
+  if (typeof pw !== 'string' || pw.length < 8) return 'La contraseña debe tener al menos 8 caracteres';
+  if (!/[a-zA-Z]/.test(pw)) return 'La contraseña debe tener al menos una letra';
+  if (!/[0-9]/.test(pw)) return 'La contraseña debe tener al menos un número';
+  if (COMMON_PASSWORDS.has(pw.toLowerCase())) return 'Esa contraseña es demasiado común, elige otra';
+  return null;
+}
 // Alcance por rol desde el JWT. Admin: todo (names null). advisor:
 // solo lo suyo, por nombre exacto (los servicios/leads guardan el
 // asesor por nombre). sales_agent (líder de ventas): lo suyo + su red
@@ -2529,6 +2620,54 @@ async function operatorServicePhones(userName) {
   const phones = new Set();
   for (const row of r.rows) for (const v of phoneVariantsFor(row.client_phone)) phones.add(v);
   return [...phones];
+}
+// v5.3.25 (M1/M10): ¿pertenece este teléfono a un cliente en el alcance
+// del llamante? admin: siempre. Operador: solo clientes de sus servicios
+// asignados. Asesor/líder: servicios o prospectos con su nombre (o de su
+// red), o conversaciones sin asesor asignado (igual que GET /api/chats).
+// Un teléfono sin ningún servicio, prospecto ni conversación no pertenece
+// a nadie: solo el admin puede operar sobre él.
+async function phoneInScope(req, phone) {
+  const scope = await getRoleScope(req);
+  if (scope.role === 'admin') return true;
+  const variants = phoneVariantsFor(phone);
+  if (!variants.length) return false;
+  if (scope.role === 'operator') {
+    const phones = new Set(await operatorServicePhones(scope.userName));
+    return variants.some((v) => phones.has(v));
+  }
+  const names = (scope.names || []).map((n) => String(n).trim().toLowerCase()).filter(Boolean);
+  if (!names.length) return false;
+  const r = await pool.query(
+    `SELECT 1 FROM services WHERE client_phone = ANY($1) AND LOWER(TRIM(advisor)) = ANY($2)
+     UNION SELECT 1 FROM leads WHERE client_phone = ANY($1) AND LOWER(TRIM(advisor)) = ANY($2)
+     UNION SELECT 1 FROM conversations c LEFT JOIN leads l ON l.conversation_id = c.id
+       WHERE c.client_phone = ANY($1) AND (l.advisor IS NULL OR TRIM(l.advisor) = '' OR LOWER(TRIM(l.advisor)) = 'sin asignar' OR LOWER(TRIM(l.advisor)) = ANY($2)) LIMIT 1`,
+    [variants, names]
+  );
+  return r.rows.length > 0;
+}
+// ¿está esta conversación en el alcance del llamante? (M10: mismo patrón
+// que GET /api/chats). Devuelve { ok, phone, channel } o { ok: false,
+// reason }.
+async function conversationInScope(req, conversationId) {
+  const conv = await pool.query(
+    'SELECT c.client_phone, c.channel, l.advisor AS lead_advisor FROM conversations c LEFT JOIN leads l ON l.conversation_id = c.id WHERE c.id = $1',
+    [conversationId]
+  );
+  if (!conv.rows[0]) return { ok: false, reason: 'Conversación no encontrada' };
+  const row = conv.rows[0];
+  const scope = await getRoleScope(req);
+  if (scope.role === 'admin') return { ok: true, phone: row.client_phone, channel: row.channel };
+  if (scope.role === 'operator') {
+    const phones = new Set(await operatorServicePhones(scope.userName));
+    if (phoneVariantsFor(row.client_phone).some((v) => phones.has(v))) return { ok: true, phone: row.client_phone, channel: row.channel };
+    return { ok: false, reason: 'La conversación no es de tus servicios asignados' };
+  }
+  const names = new Set((scope.names || []).map((n) => String(n).trim().toLowerCase()).filter(Boolean));
+  const a = String(row.lead_advisor || '').trim().toLowerCase();
+  if (!a || a === 'sin asignar' || names.has(a)) return { ok: true, phone: row.client_phone, channel: row.channel };
+  return { ok: false, reason: 'La conversación no pertenece a tu alcance' };
 }
 // Facturación (B6): admin o asesor (vendedor). El asesor factura y cobra,
 // pero NO anula (eso sigue siendo solo admin) ni toca la configuración
@@ -2871,7 +3010,9 @@ app.post('/api/system/whatsapp/clean-cache', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/system/alerts/test', requireAdmin, async (req, res) => {
-  const text = `🔔 Prueba de alertas del CRM Purifica (v${APP_VERSION}): si lees esto en Telegram, las alertas funcionan. ${new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`;
+  // v5.3.25 (M8): el nombre sale de la marca configurada, no fijo.
+  const companyName = (await getCompanySettings().catch(() => ({})))['branding_company_name'] || 'CRM';
+  const text = `🔔 Prueba de alertas del CRM ${companyName} (v${APP_VERSION}): si lees esto en Telegram, las alertas funcionan. ${new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`;
   const r = await sendTelegramAlert(text);
   recordEvent(r.sent ? 'info' : 'warn', 'alerts', r.sent ? 'Prueba de alerta Telegram enviada' : `Prueba de alerta Telegram falló: ${r.reason}`, {});
   res.json({ ...r, text });
@@ -3127,12 +3268,39 @@ app.post('/api/system/normalize-phones', requireAdmin, async (req, res) => {
 
 // Respaldo con pg_dump (sin shell: pg_dump recibe la URL como argumento y
 // su salida se comprime con gzip en Node). Devuelve 501 si no hay pg_dump.
+// v5.3.25 (M12): cifra un respaldo .sql.gz con AES-256-GCM y la clave
+// BACKUP_ENCRYPTION_KEY. Formato del archivo .enc: [IV 16 bytes]
+// [cifrado][tag de autenticación 16 bytes]. Para descifrarlo, ver
+// scripts/decrypt-backup.js (misma clave en BACKUP_ENCRYPTION_KEY).
+async function encryptBackupFile(filePath) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', BACKUP_ENCRYPTION_KEY, iv);
+  const encPath = `${filePath}.enc`;
+  await new Promise((resolve, reject) => {
+    const input = fs.createReadStream(filePath);
+    const out = fs.createWriteStream(encPath);
+    out.write(iv);
+    input.pipe(cipher).pipe(out, { end: false });
+    cipher.on('end', () => { try { out.write(cipher.getAuthTag()); } catch { /* noop */ } out.end(); });
+    out.on('finish', resolve);
+    out.on('error', reject);
+    input.on('error', reject);
+    cipher.on('error', reject);
+  });
+  return encPath;
+}
+
 async function runBackup(trigger = 'manual') {
   if (!dbUrl) return { ok: false, code: 503, error: 'Base de datos no configurada' };
   const backupsDir = path.join(__dirname, 'backups');
   fs.mkdirSync(backupsDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 13);
-  const file = `purifica-${stamp}.sql.gz`;
+  // v5.3.25 (M8): nombre neutro derivado de la marca de la instalación
+  // (antes 'purifica-' fijo, que delataba la empresa en instalaciones
+  // revendidas). Sin marca configurada, 'crm'.
+  const company = await getCompanySettings().catch(() => ({}));
+  const slug = String(company['branding_company_name'] || 'CRM').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'crm';
+  let file = `${slug}-${stamp}.sql.gz`;
   const filePath = path.join(backupsDir, file);
   return new Promise((resolve) => {
     let settled = false;
@@ -3174,23 +3342,47 @@ async function runBackup(trigger = 'manual') {
         recordEvent('error', 'backup', `Respaldo falló (${trigger}): ${r.error}`, {});
         return done(r);
       }
-      lastBackup = { at: new Date().toISOString(), ok: true, file, sizeBytes, error: null };
+      // v5.3.25 (M12): cifrar el respaldo con AES-256-GCM y la clave
+      // BACKUP_ENCRYPTION_KEY (scripts/decrypt-backup.js para leerlo).
+      // Sin clave, el respaldo queda SIN cifrar y se registra el aviso:
+      // nunca falla en silencio. El texto plano se borra tras cifrar.
+      let encrypted = false;
+      if (BACKUP_ENCRYPTION_KEY) {
+        try {
+          await encryptBackupFile(filePath);
+          try { fs.unlinkSync(filePath); } catch { /* noop */ }
+          file = `${file}.enc`;
+          encrypted = true;
+        } catch (e) {
+          const warn = `No se pudo cifrar el respaldo (${e.message}): quedó SIN cifrar`;
+          logger.warn(warn);
+          recordEvent('warn', 'backup', warn, { file });
+        }
+      } else {
+        const warn = 'Respaldo SIN cifrar: define BACKUP_ENCRYPTION_KEY en .env para cifrarlo';
+        logger.warn(warn);
+        recordEvent('warn', 'backup', warn, { file });
+      }
+      const finalPath = path.join(backupsDir, file);
+      const finalSize = fs.existsSync(finalPath) ? fs.statSync(finalPath).size : sizeBytes;
+      lastBackup = { at: new Date().toISOString(), ok: true, file, sizeBytes: finalSize, encrypted, error: null };
       try {
         await pool.query("INSERT INTO settings (key, value) VALUES ('last_backup', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify(lastBackup)]);
       } catch { /* sin settings aún, queda en memoria */ }
       // Retención: borrar respaldos de más de BACKUP_KEEP_DAYS días. Solo
-      // archivos con el prefijo purifica-: antes borraba CUALQUIER archivo
-      // viejo de backups/ (igual que scripts/backup.sh).
+      // archivos con pinta de respaldo (<marca>-YYYYMMDD-HHMM.sql.gz, con
+      // o sin .enc): antes borraba CUALQUIER archivo viejo de backups/.
       try {
         const cutoff = Date.now() - BACKUP_KEEP_DAYS * 24 * 3600 * 1000;
+        const BACKUP_FILE_RE = /^[a-z0-9-]+\-\d{8}\-\d{4}\.sql\.gz(\.enc)?$/i;
         for (const f of fs.readdirSync(backupsDir)) {
-          if (!f.startsWith('purifica-')) continue;
+          if (!BACKUP_FILE_RE.test(f)) continue;
           const p = path.join(backupsDir, f);
           if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
         }
       } catch { /* limpieza opcional */ }
-      recordEvent('info', 'backup', `Respaldo OK (${trigger}): ${file} (${Math.round(sizeBytes / 1024)} KB)`, { file, sizeBytes });
-      done({ ok: true, file, sizeBytes, at: lastBackup.at });
+      recordEvent('info', 'backup', `Respaldo OK (${trigger}): ${file} (${Math.round(finalSize / 1024)} KB)${encrypted ? ' cifrado' : ' SIN cifrar'}`, { file, sizeBytes: finalSize, encrypted });
+      done({ ok: true, file, sizeBytes: finalSize, encrypted, at: lastBackup.at });
     };
     dump.on('close', (code) => { dumpCode = code; dumpClosed = true; finishBackup(); });
     dump.on('error', (e) => {
@@ -3464,7 +3656,7 @@ const initDB = async () => {
         active BOOLEAN DEFAULT TRUE,
         commission_pct NUMERIC(5,2) DEFAULT 0,
         parent_id INTEGER REFERENCES employees(id),
-        is_online BOOLEAN DEFAULT TRUE,
+        is_online BOOLEAN DEFAULT FALSE,
         last_assigned_at TIMESTAMP DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS templates (
@@ -3594,6 +3786,13 @@ const initDB = async () => {
     // v5.3.18 Seguimiento con imagen/video: qué medio se mandó con el aviso.
     // Las bases creadas en v5.3.17 tienen la tabla followups sin esta columna.
     await client.query('ALTER TABLE followups ADD COLUMN IF NOT EXISTS attachment_url TEXT');
+
+    // v5.3.25 Presencia: is_online nacía en TRUE y nada lo apagaba, así
+    // que todo el personal se veía "activo" con la sesión cerrada. El
+    // default pasa a FALSE (empleados nuevos) y al arrancar se apagan
+    // todos: cada uno se enciende al entrar o al conectar el socket.
+    await client.query('ALTER TABLE employees ALTER COLUMN is_online SET DEFAULT FALSE');
+    try { await client.query('UPDATE employees SET is_online = false'); } catch (e) { logger.warn('No se pudo apagar la presencia al arrancar', e); }
 
     // --- OPTIMIZACIÓN: ÍNDICES PARA VELOCIDAD ---
     await client.query(`
@@ -3776,9 +3975,8 @@ app.delete('/api/wa/instances/:id', requireAdmin, async (req, res) => {
 // POST: mensajes entrantes. Si META_WA_APP_SECRET está configurado, se
 // verifica X-Hub-Signature-256 (HMAC SHA256 del body crudo, guardado en
 // req.rawBody antes de que express.json lo parseara); si no coincide, 401.
-// Sin secreto, se acepta y se registra un aviso en system_events (una vez
-// por arranque, para no llenar la tabla con un evento por mensaje).
-let metaNoSecretWarned = false;
+// v5.3.25 (M5): sin secreto el POST se rechaza con 403 (antes se
+// aceptaba y solo se avisaba una vez por arranque).
 
 app.get('/api/webhooks/meta', async (req, res) => {
   const mode = req.query['hub.mode'];
@@ -3791,7 +3989,7 @@ app.get('/api/webhooks/meta', async (req, res) => {
   return res.status(403).json({ error: 'Verificación de webhook Meta fallida: verify token no coincide o META_WA_VERIFY_TOKEN no está configurado' });
 });
 
-app.post('/api/webhooks/meta', async (req, res) => {
+app.post('/api/webhooks/meta', webhookLimiter, async (req, res) => {
   if (!dbUrl) return res.status(503).json({ error: 'Base de datos no configurada' });
   try {
     const meta = await getMetaConfig();
@@ -3804,9 +4002,13 @@ app.post('/api/webhooks/meta', async (req, res) => {
         await recordEvent('warn', 'whatsapp', 'Webhook Meta rechazado: firma X-Hub-Signature-256 inválida', {});
         return res.status(401).json({ error: 'Firma de webhook inválida' });
       }
-    } else if (!metaNoSecretWarned) {
-      metaNoSecretWarned = true;
-      await recordEvent('warn', 'whatsapp', 'Webhook Meta sin META_WA_APP_SECRET: la firma no se verificó (evento aceptado). Configura el secreto en .env para verificar que los eventos vienen de Meta.', {});
+    } else {
+      // v5.3.25 (M5): sin META_WA_APP_SECRET no se puede verificar la
+      // firma, así que el webhook NO acepta mensajes (antes los aceptaba
+      // y cualquiera con la URL inyectaba mensajes falsos en las
+      // conversaciones). El canal QR, que es el que se usa, no se toca.
+      await recordEvent('warn', 'whatsapp', 'Webhook Meta rechazado: META_WA_APP_SECRET no configurado', {});
+      return res.status(403).json({ error: 'Webhook Meta no configurado: falta META_WA_APP_SECRET para verificar la firma' });
     }
 
     // Solo se procesan mensajes de texto. Los estados (entregado/leído) y
@@ -3916,21 +4118,46 @@ io.on('connection', (socket) => {
     if (id) {
       const room = id.toString();
       socket.join(room);
-      
+
       // Si el usuario es administrador, se une a la sala global de admins
       if ((role || '').toLowerCase() === 'admin') {
         socket.join('global_admin');
         logger.info(`Admin [${socket.id}] unido a Sala Global: global_admin`);
       }
-      
+
       logger.info(`Socket [${socket.id}] unido a Sala Usuario: ${room}`);
     }
   });
+
+  // v5.3.25 Presencia: al conectar el socket el usuario está en línea;
+  // al desconectar, si no le queda ningún otro socket (otra pestaña
+  // abierta), se marca fuera de línea. El conteo sale de la sala del
+  // adaptador (cada socket del usuario está en la sala con su id); en el
+  // evento 'disconnect' el socket ya salió de la sala, así que el tamaño
+  // es el de los sockets que le quedan. Sin DB no se hace nada.
+  const presenceId = socket.user?.id;
+  if (presenceId != null && dbUrl) {
+    pool.query('UPDATE employees SET is_online = true WHERE id = $1', [presenceId])
+      .then(() => notifyUpdate('staff_status'))
+      .catch(() => { /* presencia opcional */ });
+    socket.on('disconnect', () => {
+      const remaining = io.sockets.adapter.rooms.get(String(presenceId))?.size || 0;
+      if (remaining === 0) {
+        pool.query('UPDATE employees SET is_online = false WHERE id = $1', [presenceId])
+          .then(() => notifyUpdate('staff_status'))
+          .catch(() => { /* presencia opcional */ });
+      }
+    });
+  }
 });
 
 app.get('/api/notes/:phone', async (req, res) => {
   try {
     const phone = normalizePhoneString(req.params.phone);
+    // v5.3.25 (M1): la nota solo se lee si el teléfono está en el alcance
+    // del llamante (antes cualquiera leía o sobrescribía la nota de
+    // cualquier cliente con solo conocer el teléfono).
+    if (!(await phoneInScope(req, phone))) return res.status(403).json({ error: 'El cliente no pertenece a tu alcance' });
     const r = await pool.query('SELECT * FROM client_notes WHERE client_phone = $1', [phone]);
     res.json(r.rows[0] || { client_phone: phone, content: '' });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3942,6 +4169,8 @@ app.post('/api/notes', async (req, res) => {
   // content undefined sobrescribía la nota con NULL: ahora es obligatorio
   // (una cadena vacía sí vale, para borrar la nota).
   if (typeof content !== 'string') return res.status(400).json({ error: 'content es obligatorio' });
+  // v5.3.25 (M1): igual que en la lectura, la escritura exige alcance.
+  if (!(await phoneInScope(req, phone))) return res.status(403).json({ error: 'El cliente no pertenece a tu alcance' });
   try {
     await pool.query('INSERT INTO client_notes (client_phone, content, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (client_phone) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()', [phone, content]);
     res.json({ success: true });
@@ -3987,6 +4216,13 @@ app.post('/api/reminders', async (req, res) => {
 
 app.post('/api/reminders/:id/complete', async (req, res) => {
   try {
+    // v5.3.25 (M4): misma comprobación que en el DELETE: solo el creador
+    // o un admin puede marcarlo completo (antes cualquiera borraba los
+    // pendientes de otro asesor).
+    const cur = await pool.query('SELECT created_by FROM client_reminders WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Recordatorio no encontrado' });
+    const isAdmin = normalizeRoleValue(req.user?.role) === 'admin';
+    if (!isAdmin && cur.rows[0].created_by !== req.user?.name) return res.status(403).json({ error: 'Solo el creador o un administrador puede completar este recordatorio' });
     await pool.query('UPDATE client_reminders SET is_processed = true WHERE id = $1', [req.params.id]);
     notifyUpdate('reminder');
     res.json({ success: true });
@@ -4212,7 +4448,7 @@ app.get('/api/followups', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/followups/:id/send', requireAdmin, async (req, res) => {
+app.post('/api/followups/:id/send', requireAdmin, waSendLimiter, async (req, res) => {
   try {
     const cur = await pool.query('SELECT * FROM followups WHERE id = $1', [req.params.id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Seguimiento no encontrado' });
@@ -4245,7 +4481,7 @@ app.post('/api/followups/:id/skip', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/followups/send-all', requireAdmin, async (req, res) => {
+app.post('/api/followups/send-all', requireAdmin, waSendLimiter, async (req, res) => {
   try {
     if (followupSending) return res.status(409).json({ error: 'Ya hay un envío de seguimiento en curso' });
     const r = await pool.query("SELECT * FROM followups WHERE status = 'pending' ORDER BY due_date ASC, created_at ASC");
@@ -4448,7 +4684,7 @@ app.get('/api/campaigns/:id', requireAdmin, async (req, res) => {
 // v5.3.20 — Subida de imagen o video para una campaña (mismo multer del
 // chat, tope 25 MB, solo imagen o video). El endpoint solo sube y devuelve
 // la URL; el frontend la manda en el body al crear la campaña.
-app.post('/api/campaigns/media', requireAdmin, async (req, res) => {
+app.post('/api/campaigns/media', requireAdmin, uploadLimiter, async (req, res) => {
   waMediaUpload.single('file')(req, res, (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
@@ -4465,7 +4701,7 @@ app.post('/api/campaigns/media', requireAdmin, async (req, res) => {
   });
 });
 
-app.post('/api/campaigns/:id/send', requireAdmin, async (req, res) => {
+app.post('/api/campaigns/:id/send', requireAdmin, waSendLimiter, async (req, res) => {
   try {
     const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Campaña no encontrada' });
@@ -4482,7 +4718,7 @@ app.post('/api/campaigns/:id/send', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/campaigns/:id/retry-failed', requireAdmin, async (req, res) => {
+app.post('/api/campaigns/:id/retry-failed', requireAdmin, waSendLimiter, async (req, res) => {
   try {
     const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
     if (!cur.rows[0]) return res.status(404).json({ error: 'Campaña no encontrada' });
@@ -4533,7 +4769,7 @@ app.get('/api/availability', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/chats/:id/messages', async (req, res) => {
+app.post('/api/chats/:id/messages', waSendLimiter, async (req, res) => {
   const { id } = req.params;
   // v5.2 Solo lectura para el operador (B5): puede leer los mensajes de
   // sus servicios, pero no enviar.
@@ -4543,6 +4779,11 @@ app.post('/api/chats/:id/messages', async (req, res) => {
   const { content, type, attachmentUrl } = req.body;
   const msgType = ['text', 'image', 'audio', 'video', 'document', 'sticker'].includes(type) ? type : 'text';
   try {
+    // v5.3.25 (M10): la conversación debe estar en el alcance del
+    // llamante (mismo patrón que GET /api/chats): un asesor no escribe
+    // como la empresa a los clientes de otro asesor.
+    const scopeCheck = await conversationInScope(req, id);
+    if (!scopeCheck.ok) return res.status(403).json({ success: false, sent: false, error: scopeCheck.reason });
     let lastMsgPreview = content;
     if (!lastMsgPreview) {
       if (msgType === 'image') lastMsgPreview = '📷 Imagen';
@@ -4666,7 +4907,7 @@ const waMediaUpload = multer({
   },
   limits: { fileSize: WA_MEDIA_MAX_BYTES },
 });
-app.post('/api/chats/:id/attachments', async (req, res) => {
+app.post('/api/chats/:id/attachments', uploadLimiter, async (req, res) => {
   if (normalizeRoleValue(req.user?.role) === 'operator') {
     return res.status(403).json({ error: 'Solo lectura: los operadores no pueden enviar mensajes' });
   }
@@ -4694,7 +4935,7 @@ app.post('/api/chats/:id/attachments', async (req, res) => {
 // ni documentos en esta versión. El endpoint solo SUBE el archivo y devuelve
 // su URL; el frontend guarda followup_media_url y followup_media_type con
 // POST /api/settings, como el resto de ajustes de seguimiento.
-app.post('/api/followups/media', requireAdmin, async (req, res) => {
+app.post('/api/followups/media', requireAdmin, uploadLimiter, async (req, res) => {
   waMediaUpload.single('file')(req, res, (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
@@ -5499,7 +5740,7 @@ app.get('/api/staff', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/staff', requireAdminOrLeader, async (req, res) => {
+app.post('/api/staff', requireAdminOrLeader, accountLimiter, async (req, res) => {
   const { name, email, password, phone: rawPhone, active, commissionPct, parentId } = req.body;
   const role = normalizeRoleValue(req.body?.role);
   if (!role) return res.status(400).json({ error: "role inválido: debe ser 'admin', 'advisor', 'operator' o 'sales_agent'" });
@@ -5513,6 +5754,11 @@ app.post('/api/staff', requireAdminOrLeader, async (req, res) => {
     const existing = await pool.query('SELECT id FROM employees WHERE email = $1', [email]);
     if (existing.rows.length === 0 && !password) {
       return res.status(400).json({ error: 'La contraseña es obligatoria al crear un empleado' });
+    }
+    // v5.3.25 (M11): la contraseña nueva debe cumplir la política.
+    if (password) {
+      const pwError = validatePassword(password);
+      if (pwError) return res.status(400).json({ error: pwError });
     }
     let result;
     if (password) {
@@ -5537,6 +5783,11 @@ app.put('/api/staff/:id', requireAdminOrLeader, async (req, res) => {
   if (!role) return res.status(400).json({ error: "role inválido: debe ser 'admin', 'advisor', 'operator' o 'sales_agent'" });
   // Igual que en el POST: nombre y correo obligatorios.
   if (!name || !email) return res.status(400).json({ error: 'Nombre y correo son obligatorios' });
+  // v5.3.25 (M11): la contraseña nueva (si se cambia) debe cumplir la política.
+  if (password) {
+    const pwError = validatePassword(password);
+    if (pwError) return res.status(400).json({ error: pwError });
+  }
   const phone = normalizePhoneString(rawPhone);
   try {
     let query = 'UPDATE employees SET name=$1, email=$2, role=$3, phone=$4, active=$5, commission_pct=$6, parent_id=$7';
@@ -5564,8 +5815,27 @@ app.delete('/api/staff/:id', requireAdminOrLeader, async (req, res) => {
 });
 
 app.post('/api/staff/status', async (req, res) => {
-  const { id, isOnline } = req.body;
+  // v5.3.25 (M3): el id del cuerpo ya no se confía a ciegas: cada uno
+  // solo cambia SU propio estado (JWT). El admin puede cambiar el de
+  // cualquiera y el líder solo el de sus subordinados directos. Antes
+  // cualquiera marcaba al admin como desconectado o se marcaba en línea.
+  const { isOnline } = req.body;
+  const role = normalizeRoleValue(req.user?.role);
+  let id = req.user?.id;
   try {
+    if (req.body?.id != null && String(req.body.id) !== String(id)) {
+      if (role === 'admin') { id = req.body.id; }
+      else if (role === 'sales_agent') {
+        const t = await pool.query('SELECT parent_id FROM employees WHERE id = $1', [req.body.id]);
+        if (!t.rows[0] || String(t.rows[0].parent_id) !== String(req.user?.id)) {
+          return res.status(403).json({ error: 'Solo puedes cambiar tu propio estado o el de tus subordinados directos' });
+        }
+        id = req.body.id;
+      } else {
+        return res.status(403).json({ error: 'Solo puedes cambiar tu propio estado' });
+      }
+    }
+    if (id == null) return res.status(401).json({ error: 'No autorizado' });
     await pool.query('UPDATE employees SET is_online = $1 WHERE id = $2', [isOnline, id]);
     notifyUpdate('staff_status');
     res.json({ success: true });
@@ -5594,7 +5864,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (r.rows.length > 0 && await bcrypt.compare(password, r.rows[0].password)) {
       loginFailures.delete(blockKey);
       loginBlocks.delete(blockKey);
-      const user = { id: r.rows[0].id.toString(), name: r.rows[0].name, role: (r.rows[0].role || 'operator').toLowerCase(), email: r.rows[0].email, isOnline: r.rows[0].is_online };
+      // v5.3.25 Presencia: entrar enciende el flag; el logout y la
+      // desconexión del socket lo apagan.
+      try { await pool.query('UPDATE employees SET is_online = true WHERE id = $1', [r.rows[0].id]); } catch { /* presencia opcional, no bloquea el login */ }
+      const user = { id: r.rows[0].id.toString(), name: r.rows[0].name, role: (r.rows[0].role || 'operator').toLowerCase(), email: r.rows[0].email, isOnline: true };
       const token = jwt.sign(user, jwtSecret, { expiresIn: '24h' });
       // v5.3.24 (A5): el token va en cookie HttpOnly; el frontend ya no
       // lo guarda en localStorage. El token sigue en el JSON para
@@ -5629,13 +5902,52 @@ app.post('/api/auth/login', async (req, res) => {
 // sesión al recargar (el usuario ya no vive en localStorage: la app
 // pregunta quién es con la cookie). /api/auth/me pasa por
 // authMiddleware, así que req.user ya está verificado aquí.
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
+  // v5.3.25 Presencia: apagar el flag del usuario que cierra sesión.
+  // El id sale del JWT ya verificado por authMiddleware (req.user); si no
+  // lo hay, se intenta con la cookie. Sin token válido, solo se borra la
+  // cookie, nunca un 500.
+  try {
+    let userId = req.user?.id;
+    if (userId == null) {
+      const header = req.headers.authorization || '';
+      const token = parseCookies(req)[AUTH_COOKIE]
+        || (header.startsWith('Bearer ') ? header.slice(7) : null);
+      if (token) { try { userId = jwt.verify(token, jwtSecret)?.id; } catch { /* sin token válido */ } }
+    }
+    if (userId != null && dbUrl) {
+      await pool.query('UPDATE employees SET is_online = false WHERE id = $1', [userId]);
+      notifyUpdate('staff_status');
+    }
+  } catch { /* el logout nunca falla por la presencia */ }
   res.clearCookie(AUTH_COOKIE, { path: '/' });
   res.json({ success: true });
 });
 
 app.get('/api/auth/me', (req, res) => {
   res.json({ user: req.user });
+});
+
+// v5.3.25 (M11): cambiar la propia contraseña (actual + nueva). Antes
+// solo un admin/líder podía cambiarla; el usuario no podía rotar la suya.
+app.post('/api/auth/change-password', accountLimiter, async (req, res) => {
+  if (!dbUrl) return res.status(503).json({ error: 'Base de datos no configurada' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'La contraseña actual y la nueva son obligatorias' });
+  const pwError = validatePassword(newPassword);
+  if (pwError) return res.status(400).json({ error: pwError });
+  if (currentPassword === newPassword) return res.status(400).json({ error: 'La contraseña nueva debe ser distinta de la actual' });
+  try {
+    const r = await pool.query('SELECT password FROM employees WHERE id = $1 AND active = true', [req.user?.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (!(await bcrypt.compare(currentPassword, r.rows[0].password))) {
+      return res.status(401).json({ error: 'La contraseña actual no es correcta' });
+    }
+    const hashedPw = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE employees SET password = $1 WHERE id = $2', [hashedPw, req.user.id]);
+    recordEvent('info', 'auth', `Contraseña cambiada por ${req.user?.email || req.user?.id}`, {});
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/services', async (req, res) => {
@@ -5943,13 +6255,15 @@ app.post('/api/system/google-calendar/test', requireAdmin, async (req, res) => {
   try {
     const { client, cfg, error } = await getGoogleCalendarClient();
     if (!client) return res.status(400).json({ ok: false, configured: false, error: error || cfg.reason });
+    // v5.3.25 (M8): el nombre sale de la marca configurada, no fijo.
+    const companyName = (await getCompanySettings().catch(() => ({})))['branding_company_name'] || 'CRM';
     const now = new Date(Date.now() + 3600 * 1000);
     const end = new Date(now.getTime() + 15 * 60000);
     const created = await client.events.insert({
       calendarId: cfg.calendarId,
       requestBody: {
         summary: 'Prueba CRM — borrar',
-        description: 'Evento de prueba del CRM Purifica (se borra solo). Si lo ves en tu calendario, la conexión funciona.',
+        description: `Evento de prueba del CRM ${companyName} (se borra solo). Si lo ves en tu calendario, la conexión funciona.`,
         start: { dateTime: now.toISOString(), timeZone: 'America/Bogota' },
         end: { dateTime: end.toISOString(), timeZone: 'America/Bogota' },
       },
@@ -6410,7 +6724,7 @@ async function applyGatewayPayment({ invoiceNumber, paidAmount, method, transact
 // Wompi, "Secreto de eventos"); si no está, se acepta WOMPI_PRIVATE_KEY
 // como respaldo. SIN secreto configurado el evento se registra pero NO se
 // marca nada como pagado (no se puede verificar que venga de Wompi).
-app.post('/api/webhooks/wompi', async (req, res) => {
+app.post('/api/webhooks/wompi', webhookLimiter, async (req, res) => {
   if (!dbUrl) return res.status(503).json({ error: 'Base de datos no configurada' });
   try {
     const tx = req.body?.data?.transaction;
@@ -6441,7 +6755,7 @@ app.post('/api/webhooks/wompi', async (req, res) => {
 // state_pol (4 = aprobado) y sign = MD5(apiKey~merchant_id~reference_sale~
 // value~currency~state_pol), con value a 1 decimal. Sin PAYU_API_KEY no se
 // puede verificar la firma: se registra el evento pero NO se marca pagado.
-app.post('/api/webhooks/payu', async (req, res) => {
+app.post('/api/webhooks/payu', webhookLimiter, async (req, res) => {
   if (!dbUrl) return res.status(503).json({ error: 'Base de datos no configurada' });
   try {
     const b = req.body || {};
@@ -6476,7 +6790,7 @@ app.get('/api/templates', async (req, res) => {
   try { const r = await pool.query('SELECT * FROM templates ORDER BY id ASC'); res.json(r.rows); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.post('/api/templates', async (req, res) => {
+app.post('/api/templates', requireAdmin, async (req, res) => {
   try {
     const { id, title, content } = req.body;
     if (id) { await pool.query('UPDATE templates SET title=$1, content=$2 WHERE id=$3', [title, content, id]); }
@@ -6485,7 +6799,7 @@ app.post('/api/templates', async (req, res) => {
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.delete('/api/templates/:id', async (req, res) => {
+app.delete('/api/templates/:id', requireAdmin, async (req, res) => {
   try { await pool.query('DELETE FROM templates WHERE id=$1', [req.params.id]); notifyUpdate('template'); res.json({ success: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6511,11 +6825,22 @@ app.get('/api/settings', async (req, res) => {
     delete s['google_client_id'];
     delete s['telegram_bot_token'];
     delete s['telegram_chat_id'];
+    // v5.3.25 (M15): el phone number id de Meta tampoco sale (no es
+    // secreto, pero no hace falta exponerlo).
+    delete s['meta_wa_phone_number_id'];
+    // v5.3.25 (M15): los no-admines solo reciben las claves que su
+    // interfaz necesita (capacidad, reasignación y datos de facturación
+    // para imprimir). Los secretos y ajustes de admin (seguimiento,
+    // Google, Telegram, Meta) solo los ve el admin.
+    if (normalizeRoleValue(req.user?.role) !== 'admin') {
+      const NON_ADMIN_SETTINGS_KEYS = new Set(['daily_capacity', 'reassignment_timeout', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'invoice_default_type']);
+      for (const k of Object.keys(s)) if (!NON_ADMIN_SETTINGS_KEYS.has(k)) delete s[k];
+    }
     res.json(s);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/settings', async (req, res) => {
+app.post('/api/settings', settingsLimiter, async (req, res) => {
   try {
     const { key, value } = req.body;
     // Sin allow-list cualquier clave (incluidas branding_* o last_backup) se
@@ -6533,9 +6858,18 @@ app.post('/api/settings', async (req, res) => {
     // v5.2 Facturación (B6): el tipo de factura por defecto y los datos de
     // la empresa para facturar son solo admin, aunque el asesor (vendedor)
     // ya puede crear facturas y cobrar.
-    const ADMIN_ONLY_SETTINGS = new Set(['invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type']);
+    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type']);
     if (ADMIN_ONLY_SETTINGS.has(key) && normalizeRoleValue(req.user?.role) !== 'admin') {
       return res.status(403).json({ error: 'Solo el administrador puede cambiar esa configuración' });
+    }
+    // v5.3.25 (M7): reassignment_timeout y daily_capacity son solo admin
+    // y se validan (enteros positivos con máximo razonable). Antes un
+    // operario podía poner daily_capacity en 0 y bloquear la agenda.
+    if (key === 'reassignment_timeout' && value && (!/^\d+$/.test(String(value).trim()) || +value < 1 || +value > 1440)) {
+      return res.status(400).json({ error: 'reassignment_timeout debe ser un número entre 1 y 1440 minutos' });
+    }
+    if (key === 'daily_capacity' && value && (!/^\d+$/.test(String(value).trim()) || +value < 1 || +value > 500)) {
+      return res.status(400).json({ error: 'daily_capacity debe ser un número entre 1 y 500' });
     }
     if (key === 'meta_wa_phone_number_id' && value && !/^\d+$/.test(String(value).trim())) {
       return res.status(400).json({ error: 'El phone number id de Meta debe ser solo dígitos' });
@@ -6650,7 +6984,7 @@ app.use((err, req, res, next) => {
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'index.html')));
 
 server.listen(PORT, () => {
-  console.log(`🚀 Purifica CRM Real-Time ON :${PORT}`);
+  console.log(`🚀 CRM Real-Time ON :${PORT}`);
 
   // v5.3.2: las instancias guardadas se restauran al final de initDB
   // (restoreWhatsAppInstances), no aquí: así solo se levantan cuando la

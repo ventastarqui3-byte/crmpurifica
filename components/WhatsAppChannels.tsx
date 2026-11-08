@@ -4,6 +4,7 @@ import {Smartphone, Plus, Trash2, RefreshCw, QrCode, Loader2, Info, ShieldCheck,
 import { WhatsAppInstance, CurrentUser } from '../types';
 import { io } from 'socket.io-client';
 import { apiFetch } from '../lib/api';
+import { isSafeImageSrc } from '../lib/safeUrl';
 
 interface MetaStatus {
   configured: boolean;
@@ -364,7 +365,8 @@ export const WhatsAppChannels: React.FC<{ currentUser: CurrentUser }> = ({ curre
               <Zap className="w-4 h-4" /> Estado de Conexión
             </h3>
             
-            {activeQr ? (
+            {/* v5.3.25 (M13): el QR solo se muestra si es una data:image válida. */}
+            {activeQr && isSafeImageSrc(activeQr.qr) ? (
               <div className="space-y-6 flex flex-col items-center">
                 <div className="bg-white p-4 rounded-3xl shadow-xl">
                   <img src={activeQr.qr} alt="WhatsApp QR" className="w-48 h-48" />

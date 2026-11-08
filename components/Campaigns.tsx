@@ -11,6 +11,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Megaphone, Send, Upload, Trash2, Loader2, CheckCircle2, XCircle, Play, Eye, EyeOff, Search, Users } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { isSafeUrl } from '../lib/safeUrl';
 import type { CampaignRow, CampaignStatus, CampaignRecipientRow, ClientSummary } from '../types';
 
 const STATUS_LABEL: Record<CampaignStatus, string> = {
@@ -259,7 +260,8 @@ export const Campaigns: React.FC = () => {
           </label>
           <div className="text-sm text-slate-700">
             Imagen o video (opcional)
-            {mediaUrl ? (
+            {/* v5.3.25 (M13): el medio solo se previsualiza si la URL es segura. */}
+            {mediaUrl && isSafeUrl(mediaUrl) ? (
               <div className="mt-1">
                 {mediaType === 'video' ? (
                   <video src={mediaUrl} controls className="max-h-32 rounded-lg border border-slate-200" />

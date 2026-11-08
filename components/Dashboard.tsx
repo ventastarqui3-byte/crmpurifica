@@ -6,6 +6,7 @@ import { motion } from 'framer-motion';
 import {DollarSign, TrendingUp, Calculator, Award, ChevronRight, BarChart3, PieChart as PieChartIcon, Wallet, Percent, Users, CheckCircle, FileSpreadsheet, UserCheck, Target, Medal, Trash2, Timer} from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { formatCurrency } from '../lib/format';
+import { getCachedBranding } from '../lib/branding';
 
 interface DashboardProps {
   currentUser: CurrentUser;
@@ -17,6 +18,9 @@ type TimeRange = 'all' | 'month' | 'week' | 'today';
 type DashboardTab = 'summary' | 'accounting' | 'ranking';
 
 export const Dashboard: React.FC<DashboardProps> = ({ currentUser, staff, onNavigate }) => {
+  // v5.3.25 (M8): el nombre de la empresa sale de la marca configurada,
+  // no fijo "Purifica Tu Ambiente" (visible en subtítulo y Excel).
+  const brandName = getCachedBranding().company_name || 'CRM';
   const [timeRange, setTimeRange] = useState<TimeRange>('month');
   const [activeTab, setActiveTab] = useState<DashboardTab>('summary');
   const [now, setNow] = useState(new Date());
@@ -186,7 +190,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, staff, onNavi
 
   const exportAccounting = () => {
     const sheetData = [
-      ["REPORTE CONTABLE - PURIFICA TU AMBIENTE"],
+      [`REPORTE CONTABLE - ${brandName.toUpperCase()}`],
       ["Periodo:", timeRange.toUpperCase()],
       ["Fecha Reporte:", new Date().toLocaleDateString()],
       [],
@@ -225,7 +229,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, staff, onNavi
           <h1 className="text-3xl font-black text-slate-800 tracking-tight flex items-center gap-3">
              <BarChart3 className="w-8 h-8 text-brand-600" /> {isOperator ? 'Mis Ganancias' : 'Dashboard Operativo'}
           </h1>
-          <p className="text-slate-500 font-medium">{isOperator ? 'Seguimiento de tus pagos y servicios realizados' : 'Gestión financiera y comercial - Purifica Tu Ambiente'}</p>
+          <p className="text-slate-500 font-medium">{isOperator ? 'Seguimiento de tus pagos y servicios realizados' : `Gestión financiera y comercial - ${brandName}`}</p>
         </div>
         
         <div className="flex flex-col sm:flex-row items-end sm:items-center gap-4">
