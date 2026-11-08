@@ -22,7 +22,10 @@ export const DEFAULT_BRANDING: Branding = {
   secondary_color: '#0ea5e9',
 };
 
-const CACHE_KEY = 'purifica_branding';
+// v5.3.26 (B4): clave neutra. Antes 'purifica_branding' delataba la
+// empresa en DevTools en instalaciones revendidas. Al cambiar la clave,
+// la marca se vuelve a cargar del servidor en la próxima visita.
+const CACHE_KEY = 'crm_branding';
 let cached: Branding | null = null;
 
 export function getCachedBranding(): Branding {
@@ -32,6 +35,17 @@ export function getCachedBranding(): Branding {
     if (raw) cached = { ...DEFAULT_BRANDING, ...JSON.parse(raw) };
   } catch { /* noop */ }
   return cached || { ...DEFAULT_BRANDING };
+}
+
+/** Iniciales de la empresa para el logo provisional (B4, v5.3.26):
+ * cuando no hay logo subido se muestran las iniciales del nombre en
+ * vez de un icono fijo. "Purifica Tu Ambiente" -> "PT"; "CRM" -> "CR". */
+export function companyInitials(name: string): string {
+  const words = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return 'CRM';
+  const first = words[0][0] || '';
+  const second = words.length > 1 ? (words[1][0] || '') : (words[0][1] || '');
+  return (first + second).toUpperCase();
 }
 
 function mix(hex: string, target: string, amount: number): string {

@@ -7,6 +7,7 @@ import { apiFetch } from '../lib/api';
 import { formatCurrency } from '../lib/format';
 import { formatPhoneCO } from '../lib/phone';
 import { getCachedBranding } from '../lib/branding';
+import { sanitizeExcelRow } from '../lib/excel';
 
 // Fecha del último servicio en zona Bogotá: el servidor devuelve un
 // timestamp y `split('T')[0]` tomaba la fecha UTC (un día más en
@@ -91,7 +92,10 @@ export const ClientsList: React.FC<ClientsListProps> = ({
       if (res.ok) {
         const result = await res.json();
         const allData = result.data;
-        const worksheet = XLSX.utils.json_to_sheet(allData.map((c: any) => ({
+        // v5.3.26 (B5/B9): los valores se sanitizan para que un nombre o
+        // dirección que empiece por = + - @ no se ejecute como fórmula
+        // al abrir el Excel.
+        const worksheet = XLSX.utils.json_to_sheet(allData.map((c: any) => sanitizeExcelRow({
           "Nombre": c.clientName,
           "Teléfono": c.clientPhone,
           "Ciudad": c.city,

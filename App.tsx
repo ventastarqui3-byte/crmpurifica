@@ -26,11 +26,11 @@ import { SystemStatus } from './components/SystemStatus';
 import { Invoices } from './components/Invoices';
 
 export default function App() {
-  // v5.3.24 (A5): el usuario ya NO se guarda en localStorage
-  // ('purifica_session' con el usuario completo). La sesión vive en la
-  // cookie HttpOnly del servidor y al recargar se restaura preguntando
-  // quién es a /api/auth/me. Mientras se comprueba, sessionChecked es
-  // false y no se muestra el login (para que no parpadee).
+  // v5.3.24 (A5): el usuario ya NO se guarda en localStorage. La sesión
+  // vive en la cookie HttpOnly del servidor y al recargar se restaura
+  // preguntando quién es a /api/auth/me. Mientras se comprueba,
+  // sessionChecked es false y no se muestra el login (para que no
+  // parpadee).
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
 
@@ -158,9 +158,15 @@ export default function App() {
         } else if (key === 'staff') {
           if (Array.isArray(data)) setStaff(data);
         } else if (key === 'chats') {
-          if (!Array.isArray(data)) continue;
-          setChats(data);
-          const currentChatUnread = data.reduce((acc: number, curr: any) => acc + (curr.unreadCount || 0), 0);
+          // v5.3.26 (B7): /api/chats ahora pagina como leads/services
+          // ({ data, total, totalUnread }); se acepta también el
+          // arreglo viejo por compatibilidad con servidores anteriores.
+          const list = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : null);
+          if (!list) continue;
+          setChats(list);
+          const currentChatUnread = typeof data?.totalUnread === 'number'
+            ? data.totalUnread
+            : list.reduce((acc: number, curr: any) => acc + (curr.unreadCount || 0), 0);
           if (currentChatUnread > prevChatUnreadTotal.current && currentView !== 'inbox' && currentUser.role !== 'operator') {
             notificationService.playReceived();
             triggerToast('Mensaje Nuevo', 'Has recibido un nuevo mensaje en el inbox.', 'info');

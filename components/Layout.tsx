@@ -6,7 +6,6 @@ import {
   CalendarCheck, 
   Menu,
   X,
-  Droplets,
   Users,
   MessageSquare,
   LogOut,
@@ -23,7 +22,7 @@ import {
 } from 'lucide-react';
 import { ViewState, CurrentUser, roleLabel } from '../types';
 import { notificationService } from '../utils/NotificationService';
-import { getCachedBranding, loadBranding, Branding } from '../lib/branding';
+import { getCachedBranding, loadBranding, Branding, companyInitials } from '../lib/branding';
 import { apiFetch } from '../lib/api';
 
 interface LayoutProps {
@@ -163,7 +162,9 @@ export const Layout: React.FC<LayoutProps> = ({ currentView, onNavigate, childre
             {branding.logo_url ? (
               <img src={branding.logo_url} alt={branding.company_name} className="w-8 h-8 object-contain mr-2" />
             ) : (
-              <Droplets className="w-8 h-8 text-brand-600 mr-2" />
+              // v5.3.26 (B4): iniciales de la empresa en vez del icono
+              // fijo (que era de la empresa original).
+              <span className="w-8 h-8 rounded-lg bg-brand-600 text-white flex items-center justify-center font-bold text-sm mr-2 shrink-0">{companyInitials(branding.company_name)}</span>
             )}
             <span className="text-lg font-bold text-slate-800 uppercase tracking-tighter truncate">{branding.company_name}</span>
           </div>
@@ -198,7 +199,7 @@ export const Layout: React.FC<LayoutProps> = ({ currentView, onNavigate, childre
             {branding.logo_url ? (
               <img src={branding.logo_url} alt={branding.company_name} className="w-7 h-7 object-contain mr-2" />
             ) : (
-              <Droplets className="w-7 h-7 text-brand-600 mr-2" />
+              <span className="w-7 h-7 rounded-lg bg-brand-600 text-white flex items-center justify-center font-bold text-xs mr-2 shrink-0">{companyInitials(branding.company_name)}</span>
             )}
             <span className="font-bold text-slate-800 tracking-tight truncate">{branding.company_name}</span>
           </div>

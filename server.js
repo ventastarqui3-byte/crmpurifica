@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.25';
+const APP_VERSION = '5.3.26';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -2449,14 +2449,24 @@ async function authMiddleware(req, res, next) {
   // v5.3 El token no basta: el empleado puede haber sido desactivado o
   // cambiado de rol después de emitirlo (el token dura 24 h). Si no existe
   // o está inactivo -> 401; si cambió de rol, el JWT se actualiza al rol
-  // actual para que los permisos sigan la realidad. Si la consulta falla
-  // (DB caída) se deja pasar: los endpoints fallarán después con 500.
+  // actual para que los permisos sigan la realidad.
+  // v5.3.26 (B2): fail-closed. Si la consulta falla (DB caída) se
+  // devuelve 503 en vez de dejar pasar: antes, con la DB caída, el token
+  // de un usuario desactivado seguía funcionando en los endpoints que no
+  // necesitan DB (/api/wa/*, /api/system/*).
   if (dbUrl && req.user?.id != null) {
     try {
-      const r = await pool.query('SELECT active, role FROM employees WHERE id = $1', [req.user.id]);
+      const r = await pool.query('SELECT active, role, token_version FROM employees WHERE id = $1', [req.user.id]);
       if (!r.rows[0] || r.rows[0].active === false) return res.status(401).json({ error: 'Cuenta desactivada o inexistente' });
       if (r.rows[0].role) req.user.role = String(r.rows[0].role).toLowerCase();
-    } catch { /* DB caída: dejar pasar */ }
+      // v5.3.26 (B3): revocación de tokens por versión. Cada cierre de
+      // sesión o cambio de contraseña sube token_version; un token con
+      // versión vieja ya no vale. Los tokens emitidos antes de la v5.3.26
+      // no traen tv: se tratan como versión 0 (siguen valiendo hasta la
+      // primera revocación del usuario).
+      const tokenTv = req.user?.tv == null ? 0 : Number(req.user.tv);
+      if ((r.rows[0].token_version ?? 0) !== tokenTv) return res.status(401).json({ error: 'Sesión revocada, inicia sesión de nuevo' });
+    } catch { return res.status(503).json({ error: 'Base de datos no disponible' }); }
   }
   next();
 }
@@ -2685,10 +2695,27 @@ app.get('/api/health', async (req, res) => {
   if (dbUrl) {
     try { await pool.query('SELECT 1'); db = true; } catch (e) { db = false; }
   }
+  const ok = !dbUrl || db;
+  // v5.3.26 (B1): la versión, el uptime y el estado de WhatsApp servían
+  // para fingerprinting (saber qué versión corre y si WhatsApp está
+  // caído). Sin sesión solo se devuelve { ok } — suficiente para el
+  // HEALTHCHECK de Docker y de Railway, que solo miran el 200. Un admin
+  // autenticado (cookie o Bearer) sí ve el detalle completo.
+  let isAdmin = false;
+  try {
+    const header = req.headers.authorization || '';
+    const token = parseCookies(req)[AUTH_COOKIE]
+      || (header.startsWith('Bearer ') ? header.slice(7) : null);
+    if (token) {
+      const payload = jwt.verify(token, jwtSecret);
+      if (String(payload?.role || '').toLowerCase() === 'admin') isAdmin = true;
+    }
+  } catch { /* sin sesión válida: respuesta mínima */ }
+  if (!isAdmin) return res.json({ ok });
   const waInstances = Object.keys(waClients).length;
   const waConnected = Object.values(waClients).filter((w) => w.status === 'ready').length;
   res.json({
-    ok: !dbUrl || db, version: APP_VERSION, db,
+    ok, version: APP_VERSION, db,
     uptime_seconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
     whatsapp: { instances: waInstances, connected: waConnected },
   });
@@ -3657,6 +3684,7 @@ const initDB = async () => {
         commission_pct NUMERIC(5,2) DEFAULT 0,
         parent_id INTEGER REFERENCES employees(id),
         is_online BOOLEAN DEFAULT FALSE,
+        token_version INTEGER NOT NULL DEFAULT 0,
         last_assigned_at TIMESTAMP DEFAULT NOW()
       );
       CREATE TABLE IF NOT EXISTS templates (
@@ -3793,6 +3821,11 @@ const initDB = async () => {
     // todos: cada uno se enciende al entrar o al conectar el socket.
     await client.query('ALTER TABLE employees ALTER COLUMN is_online SET DEFAULT FALSE');
     try { await client.query('UPDATE employees SET is_online = false'); } catch (e) { logger.warn('No se pudo apagar la presencia al arrancar', e); }
+
+    // v5.3.26 (B3): revocación de tokens por versión. Cada cierre de
+    // sesión o cambio de contraseña sube token_version y los tokens
+    // viejos dejan de valer (el middleware compara req.user.tv).
+    await client.query('ALTER TABLE employees ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0');
 
     // --- OPTIMIZACIÓN: ÍNDICES PARA VELOCIDAD ---
     await client.query(`
@@ -4084,15 +4117,28 @@ app.delete('/api/commission-tiers/:id', requireAdmin, async (req, res) => {
 // Socket autenticado: el cliente envía el JWT en la cookie HttpOnly
 // (v5.3.24, A5); se sigue aceptando handshake.auth.token como respaldo
 // para clientes viejos. Sin token válido no hay conexión en tiempo real.
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const token = parseCookies(socket.handshake)?.[AUTH_COOKIE] || socket.handshake.auth?.token;
   if (!token) return next(new Error('No autorizado: falta token'));
   try {
     socket.user = jwt.verify(token, jwtSecret);
-    next();
   } catch (e) {
-    next(new Error('No autorizado: token inválido'));
+    return next(new Error('No autorizado: token inválido'));
   }
+  // v5.3.26 (B3): el handshake también verifica la versión del token
+  // (un token revocado no abre socket) y que la cuenta siga activa.
+  // Sin DB no se puede comprobar: fail-closed, igual que el middleware.
+  if (dbUrl && socket.user?.id != null) {
+    try {
+      const r = await pool.query('SELECT active, token_version FROM employees WHERE id = $1', [socket.user.id]);
+      if (!r.rows[0] || r.rows[0].active === false) return next(new Error('No autorizado: cuenta desactivada'));
+      const tokenTv = socket.user?.tv == null ? 0 : Number(socket.user.tv);
+      if ((r.rows[0].token_version ?? 0) !== tokenTv) return next(new Error('No autorizado: sesión revocada'));
+    } catch (e) {
+      return next(new Error('No autorizado: base de datos no disponible'));
+    }
+  }
+  next();
 });
 
 io.on('connection', (socket) => {
@@ -4180,6 +4226,9 @@ app.post('/api/notes', async (req, res) => {
 app.get('/api/reminders/:phone', async (req, res) => {
   try {
     const phone = normalizePhoneString(req.params.phone);
+    // v5.3.26 (pendiente Fase 2): mismo alcance que las notas (M1): sin
+    // esto cualquiera leía los recordatorios de cualquier cliente.
+    if (!(await phoneInScope(req, phone))) return res.status(403).json({ error: 'El cliente no pertenece a tu alcance' });
     const r = await pool.query('SELECT * FROM client_reminders WHERE client_phone = $1 ORDER BY alert_at ASC', [phone]);
     res.json(r.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -5470,8 +5519,15 @@ app.delete('/api/clients/:phone', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/chats', async (req, res) => {
+  // v5.3.26 (B7): paginado como /api/leads y /api/services (antes sin
+  // LIMIT: con muchos chats la respuesta era enorme) y sin N+1 (antes
+  // 2 consultas por conversación). Ahora son 3 consultas en total:
+  // conversaciones, mensajes de la página y conteos de tareas. La
+  // respuesta cambia a { data, total, page, limit, totalUnread } como
+  // leads/services (el frontend acepta ambas formas).
+  const { page, limit, offset } = clampPagination(req.query);
   try {
-    const r = await pool.query(`SELECT c.*, l.status as lead_status, l.items_to_clean, l.location, l.address, l.estimated_value, l.advisor as lead_advisor, l.technical_images FROM conversations c LEFT JOIN leads l ON c.id = l.conversation_id ORDER BY c.last_message_time DESC`);
+    const r = await pool.query(`SELECT c.*, l.status as lead_status, l.items_to_clean, l.location, l.address, l.estimated_value, l.advisor as lead_advisor, l.technical_images FROM conversations c LEFT JOIN leads l ON c.id = l.conversation_id ORDER BY c.last_message_time DESC LIMIT 1000`);
     // v5.2 Alcance por rol (JWT): antes este endpoint devolvía TODAS las
     // conversaciones a cualquier usuario logueado. Ahora: operador solo
     // las de los clientes de sus servicios asignados (B5); asesor solo
@@ -5489,30 +5545,44 @@ app.get('/api/chats', async (req, res) => {
       const names = new Set((scope.names || []).map((n) => n.trim().toLowerCase()));
       rows = rows.filter((row) => { const a = (row.lead_advisor || '').trim().toLowerCase(); return !a || a === 'sin asignar' || names.has(a); });
     }
-    const chats = await Promise.all(rows.map(async (row) => {
-      const msgs = await pool.query('SELECT * FROM messages WHERE conversation_id = $1 ORDER BY timestamp ASC', [row.id]);
-      const tasks = await pool.query('SELECT COUNT(*) FROM tasks WHERE conversation_id = $1 AND completed = false', [row.id]);
-      return { 
-        id: row.id, 
-        clientName: row.client_name, 
-        clientPhone: row.client_phone, 
-        source: row.source, 
-        unreadCount: row.unread_count, 
-        leadStatus: row.lead_status, 
+    const total = rows.length;
+    const totalUnread = rows.reduce((acc, row) => acc + (Number(row.unread_count) || 0), 0);
+    const pageRows = rows.slice(offset, offset + limit);
+    const ids = pageRows.map((row) => row.id);
+    const msgsByConv = new Map();
+    const tasksByConv = new Map();
+    if (ids.length > 0) {
+      const msgs = await pool.query('SELECT * FROM messages WHERE conversation_id = ANY($1) ORDER BY conversation_id, timestamp ASC', [ids]);
+      for (const m of msgs.rows) {
+        if (!msgsByConv.has(m.conversation_id)) msgsByConv.set(m.conversation_id, []);
+        msgsByConv.get(m.conversation_id).push(m);
+      }
+      const tasks = await pool.query('SELECT conversation_id, COUNT(*) AS c FROM tasks WHERE conversation_id = ANY($1) AND completed = false GROUP BY conversation_id', [ids]);
+      for (const t of tasks.rows) tasksByConv.set(t.conversation_id, parseInt(t.c, 10) || 0);
+    }
+    const chats = pageRows.map((row) => {
+      const msgs = msgsByConv.get(row.id) || [];
+      return {
+        id: row.id,
+        clientName: row.client_name,
+        clientPhone: row.client_phone,
+        source: row.source,
+        unreadCount: row.unread_count,
+        leadStatus: row.lead_status,
         inboxName: row.inbox_name,
-        pendingTasksCount: parseInt(tasks.rows[0].count), 
-        leadData: { itemsToClean: row.items_to_clean, location: row.location, address: row.address, estimatedValue: Number(row.estimated_value), advisor: row.lead_advisor, technicalImages: row.technical_images || [] }, 
-        messages: msgs.rows.map(m => ({ 
-          id: m.id.toString(), 
-          sender: m.sender, 
-          content: m.content, 
-          type: m.type, 
-          attachmentUrl: m.attachment_url, 
-          timestamp: new Date(m.timestamp).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' }) 
-        })) 
+        pendingTasksCount: tasksByConv.get(row.id) || 0,
+        leadData: { itemsToClean: row.items_to_clean, location: row.location, address: row.address, estimatedValue: Number(row.estimated_value), advisor: row.lead_advisor, technicalImages: row.technical_images || [] },
+        messages: msgs.map(m => ({
+          id: m.id.toString(),
+          sender: m.sender,
+          content: m.content,
+          type: m.type,
+          attachmentUrl: m.attachment_url,
+          timestamp: new Date(m.timestamp).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
+        }))
       };
-    }));
-    res.json(chats);
+    });
+    res.json({ data: chats, total, page, limit, totalUnread });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5763,7 +5833,7 @@ app.post('/api/staff', requireAdminOrLeader, accountLimiter, async (req, res) =>
     let result;
     if (password) {
       const hashedPw = await bcrypt.hash(password, 10);
-      const query = `INSERT INTO employees (name, email, password, role, phone, active, commission_pct, parent_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, password = EXCLUDED.password, role = EXCLUDED.role, phone = EXCLUDED.phone, active = EXCLUDED.active, commission_pct = EXCLUDED.commission_pct, parent_id = EXCLUDED.parent_id RETURNING id`;
+      const query = `INSERT INTO employees (name, email, password, role, phone, active, commission_pct, parent_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, password = EXCLUDED.password, role = EXCLUDED.role, phone = EXCLUDED.phone, active = EXCLUDED.active, commission_pct = EXCLUDED.commission_pct, parent_id = EXCLUDED.parent_id, token_version = employees.token_version + 1 RETURNING id`;
       result = await pool.query(query, [name, email, hashedPw, role, phone, active ?? true, commissionPct || 0, parentId || null]);
     } else {
       const query = `INSERT INTO employees (name, email, role, phone, active, commission_pct, parent_id) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, phone = EXCLUDED.phone, active = EXCLUDED.active, commission_pct = EXCLUDED.commission_pct, parent_id = EXCLUDED.parent_id RETURNING id`;
@@ -5792,7 +5862,9 @@ app.put('/api/staff/:id', requireAdminOrLeader, async (req, res) => {
   try {
     let query = 'UPDATE employees SET name=$1, email=$2, role=$3, phone=$4, active=$5, commission_pct=$6, parent_id=$7';
     let params = [name, email, role, phone, active ?? true, commissionPct || 0, parentId || null];
-    if (password) { const hashedPw = await bcrypt.hash(password, 10); query += ', password=$8 WHERE id=$9'; params.push(hashedPw, id); }
+    // v5.3.26 (B3): si se cambia la contraseña, los tokens viejos del
+    // empleado dejan de valer (token_version + 1).
+    if (password) { const hashedPw = await bcrypt.hash(password, 10); query += ', password=$8, token_version = token_version + 1 WHERE id=$9'; params.push(hashedPw, id); }
     else { query += ' WHERE id=$8'; params.push(id); }
     const r = await pool.query(query, params);
     if (r.rowCount === 0) return res.status(404).json({ error: 'Empleado no encontrado' });
@@ -5867,7 +5939,10 @@ app.post('/api/auth/login', async (req, res) => {
       // v5.3.25 Presencia: entrar enciende el flag; el logout y la
       // desconexión del socket lo apagan.
       try { await pool.query('UPDATE employees SET is_online = true WHERE id = $1', [r.rows[0].id]); } catch { /* presencia opcional, no bloquea el login */ }
-      const user = { id: r.rows[0].id.toString(), name: r.rows[0].name, role: (r.rows[0].role || 'operator').toLowerCase(), email: r.rows[0].email, isOnline: true };
+      // v5.3.26 (B3): el token lleva la versión de sesión (tv). Cada
+      // cierre de sesión o cambio de contraseña la sube y este token
+      // deja de valer.
+      const user = { id: r.rows[0].id.toString(), name: r.rows[0].name, role: (r.rows[0].role || 'operator').toLowerCase(), email: r.rows[0].email, isOnline: true, tv: (r.rows[0].token_version || 0) };
       const token = jwt.sign(user, jwtSecret, { expiresIn: '24h' });
       // v5.3.24 (A5): el token va en cookie HttpOnly; el frontend ya no
       // lo guarda en localStorage. El token sigue en el JSON para
@@ -5907,6 +5982,8 @@ app.post('/api/auth/logout', async (req, res) => {
   // El id sale del JWT ya verificado por authMiddleware (req.user); si no
   // lo hay, se intenta con la cookie. Sin token válido, solo se borra la
   // cookie, nunca un 500.
+  // v5.3.26 (B3): el logout REVOCA el token: sube token_version, así que
+  // un token robado o copiado deja de valer aunque no haya expirado.
   try {
     let userId = req.user?.id;
     if (userId == null) {
@@ -5916,7 +5993,7 @@ app.post('/api/auth/logout', async (req, res) => {
       if (token) { try { userId = jwt.verify(token, jwtSecret)?.id; } catch { /* sin token válido */ } }
     }
     if (userId != null && dbUrl) {
-      await pool.query('UPDATE employees SET is_online = false WHERE id = $1', [userId]);
+      await pool.query('UPDATE employees SET is_online = false, token_version = token_version + 1 WHERE id = $1', [userId]);
       notifyUpdate('staff_status');
     }
   } catch { /* el logout nunca falla por la presencia */ }
@@ -5944,9 +6021,16 @@ app.post('/api/auth/change-password', accountLimiter, async (req, res) => {
       return res.status(401).json({ error: 'La contraseña actual no es correcta' });
     }
     const hashedPw = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE employees SET password = $1 WHERE id = $2', [hashedPw, req.user.id]);
+    // v5.3.26 (B3): cambiar la contraseña revoca los tokens viejos (el
+    // actual incluido). Se emite un token nuevo con la versión subida
+    // para que la sesión continúe sin tener que entrar de nuevo.
+    const bumped = await pool.query('UPDATE employees SET password = $1, token_version = token_version + 1 WHERE id = $2 RETURNING token_version', [hashedPw, req.user.id]);
+    const newTv = bumped.rows[0]?.token_version ?? 0;
+    const freshUser = { id: String(req.user.id), name: req.user.name, role: (req.user.role || 'operator').toLowerCase(), email: req.user.email, isOnline: true, tv: newTv };
+    const freshToken = jwt.sign(freshUser, jwtSecret, { expiresIn: '24h' });
+    res.cookie(AUTH_COOKIE, freshToken, authCookieOptions(req));
     recordEvent('info', 'auth', `Contraseña cambiada por ${req.user?.email || req.user?.id}`, {});
-    res.json({ success: true });
+    res.json({ success: true, token: freshToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6768,7 +6852,11 @@ app.post('/api/webhooks/payu', webhookLimiter, async (req, res) => {
       const expected = crypto.createHash('md5')
         .update(`${apiKey}~${b.merchant_id}~${reference}~${value1}~${b.currency}~${b.state_pol}`)
         .digest('hex');
-      verified = String(b.sign).toLowerCase() === expected;
+      // v5.3.26 (B6): comparación en tiempo constante, igual que Wompi:
+      // con === el tiempo de respuesta delataba cuántos caracteres de
+      // la firma coincidían.
+      const given = String(b.sign).toLowerCase();
+      verified = given.length === expected.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(given));
     }
     await recordEvent(verified ? 'info' : 'warn', 'invoices',
       `Webhook PayU state_pol ${b.state_pol} ref ${reference} (firma ${verified ? 'verificada' : 'NO verificada'})`,

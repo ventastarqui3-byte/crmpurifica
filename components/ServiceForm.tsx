@@ -19,7 +19,7 @@ const emptyService: ServiceRecord = {
   time: '08:00',
   clientName: '',
   clientPhone: '',
-  city: 'Bogotá',
+  city: '',
   neighborhood: '',
   address: '',
   advisor: '',

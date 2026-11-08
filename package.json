@@ -1,6 +1,6 @@
 {
   "name": "purifica-crm",
-  "version": "5.3.25",
+  "version": "5.3.26",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -44,7 +44,8 @@
     "socket.io-parser": "^4.2.7",
     "ws": "^8.22.2",
     "lodash": "^4.18.1",
-    "glob": "^14.0.4"
+    "glob": "^14.0.4",
+    "proxy-addr": "2.0.8"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

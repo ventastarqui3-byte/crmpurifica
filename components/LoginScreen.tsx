@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { apiFetch } from '../lib/api';
-import { getCachedBranding, loadBranding, Branding } from '../lib/branding';
+import { getCachedBranding, loadBranding, Branding, companyInitials } from '../lib/branding';
 import { CurrentUser } from '../types';
-import { Droplets, Mail, Lock, Loader2, AlertCircle } from 'lucide-react';
+import { Mail, Lock, Loader2, AlertCircle } from 'lucide-react';
 
 interface LoginScreenProps {
   onLogin: (user: CurrentUser) => void;
@@ -51,8 +51,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
         {branding.logo_url ? (
           <img src={branding.logo_url} alt={branding.company_name} className="h-20 w-20 object-contain mx-auto mb-4 bg-white rounded-2xl shadow-lg p-2" />
         ) : (
+          // v5.3.26 (B4): iniciales de la empresa en vez del icono fijo.
           <div className="inline-flex items-center justify-center w-20 h-20 bg-brand-600 rounded-2xl mb-4 shadow-lg">
-            <Droplets className="w-10 h-10 text-white" />
+            <span className="text-white font-bold text-3xl">{companyInitials(branding.company_name)}</span>
           </div>
         )}
         <h1 className="text-3xl font-bold text-slate-800">{branding.company_name}</h1>
@@ -73,9 +74,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
             <label className="block text-sm font-medium text-slate-700 mb-1">Correo Electrónico</label>
             <div className="relative">
               <Mail className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
-              <input 
-                type="email" 
-                required 
+              <input
+                type="email"
+                required
+                autoComplete="username"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-all"
@@ -88,9 +90,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
             <label className="block text-sm font-medium text-slate-700 mb-1">Contraseña</label>
             <div className="relative">
               <Lock className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
-              <input 
-                type="password" 
-                required 
+              <input
+                type="password"
+                required
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-all"

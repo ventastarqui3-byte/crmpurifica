@@ -516,7 +516,7 @@ export const TeamManagement: React.FC<TeamManagementProps> = ({ staff, onAddStaf
                           </div>
                           <div>
                             <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1 block">Contraseña</label>
-                            <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder={editingId ? 'Mantener actual' : '******'} className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm font-bold outline-none" />
+                            <input type="password" autoComplete="new-password" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder={editingId ? 'Mantener actual' : '******'} className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm font-bold outline-none" />
                           </div>
                           <div className="bg-brand-50 p-5 rounded-2xl border border-brand-100">
                             <label className="text-[10px] font-black text-brand-600 uppercase tracking-widest mb-2 block">% Comisión Base (Falla-Safe)</label>

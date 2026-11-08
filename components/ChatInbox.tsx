@@ -57,7 +57,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
   const [estimatedValue, setEstimatedValue] = useState(0);
   const [address, setAddress] = useState('');
   const [neighborhood, setNeighborhood] = useState('');
-  const [city, setCity] = useState('Bogotá');
+  const [city, setCity] = useState('');
   const [advisor, setAdvisor] = useState('');
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -134,7 +134,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
       // neighborhood y al guardar se sumaba la ciudad otra vez
       // ("Chapinero, Bogotá, Bogotá", creciendo en cada guardado).
       setNeighborhood((activeChat.leadData?.location || '').split(',')[0].trim());
-      setCity(activeChat.leadData?.location?.split(',')[1]?.trim() || 'Bogotá');
+      setCity(activeChat.leadData?.location?.split(',')[1]?.trim() || '');
       setAdvisor(activeChat.leadData?.advisor || currentUser.name);
       
       setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 150);

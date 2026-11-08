@@ -7,6 +7,7 @@ import {DollarSign, TrendingUp, Calculator, Award, ChevronRight, BarChart3, PieC
 import { apiFetch } from '../lib/api';
 import { formatCurrency } from '../lib/format';
 import { getCachedBranding } from '../lib/branding';
+import { sanitizeExcelCell } from '../lib/excel';
 
 interface DashboardProps {
   currentUser: CurrentUser;
@@ -189,6 +190,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, staff, onNavi
   }
 
   const exportAccounting = () => {
+    // v5.3.26 (B5/B9): las celdas de texto se sanitizan para que un
+    // valor que empiece por = + - @ no se ejecute como fórmula al
+    // abrir el Excel (los números pasan tal cual).
     const sheetData = [
       [`REPORTE CONTABLE - ${brandName.toUpperCase()}`],
       ["Periodo:", timeRange.toUpperCase()],
@@ -200,7 +204,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser, staff, onNavi
       ["Pago a Operarios", dashboardStats.totalOperatorPayments],
       ["Comisiones Vendedores/Líderes de ventas (escalafón, servidor)", dashboardStats.totalCommissions],
       ["Utilidad Neta Empresa", dashboardStats.netCompanyProfit]
-    ];
+    ].map((row) => row.map((cell) => sanitizeExcelCell(cell)));
     const ws = XLSX.utils.aoa_to_sheet(sheetData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Contabilidad");
