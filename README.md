@@ -1,4 +1,150 @@
-# Purifica Tu Ambiente CRM — v5.3.13 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir)
+# Purifica Tu Ambiente CRM — v5.3.15 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM)
+
+## Configuración de Google Calendar y Telegram en el CRM (v5.3.15, 2026-11-08)
+
+**El usuario tiene razón:** Google Calendar y Telegram no tenían dónde
+configurarse en el CRM. La API existía (el refresh token de Google sí se
+podía guardar por `POST /api/settings`, y Telegram se leía solo de env),
+pero ningún formulario la usaba: Google solo se configuraba con el script
+local y variables en Railway, y Telegram solo con `TELEGRAM_BOT_TOKEN` /
+`TELEGRAM_CHAT_ID` en el .env. Estado del Sistema solo mostraba el estado
+y el aviso, sin campos para poner los valores.
+
+**Qué se añadió en v5.3.15 (Estado del Sistema → Configuración de
+integraciones, solo admin):**
+
+- **Google Calendar:** campos para Client ID, Client Secret y Refresh Token
+  (tipo password), Calendar ID (por defecto `primary`), duración de cada
+  servicio en minutos (por defecto 120) y checkbox Habilitado. Botón
+  Guardar (una llamada a `POST /api/settings` por clave; los secretos
+  vacíos NO se envían, lo guardado se conserva) y botón Probar conexión
+  (`POST /api/system/google-calendar/test`). La línea de estado muestra
+  Configurado / No configurado con el motivo, con los datos que ya
+  cargaba la página.
+- **Telegram:** campos para Bot Token (password) y Chat ID, botón Guardar
+  (mismo patrón: vacíos no se envían). El botón “Probar alerta de
+  Telegram” que ya existía en Acciones se queda donde está y funciona
+  tras guardar.
+- **Seguridad, sin cambios de criterio:** los secretos NUNCA se traen ni
+  se muestran (los campos empiezan vacíos; si está configurado, el
+  placeholder dice “•••••••• (configurado)”). `GET /api/settings` ahora
+  también borra `telegram_bot_token`, `telegram_chat_id` y
+  `google_client_id` (además de `google_client_secret`,
+  `google_refresh_token` y `meta_wa_token`, que ya borraba). Las 6 claves
+  nuevas (`google_client_id`, `google_client_secret`,
+  `telegram_bot_token`, `telegram_chat_id`) están en
+  `ALLOWED_SETTINGS_KEYS` y en `ADMIN_ONLY_SETTINGS`: solo el admin las
+  escribe. El backend lee primero de settings y, si está vacío, del env
+  (Railway/.env sigue funcionando como antes, sin tocar nada).
+
+**Cómo configurar cada integración paso a paso:**
+
+- **Telegram:** 1) En Telegram, habla con @BotFather, crea un bot con
+  `/newbot` y copia el token que te da. 2) Abre el bot y mándale un
+  mensaje cualquiera (o añádelo al grupo donde deben llegar las
+  alertas). 3) Consigue el chat id: abre
+  `https://api.telegram.org/bot<TU_TOKEN>/getUpdates` en el navegador y
+  busca `"chat":{"id":...}` (es un número, puede ser negativo en
+  grupos). 4) En el CRM: Estado del Sistema → Configuración de
+  integraciones → Telegram: pega el token y el chat id, Guardar, y luego
+  “Probar alerta de Telegram” en Acciones: debe llegar el mensaje al
+  chat.
+- **Google Calendar:** 1) En Google Cloud Console crea un proyecto (o
+  usa uno existente) y habilita la **Google Calendar API**. 2) Credenciales
+  → Crear credenciales → **ID de cliente de OAuth** → tipo **Aplicación
+  de escritorio**; anota el Client ID y el Client Secret. En “URIs de
+  redireccionamiento autorizados” añade `http://localhost:8089`. 3) Corre
+  `node scripts/get-google-refresh-token.js <CLIENT_ID> <CLIENT_SECRET>`,
+  abre la URL que imprime con la cuenta de Google de la empresa, acepta
+  el acceso al calendario y copia el refresh token que imprime. 4) En el
+  CRM: Estado del Sistema → Configuración de integraciones → Google
+  Calendar: pega Client ID, Client Secret y Refresh Token, deja Calendar
+  ID en `primary` (o el ID de un calendario compartido), duración 120 y
+  Habilitado marcado, Guardar. 5) Pulsa “Probar conexión”: debe crear y
+  borrar un evento de prueba de 15 min. (También se puede seguir usando
+  el .env con `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+  `GOOGLE_REFRESH_TOKEN`, `GOOGLE_CALENDAR_ID` y
+  `GOOGLE_CALENDAR_DURATION_MINUTES`; lo de settings tiene prioridad si
+  está puesto.)
+
+**Plan de pruebas tras desplegar v5.3.15:**
+
+1. Guardar el token y el chat id de Telegram y pulsar “Probar alerta de
+   Telegram” → debe llegar el mensaje a Telegram.
+2. Guardar las credenciales de Google y pulsar “Probar conexión” → debe
+   decir que el evento de prueba se creó y se borró.
+3. El resto de pruebas de la 5.3.14: UN solo texto desde el CRM llega UNA
+   sola vez al celular del contacto, sin letrero.
+
+## Verificación por remitente (anti-triplicación, por fin) + 5 reintentos de arranque (v5.3.14, 2026-11-08)
+
+**Lo que probó el usuario con la v5.3.13 (log 05:44:25–05:54:17 UTC,
+captura 00:56 local):** "por fin ya envia multimedia y se ve, pero
+tenemos un problema sigue enviando 2 o 3 veses el mismo mensaje a
+whasap del cliente" — "hola" x3 a las 00:49 y x3 a las 00:50, "." x3.
+La multimedia YA funciona (confirmado por el usuario), pero la
+triplicación sigue.
+
+**La causa raíz, probada en el log:** cada POST dispara los tres
+caminos (escaneo, LID, @c.us) y los tres transmiten, porque la
+verificación NUNCA encuentra nuestro mensaje. La pista decisiva es la
+línea de verificación: "ninguno de los últimos 5 mensajes es nuestro
+y coincide con el enviado (último: fromMe=false, type=chat, hace 2 s,
+revisados: 5)" — y ese "hace 2 s" coincide EXACTAMENTE con el
+timestamp de nuestros propios ecos message_create (ej.: verificación a
+las 05:49:53.617, último mensaje de hace 2 s = eco de las
+05:49:51.606; a las 05:50:08.776, hace 13 s = eco de las 05:49:55.675;
+a las 05:50:13.293, hace 1 s = eco de las 05:50:12.896). O sea: nuestro
+mensaje SÍ está entre los últimos 5 de chat.msgs, pero se lee con
+`fromMe === false`, así que `lastMatches` (que exigía `info.fromMe`)
+lo rechazaba siempre. En este chat LID, los mensajes propios guardados
+en chat.msgs leen fromMe=false (el eco del evento message_create sí
+trae fromMe=true, pero la copia en la colección no). Esa es la causa
+raíz de la triplicación: la verificación no podía ver que el envío ya
+salió, así que probaba los otros dos caminos y cada uno mandaba su
+copia.
+
+**Corrección en v5.3.14 (verificación por REMITENTE, no por fromMe):**
+en `recentMsgsInfo` (tanto en el evaluate del escaneo `sendWaByScan`
+como en `verifyWaLastMessage`) se devuelve además `idFromMe` (de
+`m.id.fromMe`) y `sender` (de `m.from._serialized` o `m.from.$1`). En
+`lastMatches` / `matches`, un mensaje es nuestro si es reciente
+(<60 s) Y coincide en contenido/type Y (fromMe O idFromMe O el
+remitente NO es el contacto). El contacto es `lidDigits + '@lid'` y
+`phoneDigits + '@c.us'`. Es decir: un mensaje reciente con el mismo
+contenido cuyo remitente no es el contacto es nuestro, aunque fromMe
+lea false. La ventana sigue siendo los últimos 5 mensajes y la espera
+de ~2 s antes de verificar. En la línea de log de verificación fallida
+ahora se añade el remitente, fromMe e idFromMe del último mensaje
+revisado, para diagnosticarlo en el próximo log.
+
+**Segundo hallazgo del mismo log (secundario):** el arranque de la
+v5.3.13 falló 7 veces seguidas con el mismo error transitorio
+"Protocol error (Runtime.callFunctionOn): Execution context was
+destroyed" en Client.inject durante Client.initialize (05:44:30,
+05:44:42, 05:45:15, 05:46:17, 05:48:18, 05:48:30, 05:48:39); los 3
+reintentos de v5.3.8 no alcanzaron y el usuario tuvo que escanear el QR
+de nuevo (QR recibido 05:48:51, listo 05:49:31). La sesión no se
+restauró en ese arranque (causa no probada en el log).
+
+**Corrección en v5.3.14 (reintentos de arranque):** de 3 a 5 reintentos
+transitorios, delays [10000, 30000, 60000, 120000, 120000]. Textos del
+log actualizados ("reintento N/5", "se agotaron los 5 reintentos"). El
+vigilante sigue intentando una re-inicialización más al agotar los
+reintentos, como antes.
+
+**Lo que NO se tocó en v5.3.14:** el arreglo de mimetype de la
+multimedia (FUNCIONA, no se tocó), el segundo servicio (App.tsx),
+PERSIST_DIR, el dedup de ecos, el guardado-con-etiqueta, el mapeo
+LID/canónico y la auto-restauración.
+
+**Plan de pruebas tras desplegar v5.3.14:**
+
+1. Enviar UN solo texto desde el CRM — debe llegar UNA sola vez al
+   celular del contacto, sin letrero, y el log debe decir que la
+   verificación lo encontró (por remitente).
+2. Enviar UNA foto desde el CRM — una sola vez, sin letrero.
+3. Recibir una foto desde el teléfono — debe aparecer con vista previa.
 
 ## Enviar UNA vez (anti-triplicación) + multimedia con mimetype + segundo servicio sin sobrescribir (v5.3.13, 2026-11-08)
 
@@ -482,19 +628,21 @@ solo actuaba sobre `'authenticated'` o `'initializing'`, nunca sobre
 1. **Reintento transitorio en el arranque:** si el error del
    `client.initialize()` coincide con
    `/Execution context was destroyed|Target closed|Session closed|Protocol error|Failed to launch|Navigation failed|net::ERR|Timeout/i`,
-   se reintenta **hasta 3 veces con espera creciente (10 s, 30 s, 60 s)**,
+   se reintenta **hasta 5 veces con espera creciente (10 s, 30 s, 60 s,
+   120 s, 120 s)** — en v5.3.8 eran 3; la v5.3.14 los subió a 5 porque
+   el log de v5.3.13 probó que un arranque necesitó 8 intentos —,
    recreando el cliente con `stopWaInstance` + `initWhatsApp`. Los archivos
    de sesión en disco no se tocan en un inject fallido, así que el reintento
    restaura la sesión **sin pedir QR nuevo**. Cada intento queda en el log
-   ("reintento 1/3 de arranque de WhatsApp..."). Mientras quedan reintentos,
+   ("reintento 1/5 de arranque de WhatsApp..."). Mientras quedan reintentos,
    el estado sigue en `'initializing'` y el vigilante NO se cancela.
 2. **El reintento de perfil bloqueado no cambia:** sigue como estaba
    (funciona: el log mostró los 3 locks limpiados).
-3. **El vigilante ahora también actúa sobre `'error'`:** tras agotar los 3
+3. **El vigilante ahora también actúa sobre `'error'`:** tras agotar los 5
    reintentos, la instancia pasa a `'error'` pero el vigilante ya NO se
    cancela, así que a los 120 s dispara su único reintento automático por
    arranque (guard `waReadyAutoRetried`). Un fallo de arranque ya no es un
-   callejón sin salida. Sin bucles infinitos: 3 reintentos transitorios por
+   callejón sin salida. Sin bucles infinitos: 5 reintentos transitorios por
    cadena + 1 reintento del vigilante por arranque.
 4. **Los errores NO transitorios** (p. ej. fallos de autenticación) mantienen
    el comportamiento de siempre: `'error'` + evento en `system_events`, sin
@@ -510,9 +658,9 @@ camino manual debería dejar de ser necesario.
 
 1. Que el servicio arranque y `/api/health` diga versión **5.3.8**.
 2. Si la página de WhatsApp Web recarga durante el arranque, el log debe
-   mostrar "reintento 1/3 de arranque de WhatsApp..." y la instancia debe
+   mostrar "reintento 1/5 de arranque de WhatsApp..." y la instancia debe
    volver a `ready` **sin QR nuevo** y sin tocar Reconectar.
-3. Si los 3 reintentos se agotan, la instancia queda en `'error'` y el
+3. Si los 5 reintentos se agotan, la instancia queda en `'error'` y el
    vigilante intenta una re-inicialización más a los 120 s (queda en el log
    y en Estado del Sistema).
 4. En VPS/docker-compose: sin cambios (sin `PERSIST_DIR` todo igual que en
@@ -1569,12 +1717,16 @@ opcional.
    `node scripts/get-google-refresh-token.js <CLIENT_ID> <CLIENT_SECRET>`
    Abre la URL que imprime con la cuenta de Google de la empresa, acepta
    el acceso al calendario y el script imprime el refresh token.
-4. Pon en el `.env` (y reinicia) o guárdalo desde el CRM (solo admin):
+4. Pégalo en el CRM (solo admin): Estado del Sistema → Configuración de
+   integraciones → Google Calendar: Client ID, Client Secret y Refresh
+   Token, Calendar ID `primary` (o el ID de un calendario compartido) y
+   duración 120. También se puede poner en el `.env` (y reinicia):
    `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`,
-   `GOOGLE_CALENDAR_ID=primary` (o el ID de un calendario compartido) y
-   `GOOGLE_CALENDAR_DURATION_MINUTES=120`.
-5. Prueba: Estado del Sistema > fila Google Calendar, o
-   `POST /api/system/google-calendar/test` (solo admin): crea un evento
+   `GOOGLE_CALENDAR_ID` y `GOOGLE_CALENDAR_DURATION_MINUTES`; lo de
+   settings tiene prioridad si está puesto.
+5. Prueba: Estado del Sistema → Configuración de integraciones → Google
+   Calendar → “Probar conexión” (o
+   `POST /api/system/google-calendar/test`, solo admin): crea un evento
    de prueba de 15 min "Prueba CRM — borrar" y lo borra de inmediato.
    `GET /api/system/google-calendar/status` (solo admin) dice si está
    configurado, sin mostrar secretos.
@@ -1629,8 +1781,11 @@ Es el canal principal porque sigue funcionando cuando WhatsApp está caído
    `https://api.telegram.org/bot<TU_TOKEN>/getUpdates` y busca
    `"chat":{"id": 123456789}`: ese número es tu `TELEGRAM_CHAT_ID`.
    (También sirve el bot **@userinfobot**: te dice tu id directamente.)
-4. En el `.env` del CRM pon `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID` y
-   reinicia el servidor (`docker compose restart app`).
+4. Pégalo en el CRM (solo admin): Estado del Sistema → Configuración de
+   integraciones → Telegram: Bot Token y Chat ID, Guardar. También se puede
+   poner en el `.env` (`TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`) y
+   reiniciar el servidor (`docker compose restart app`); lo de settings
+   tiene prioridad si está puesto.
 5. Prueba: en **Estado del Sistema → Probar alerta de Telegram**. Si llega el
    mensaje a tu teléfono, las alertas funcionan.
 

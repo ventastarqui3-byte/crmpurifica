@@ -1,7 +1,7 @@
 // Estado del Sistema (solo administradores).
 // Semáforos por componente, autoprueba, últimos eventos, reconexión de
 // WhatsApp y respaldo. Si algo se rompe, aquí se ve sin entrar a los logs.
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Activity, CheckCircle2, AlertTriangle, XCircle, RefreshCw, Play,
   Database, Smartphone, Server, MessagesSquare, HardDrive, Bell,
@@ -65,6 +65,20 @@ export const SystemStatus: React.FC = () => {
   const [busy, setBusy] = useState('');
   const [tests, setTests] = useState<SelfTestResult[] | null>(null);
   const [testSummary, setTestSummary] = useState('');
+  // v5.3.15 Formularios de integraciones (Google Calendar y Telegram).
+  // Los secretos NUNCA se traen del servidor: los campos empiezan vacíos y
+  // los vacíos no se envían al guardar (lo guardado se conserva). Los campos
+  // no secretos de Google (calendario, duración, habilitado) se rellenan UNA
+  // vez con lo que devuelve GET /api/settings (que ya borra los secretos).
+  const [gcalClientId, setGcalClientId] = useState('');
+  const [gcalClientSecret, setGcalClientSecret] = useState('');
+  const [gcalRefreshToken, setGcalRefreshToken] = useState('');
+  const [gcalCalendarId, setGcalCalendarId] = useState('');
+  const [gcalDuration, setGcalDuration] = useState('120');
+  const [gcalEnabled, setGcalEnabled] = useState(true);
+  const [tgBotToken, setTgBotToken] = useState('');
+  const [tgChatId, setTgChatId] = useState('');
+  const gcalFormInit = useRef(false);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -77,6 +91,19 @@ export const SystemStatus: React.FC = () => {
       const evRes = await apiFetch(`/api/system/events?limit=50${levelFilter ? `&level=${levelFilter}` : ''}`);
       const evJson = await evRes.json().catch(() => ({}));
       if (evRes.ok) setEvents(evJson.events || []);
+      // v5.3.15 Rellenar una sola vez los campos NO secretos de Google con
+      // lo guardado (GET /api/settings ya borra los secretos). En su propio
+      // try/catch: si falla, el estado principal ya cargó igual.
+      try {
+        const stRes = await apiFetch('/api/settings');
+        const stJson = await stRes.json().catch(() => ({}));
+        if (stRes.ok && !gcalFormInit.current) {
+          if (typeof stJson.google_calendar_id === 'string' && stJson.google_calendar_id) setGcalCalendarId(stJson.google_calendar_id);
+          if (typeof stJson.google_calendar_duration_minutes === 'string' && stJson.google_calendar_duration_minutes) setGcalDuration(stJson.google_calendar_duration_minutes);
+          if (typeof stJson.google_calendar_enabled === 'string') setGcalEnabled(stJson.google_calendar_enabled.toLowerCase() !== 'false');
+          gcalFormInit.current = true;
+        }
+      } catch { /* sin settings: los campos quedan con su valor por defecto */ }
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -154,6 +181,60 @@ export const SystemStatus: React.FC = () => {
       return { message: 'Alerta de prueba enviada a Telegram. Revisa tu teléfono.' };
     });
 
+  // v5.3.15 Guardar una clave en settings (POST /api/settings, una llamada
+  // por clave). Solo admin (el backend lo exige).
+  const saveSetting = async (key: string, value: string) => {
+    const res = await apiFetch('/api/settings', {
+      method: 'POST',
+      body: JSON.stringify({ key, value }),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(json.error || `No se pudo guardar ${key}`);
+  };
+
+  // v5.3.15 Google Calendar: los secretos vacíos NO se envían (lo guardado
+  // se conserva). La duración y el calendario solo se envían si tienen
+  // valor; el habilitado siempre se envía (es el interruptor). Tras guardar
+  // se limpian los campos de secreto y se recarga el estado.
+  const saveGoogle = async () =>
+    runAction('gcal-save', async () => {
+      const pairs: [string, string][] = [];
+      if (gcalClientId.trim()) pairs.push(['google_client_id', gcalClientId.trim()]);
+      if (gcalClientSecret.trim()) pairs.push(['google_client_secret', gcalClientSecret.trim()]);
+      if (gcalRefreshToken.trim()) pairs.push(['google_refresh_token', gcalRefreshToken.trim()]);
+      if (gcalCalendarId.trim()) pairs.push(['google_calendar_id', gcalCalendarId.trim()]);
+      const dur = parseInt(gcalDuration, 10);
+      if (Number.isFinite(dur) && dur > 0) pairs.push(['google_calendar_duration_minutes', String(dur)]);
+      pairs.push(['google_calendar_enabled', gcalEnabled ? 'true' : 'false']);
+      for (const [key, value] of pairs) await saveSetting(key, value);
+      setGcalClientId('');
+      setGcalClientSecret('');
+      setGcalRefreshToken('');
+      return { message: 'Google Calendar guardado. Pulsa “Probar conexión” para verificar que funciona.' };
+    });
+
+  const testGoogle = async () =>
+    runAction('gcal-test', async () => {
+      const res = await apiFetch('/api/system/google-calendar/test', { method: 'POST' });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'La prueba de Google Calendar falló');
+      return { message: json.detail || 'Google Calendar conectado: evento de prueba creado y borrado.' };
+    });
+
+  // v5.3.15 Telegram: los campos vacíos NO se envían (lo guardado se
+  // conserva). Si no hay nada que guardar, se avisa en vez de llamar.
+  const saveTelegram = async () =>
+    runAction('tg-save', async () => {
+      const pairs: [string, string][] = [];
+      if (tgBotToken.trim()) pairs.push(['telegram_bot_token', tgBotToken.trim()]);
+      if (tgChatId.trim()) pairs.push(['telegram_chat_id', tgChatId.trim()]);
+      if (pairs.length === 0) throw new Error('Escribe el token del bot y/o el chat id para guardar');
+      for (const [key, value] of pairs) await saveSetting(key, value);
+      setTgBotToken('');
+      setTgChatId('');
+      return { message: 'Telegram guardado. Pulsa “Probar alerta de Telegram” para verificar que llega el mensaje.' };
+    });
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64 text-slate-500 gap-2">
@@ -163,6 +244,11 @@ export const SystemStatus: React.FC = () => {
   }
 
   const wa = data?.components.find((c) => c.key === 'whatsapp');
+  // v5.3.15 Estado de las integraciones para los formularios de abajo: el
+  // estado de Google viene en su componente (configured + detail) y el de
+  // Telegram en data.alerts. Los secretos nunca se traen al navegador.
+  const gcalComp = data?.components.find((c) => c.key === 'google-calendar');
+  const tgConfigured = data?.alerts.telegramConfigured ?? false;
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -188,10 +274,10 @@ export const SystemStatus: React.FC = () => {
             <p className="font-bold">Las alertas de Telegram no están configuradas.</p>
             <p>
               Sin Telegram, si WhatsApp o la base de datos se caen nadie se entera hasta que un
-              cliente se queje. Configura <code className="font-mono">TELEGRAM_BOT_TOKEN</code> y{' '}
-              <code className="font-mono">TELEGRAM_CHAT_ID</code> en el <code className="font-mono">.env</code>{' '}
-              (2 minutos con BotFather, ver README → “¿Cómo sé si algo se rompió?”) y luego pulsa
-              “Probar alerta”.
+              cliente se queje. Configúralo abajo, en “Configuración de integraciones → Telegram”
+              (2 minutos con BotFather), o con <code className="font-mono">TELEGRAM_BOT_TOKEN</code> y{' '}
+              <code className="font-mono">TELEGRAM_CHAT_ID</code> en el <code className="font-mono">.env</code>,
+              y luego pulsa “Probar alerta”.
             </p>
           </div>
         </div>
@@ -258,6 +344,119 @@ export const SystemStatus: React.FC = () => {
             </div>
           );
         })}
+      </div>
+
+      {/* v5.3.15 Configuración de integraciones: antes no había dónde poner
+          Google Calendar ni Telegram (solo por .env / script local). Los
+          secretos se escriben aquí y nunca se muestran ni se devuelven: los
+          campos empiezan vacíos y los vacíos no se envían al guardar. */}
+      <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+        <h2 className="font-bold text-slate-800 mb-1">Configuración de integraciones</h2>
+        <p className="text-sm text-slate-500 mb-4">
+          Las credenciales se guardan solo para el administrador y nunca se muestran.
+          Si un campo de secreto queda vacío al guardar, lo que ya estaba guardado se
+          conserva. Las variables de .env (Railway) siguen funcionando como respaldo
+          si aquí no hay nada puesto.
+        </p>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div className="border border-slate-200 rounded-2xl p-4">
+            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+              <CalendarDays className="w-5 h-5 text-slate-500" /> Google Calendar
+            </h3>
+            <p className="text-xs text-slate-500 mt-1 mb-3">
+              {gcalComp?.configured ? 'Configurado' : 'No configurado'}
+              {gcalComp?.detail ? ` · ${gcalComp.detail}` : ''}
+            </p>
+            <div className="space-y-2">
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Client ID</span>
+                <input type="password" value={gcalClientId} onChange={(e) => setGcalClientId(e.target.value)}
+                  placeholder={gcalComp?.configured ? '•••••••• (configurado)' : 'Sin configurar'}
+                  autoComplete="off"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Client Secret</span>
+                <input type="password" value={gcalClientSecret} onChange={(e) => setGcalClientSecret(e.target.value)}
+                  placeholder={gcalComp?.configured ? '•••••••• (configurado)' : 'Sin configurar'}
+                  autoComplete="off"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Refresh Token</span>
+                <input type="password" value={gcalRefreshToken} onChange={(e) => setGcalRefreshToken(e.target.value)}
+                  placeholder={gcalComp?.configured ? '•••••••• (configurado)' : 'Sin configurar'}
+                  autoComplete="off"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Calendar ID</span>
+                <input type="text" value={gcalCalendarId} onChange={(e) => setGcalCalendarId(e.target.value)}
+                  placeholder="primary"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Duración de cada servicio (minutos)</span>
+                <input type="number" min={15} max={1440} value={gcalDuration} onChange={(e) => setGcalDuration(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" checked={gcalEnabled} onChange={(e) => setGcalEnabled(e.target.checked)} />
+                Habilitado (crear eventos al agendar servicios)
+              </label>
+              <p className="text-xs text-slate-400">
+                El refresh token se obtiene con <code className="font-mono">node scripts/get-google-refresh-token.js</code> (ver README, sección “Google Calendar”).
+              </p>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button onClick={saveGoogle} disabled={busy === 'gcal-save'}
+                  className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'gcal-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar Google Calendar
+                </button>
+                <button onClick={testGoogle} disabled={busy === 'gcal-test'}
+                  className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-900 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'gcal-test' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />} Probar conexión
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="border border-slate-200 rounded-2xl p-4">
+            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+              <Bell className="w-5 h-5 text-slate-500" /> Telegram (alertas)
+            </h3>
+            <p className="text-xs text-slate-500 mt-1 mb-3">
+              {tgConfigured ? 'Configurado: las alertas llegan a Telegram.' : 'No configurado: si WhatsApp o la base de datos se caen, nadie se entera.'}
+            </p>
+            <div className="space-y-2">
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Bot Token</span>
+                <input type="password" value={tgBotToken} onChange={(e) => setTgBotToken(e.target.value)}
+                  placeholder={tgConfigured ? '•••••••• (configurado)' : 'Sin configurar'}
+                  autoComplete="off"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Chat ID</span>
+                <input type="text" value={tgChatId} onChange={(e) => setTgChatId(e.target.value)}
+                  placeholder={tgConfigured ? '•••••••• (configurado)' : 'Sin configurar'}
+                  autoComplete="off"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <p className="text-xs text-slate-400">
+                Crea el bot con @BotFather en Telegram y copia el token. El chat id es el número
+                del chat (o del grupo) donde deben llegar las alertas.
+              </p>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button onClick={saveTelegram} disabled={busy === 'tg-save'}
+                  className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'tg-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar Telegram
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                Después de guardar, usa el botón “Probar alerta de Telegram” de Acciones para verificar que llega el mensaje.
+              </p>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">

@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.13';
+const APP_VERSION = '5.3.15';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -125,19 +125,32 @@ async function flushEventBuffer() {
   }
 }
 
-function telegramConfigured() {
-  return Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+// v5.3.15 Telegram desde settings con fallback a env: el bot token y el
+// chat id se guardan desde Estado del Sistema (solo admin) en las claves
+// telegram_bot_token / telegram_chat_id; si están vacías se usan las
+// variables TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (Railway/.env sigue
+// funcionando como antes). getSettingValue devuelve el fallback cuando
+// no hay DB, así que sin base de datos también se sigue usando el env.
+async function getTelegramConfig() {
+  const token = (await getSettingValue('telegram_bot_token', ''))?.trim() || TELEGRAM_BOT_TOKEN;
+  const chatId = (await getSettingValue('telegram_chat_id', ''))?.trim() || TELEGRAM_CHAT_ID;
+  return { token, chatId, configured: Boolean(token && chatId) };
+}
+
+async function telegramConfigured() {
+  return (await getTelegramConfig()).configured;
 }
 
 async function sendTelegramAlert(text) {
-  if (!telegramConfigured()) return { configured: false, sent: false, reason: 'Telegram no configurado (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID vacíos)' };
+  const cfg = await getTelegramConfig();
+  if (!cfg.configured) return { configured: false, sent: false, reason: 'Telegram no configurado (falta el token del bot y/o el chat id: configúralos en Estado del Sistema o con TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID en .env)' };
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 10000);
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${cfg.token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
+      body: JSON.stringify({ chat_id: cfg.chatId, text }),
       signal: ctrl.signal,
     });
     clearTimeout(timer);
@@ -368,6 +381,15 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
       // el log probó que la respuesta del contacto puede caer entre nuestro
       // envío y la verificación (el último mensaje era del contacto,
       // "hace 0 s") y el nuestro quedaba segundo.
+      // v5.3.14 — "Nuestro" ya NO se decide por fromMe: en este chat LID
+      // los mensajes propios guardados en chat.msgs leen fromMe=false
+      // (probado en el log de v5.3.13: la verificación siempre decía
+      // "fromMe=false, hace 2 s" y ese "hace 2 s" coincidía EXACTAMENTE
+      // con el timestamp de nuestros propios ecos message_create; el eco
+      // del evento sí trae fromMe=true, pero la copia en la colección no).
+      // Por eso se decide por REMITENTE: fromMe, o id.fromMe, o un
+      // remitente distinto del contacto. Un mensaje reciente con el mismo
+      // contenido cuyo remitente no es el contacto es nuestro.
       const recentMsgsInfo = (c2) => {
         try {
           let arr = null;
@@ -376,14 +398,22 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
           if (arr && arr.length) {
             return arr.slice(-5).map((m) => {
               const mid = m && m.id;
-              return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0 };
+              const from = m && m.from;
+              return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, idFromMe: !!(mid && mid.fromMe), sender: (from && (from._serialized || from.$1)) || (typeof from === 'string' ? from : ''), body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0 };
             });
           }
         } catch (e) { /* sin mensajes legibles */ }
         return [];
       };
+      const isOurs = (info) => {
+        if (!info) return false;
+        if (info.fromMe || info.idFromMe) return true;
+        const lidSer = args.lidDigits + '@lid';
+        const cusSer = args.phoneDigits + '@c.us';
+        return !!info.sender && info.sender !== lidSer && info.sender !== cusSer;
+      };
       const lastMatches = (info) => {
-        if (!info || !info.fromMe) return false;
+        if (!isOurs(info)) return false;
         if (Math.floor(Date.now() / 1000) - (info.t || 0) > 60) return false;
         if (args.media) {
           if (args.content && (info.caption === args.content || info.body === args.content)) return true;
@@ -512,9 +542,31 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
         } catch (e) { /* no se pudo resolver el último mensaje */ }
       }
       if (!cands.length) { out.reason = 'sin mensajes legibles en el chat'; return out; }
+// v5.3.14 — "Nuestro" se decide por REMITENTE, no por fromMe: en este
+// chat LID los mensajes propios guardados en chat.msgs leen fromMe=false
+// (probado en el log de v5.3.13: la verificación siempre decía
+// "fromMe=false, hace 2 s" y ese "hace 2 s" coincidía EXACTAMENTE con el
+// timestamp de nuestros propios ecos message_create; el eco del evento sí
+// trae fromMe=true, pero la copia en la colección no). Por eso: fromMe, o
+// id.fromMe, o un remitente distinto del contacto. Un mensaje reciente con
+// el mismo contenido cuyo remitente no es el contacto es nuestro.
       const now = Math.floor(Date.now() / 1000);
+      const msgSender = (m) => {
+        const from = m && m.from;
+        return (from && (from._serialized || from.$1)) || (typeof from === 'string' ? from : '');
+      };
+      const isOursMsg = (m) => {
+        if (!m) return false;
+        if (m.fromMe) return true;
+        const mid = m.id;
+        if (mid && mid.fromMe) return true;
+        const sender = msgSender(m);
+        const lidSer = args.lidDigits + '@lid';
+        const cusSer = args.phoneDigits + '@c.us';
+        return !!sender && sender !== lidSer && sender !== cusSer;
+      };
       const matches = (m) => {
-        if (!m || !m.fromMe) return false;
+        if (!isOursMsg(m)) return false;
         if (now - (m.t || 0) > 60) return false;
         const body = m.body || '';
         const caption = m.caption || '';
@@ -530,8 +582,10 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
         return body === args.content;
       };
       // Info del mensaje más reciente (para el log), aunque no sea el nuestro.
+      // v5.3.14: se registra también remitente e idFromMe, para diagnosticar
+      // en el próximo log si los propios siguen leyendo fromMe=false.
       const newest = cands[cands.length - 1];
-      out.last = { fromMe: !!newest.fromMe, type: newest.type || '', tDelta: now - (newest.t || 0), bodyMatch: (newest.body || '') === args.content, captionMatch: (newest.caption || '') === args.content, via };
+      out.last = { fromMe: !!newest.fromMe, idFromMe: !!(newest.id && newest.id.fromMe), sender: msgSender(newest), type: newest.type || '', tDelta: now - (newest.t || 0), bodyMatch: (newest.body || '') === args.content, captionMatch: (newest.caption || '') === args.content, via };
       out.checked = cands.length;
       let hit = null;
       for (let i = cands.length - 1; i >= 0; i--) { if (matches(cands[i])) { hit = cands[i]; break; } }
@@ -554,7 +608,7 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
   if (res?.ok) {
     logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'}, revisados: ${res.checked ?? '?'})`);
   } else {
-    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'})`);
+    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, idFromMe=${res?.last?.idFromMe}, remitente=${res?.last?.sender || '?'}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'})`);
   }
   return res || { ok: false, reason: 'sin resultado' };
 }
@@ -1313,13 +1367,15 @@ let waWatchdogSeq = 0; // generación del vigilante: ignora temporizadores viejo
 // context was destroyed" en Client.inject: la página de WhatsApp Web
 // navegó/recargó mientras la librería inyectaba su JS y el contexto de
 // ejecución murió. Es transitorio: reintentando, la sesión guardada se
-// restaura sin pedir QR nuevo. Se reintenta hasta 3 veces con espera
-// creciente (10 s, 30 s, 60 s). El contador vive fuera de initWhatsApp
+// restaura sin pedir QR nuevo. v5.3.14: se reintenta hasta 5 veces con
+// espera creciente (10 s, 30 s, 60 s, 120 s, 120 s) — el log de v5.3.13
+// probó que un arranque necesitó 8 intentos y los 3 de v5.3.8 no
+// alcanzaron. El contador vive fuera de initWhatsApp
 // porque cada reintento recrea la instancia (nuevo closure); se reinicia
 // en cada arranque "fresco" (restaurar al boot, Reconectar manual, cambio
 // de canal, reintento del vigilante) y al llegar a 'ready'. Los errores NO
 // transitorios (p. ej. fallos de autenticación) no reintentan.
-const WA_TRANSIENT_RETRY_DELAYS = [10000, 30000, 60000];
+const WA_TRANSIENT_RETRY_DELAYS = [10000, 30000, 60000, 120000, 120000];
 const WA_TRANSIENT_ERROR = /Execution context was destroyed|Target closed|Session closed|Protocol error|Failed to launch|Navigation failed|net::ERR|Timeout/i;
 const waTransientAttempts = {}; // id -> reintentos transitorios hechos en la cadena actual
 function isTransientWaError(detail) {
@@ -1405,7 +1461,7 @@ async function stopWaInstance(id) {
 // a mano. El token de generación evita que un temporizador viejo actúe
 // sobre una instancia nueva con el mismo id.
 // v5.3.8: el vigilante también actúa sobre 'error' por arranque fallido
-// (tras agotar los 3 reintentos transitorios, el catch ya no lo cancela):
+// (tras agotar los 5 reintentos transitorios, el catch ya no lo cancela):
 // un fallo de arranque no es nunca un callejón sin salida. Los errores
 // NO transitorios siguen cancelando el vigilante en el catch, así que
 // sobre esos no hay reintento.
@@ -1701,12 +1757,12 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry
       // contexto de ejecución murió. Antes, cualquier error que no fuera
       // de perfil bloqueado ponía la instancia en 'error' y cancelaba el
       // vigilante: nada reintentaba jamás y solo quedaba el Reconectar
-      // manual. Ahora se reintenta hasta 3 veces con espera creciente
-      // (10 s, 30 s, 60 s), recreando el cliente con stopWaInstance +
+      // manual. Ahora se reintenta hasta 5 veces con espera creciente
+      // (10 s, 30 s, 60 s, 120 s, 120 s), recreando el cliente con stopWaInstance +
       // initWhatsApp; los archivos de sesión en disco no se tocan en un
       // inject fallido, así que el reintento restaura la sesión sin pedir
       // QR nuevo. Mientras quedan reintentos, el estado sigue en
-      // 'initializing' y el vigilante NO se cancela. Solo al agotar los 3
+      // 'initializing' y el vigilante NO se cancela. Solo al agotar los 5
       // intentos la instancia pasa a 'error' — y el vigilante (que ahora
       // también actúa sobre 'error') intentará una re-inicialización más.
       if (isTransientWaError(detail)) {
@@ -1714,7 +1770,7 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry
         if (done < WA_TRANSIENT_RETRY_DELAYS.length) {
           const delay = WA_TRANSIENT_RETRY_DELAYS[done];
           waTransientAttempts[id] = done + 1;
-          logger.warn(`WhatsApp ${name}: arranque fallido por error transitorio (${err?.message || err}); reintento ${done + 1}/3 en ${delay / 1000} s.`);
+          logger.warn(`WhatsApp ${name}: arranque fallido por error transitorio (${err?.message || err}); reintento ${done + 1}/5 en ${delay / 1000} s.`);
           const timer = setTimeout(async () => {
             const cur = waClients[id];
             if (!cur || cur.client !== client) return; // borrada o reemplazada entretanto (p. ej. Reconectar manual)
@@ -1728,7 +1784,7 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry
           if (timer.unref) timer.unref();
           return;
         }
-        logger.warn(`WhatsApp ${name}: se agotaron los 3 reintentos automáticos por error transitorio; queda en 'error' y el vigilante intentará una re-inicialización más.`);
+        logger.warn(`WhatsApp ${name}: se agotaron los 5 reintentos automáticos por error transitorio; queda en 'error' y el vigilante intentará una re-inicialización más.`);
         // NO se cancela el vigilante: con estado 'error' el vigilante de
         // v5.3.8 dispara su único reintento automático por arranque.
       } else {
@@ -2127,7 +2183,7 @@ async function getSystemStatus() {
   return {
     version: APP_VERSION,
     uptime_seconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
-    alerts: { telegramConfigured: telegramConfigured(), emailConfigured: nodemailerAvailable && Boolean((process.env.SMTP_HOST || '').trim() && (process.env.ALERT_EMAIL || '').trim()) },
+    alerts: { telegramConfigured: await telegramConfigured(), emailConfigured: nodemailerAvailable && Boolean((process.env.SMTP_HOST || '').trim() && (process.env.ALERT_EMAIL || '').trim()) },
     components: [
       { key: 'db', label: 'Base de datos', status: db.status, detail: db.detail, latencyMs: db.ms },
       { key: 'whatsapp', label: 'WhatsApp por QR', status: waStatus, detail: wa.total === 0 ? 'Sin instancias configuradas' : `${wa.connected} de ${wa.total} instancias conectadas`, instances: wa.instances },
@@ -2211,7 +2267,7 @@ app.post('/api/system/self-test', requireAdmin, async (req, res) => {
     return 'Se pudo escribir y borrar un archivo temporal';
   });
   await run('Alertas de Telegram', async () => {
-    if (!telegramConfigured()) throw new Error('Telegram no configurado (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID vacíos)');
+    if (!(await telegramConfigured())) throw new Error('Telegram no configurado (falta el token del bot y/o el chat id: Estado del Sistema o TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID en .env)');
     return 'Token y chat configurados (no se envió ningún mensaje en esta prueba)';
   });
   await run('Google Calendar', async () => {
@@ -2312,10 +2368,13 @@ async function getGoogleCalendarConfig() {
   const calendarId = (await getSettingValue('google_calendar_id', ''))?.trim() || GOOGLE_CALENDAR_ID_ENV;
   const durationRaw = await getSettingValue('google_calendar_duration_minutes', '');
   const durationMinutes = Math.min(Math.max(parseInt(durationRaw || process.env.GOOGLE_CALENDAR_DURATION_MINUTES || String(GOOGLE_CALENDAR_DURATION_DEFAULT), 10) || GOOGLE_CALENDAR_DURATION_DEFAULT, 15), 1440);
-  const clientId = GOOGLE_CLIENT_ID;
-  const clientSecret = GOOGLE_CLIENT_SECRET;
+  // v5.3.15 Client ID y Client Secret también desde settings (Estado del
+  // Sistema, solo admin), con fallback a env — igual que el refresh token.
+  // Las variables de Railway/.env siguen funcionando como antes.
+  const clientId = (await getSettingValue('google_client_id', ''))?.trim() || GOOGLE_CLIENT_ID;
+  const clientSecret = (await getSettingValue('google_client_secret', ''))?.trim() || GOOGLE_CLIENT_SECRET;
   if (!enabled) return { configured: false, reason: 'Google Calendar apagado (google_calendar_enabled=false)', enabled, calendarId, durationMinutes };
-  if (!clientId || !clientSecret) return { configured: false, reason: 'Faltan GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET en .env', enabled, calendarId, durationMinutes };
+  if (!clientId || !clientSecret) return { configured: false, reason: 'Faltan el Client ID y/o el Client Secret de Google (configúralos en Estado del Sistema o con GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET en .env)', enabled, calendarId, durationMinutes };
   if (!refreshToken) return { configured: false, reason: 'Falta el refresh token (GOOGLE_REFRESH_TOKEN o settings google_refresh_token). Ver README, sección "Google Calendar".', enabled, calendarId, durationMinutes };
   return { configured: true, reason: '', enabled, clientId, clientSecret, refreshToken, calendarId, durationMinutes };
 }
@@ -5161,8 +5220,15 @@ app.get('/api/settings', async (req, res) => {
     // GET /api/system/google-calendar/status (solo admin). El client secret
     // de Google tampoco sale, por si alguna vez se guardara en settings
     // (hoy solo vive en .env).
+    // v5.3.15 Tampoco salen el token del bot ni el chat id de Telegram, ni
+    // el client id de Google (ahora también se pueden guardar en settings
+    // desde Estado del Sistema; el estado se consulta por
+    // /api/system/status, nunca devolviendo el secreto).
     delete s['google_refresh_token'];
     delete s['google_client_secret'];
+    delete s['google_client_id'];
+    delete s['telegram_bot_token'];
+    delete s['telegram_chat_id'];
     res.json(s);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -5176,7 +5242,7 @@ app.post('/api/settings', async (req, res) => {
     // resolución de facturación. invoice_next_number NO está aquí a propósito:
     // el consecutivo solo lo mueve la creación de facturas, no un formulario.
     // v5 Parte 2B Meta: token y phone number id de WhatsApp Cloud API.
-    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled'];
+    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id'];
     if (!ALLOWED_SETTINGS_KEYS.includes(key)) return res.status(400).json({ error: `Clave no permitida: ${key}` });
     // Las claves de Meta son credenciales: solo el admin las escribe.
     if (key.startsWith('meta_wa_') && (req.user?.role || '').toLowerCase() !== 'admin') {
@@ -5185,7 +5251,7 @@ app.post('/api/settings', async (req, res) => {
     // v5.2 Facturación (B6): el tipo de factura por defecto y los datos de
     // la empresa para facturar son solo admin, aunque el asesor (vendedor)
     // ya puede crear facturas y cobrar.
-    const ADMIN_ONLY_SETTINGS = new Set(['invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled']);
+    const ADMIN_ONLY_SETTINGS = new Set(['invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id']);
     if (ADMIN_ONLY_SETTINGS.has(key) && normalizeRoleValue(req.user?.role) !== 'admin') {
       return res.status(403).json({ error: 'Solo el administrador puede cambiar esa configuración' });
     }
