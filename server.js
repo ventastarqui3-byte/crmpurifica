@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.10';
+const APP_VERSION = '5.3.11';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -307,6 +307,99 @@ async function getMetaConfig() {
   };
 }
 
+// v5.3.11 — Envío por ESCANEO de la lista de chats (en vez de buscar el
+// chat por id). El log de v5.3.10 probó que TODA búsqueda por id falla para
+// este contacto LID: `getChatById` LANZA "r" (pasa por getChatModel, que
+// llama chat.serialize()/formattedTitle/Msg.get(lastReceivedKey)) y
+// `sendMessage` devuelve undefined ("chat no encontrado") tanto para el
+// @lid como para el @c.us. Pero el chat EXISTE: los eventos lo entregan y
+// la propia librería escanea la colección en `getChats`
+// (Utils.js:921: `Chat.getModelsArray()`). Así que el envío busca el chat
+// ESCANEANDO la colección en la página y, si lo encuentra, envía con ESE
+// objeto chat llamando a `window.WWebJS.sendMessage(chat, content,
+// options)` en el mismo evaluate (replica el cuerpo del evaluate de
+// Client.sendMessage, Client.js:1535-1555, sin el getChat ni el sendSeen,
+// que son justo los pasos que fallan). Devuelve { ok, found, messageId,
+// error }: found=false si el escaneo no encontró el chat (el llamador
+// cae al camino por id de siempre); ok=false con found=true si el chat
+// existe pero el envío falló (también se cae al camino por id).
+async function sendWaByScan(client, target, { digits, lid, content, media }) {
+  const lidDigits = String(lid || '').replace(/@lid$/, '').replace(/\D/g, '');
+  let scan;
+  try {
+    scan = await client.pupPage.evaluate(async (args) => {
+      const out = { found: false, totalChats: 0, matchedIds: [], sent: false, messageId: null, error: null };
+      let chats = null;
+      try {
+        chats = window.require('WAWebCollections').Chat.getModelsArray();
+      } catch (e) {
+        out.error = 'escaneo de chats lanzó: ' + (e && e.message);
+        return out;
+      }
+      out.totalChats = chats ? chats.length : 0;
+      for (const c of chats || []) {
+        try {
+          const id = c && c.id;
+          const ser = id && (id._serialized || id.$1);
+          const user = id && id.user;
+          if (!ser && !user) continue;
+          if (ser === (args.lidDigits + '@lid') || user === args.lidDigits || ser === (args.phoneDigits + '@c.us') || user === args.phoneDigits) {
+            out.matchedIds.push(ser || (user + '@' + (id.server || 'c.us')));
+          }
+        } catch (e) { /* un chat raro no tumba el escaneo */ }
+      }
+      if (!out.matchedIds.length) return out;
+      out.found = true;
+      let chat = null;
+      for (const c of chats) {
+        const ser = c && c.id && (c.id._serialized || c.id.$1);
+        if (ser === out.matchedIds[0]) { chat = c; break; }
+      }
+      if (!chat) { out.error = 'chat no re-encontrado tras el escaneo'; return out; }
+      try {
+        const options = {};
+        if (args.media) {
+          options.media = args.media;
+          options.caption = args.caption;
+          if (args.sendMediaAsDocument) options.sendMediaAsDocument = true;
+        }
+        const msg = await window.WWebJS.sendMessage(chat, args.content || '', options);
+        if (!msg) { out.error = 'WWebJS.sendMessage devolvió vacío'; return out; }
+        out.sent = true;
+        try {
+          const model = window.WWebJS.getMessageModel(msg);
+          const mid = model && model.id;
+          out.messageId = typeof mid === 'string' ? mid : (mid && (mid._serialized || mid.$1)) || (msg.id && (msg.id._serialized || msg.id.$1)) || null;
+        } catch (e) {
+          out.messageId = (msg.id && (msg.id._serialized || msg.id.$1)) || null;
+        }
+        return out;
+      } catch (e) {
+        out.error = (e && e.message) || String(e);
+        return out;
+      }
+    }, {
+      lidDigits,
+      phoneDigits: digits,
+      content: content || '',
+      media: media ? { data: media.data, mimetype: media.mimetype, filename: media.filename || 'archivo' } : null,
+      caption: content || undefined,
+      sendMediaAsDocument: media?.type === 'document',
+    });
+  } catch (e) {
+    logger.warn(`WhatsApp (${target}): escaneo de chats falló: ${e?.message || e}`);
+    return { found: false, ok: false, error: e?.message || String(e) };
+  }
+  logger.info(`WhatsApp (${target}): escaneo de chats: ${scan?.totalChats ?? '?'} chats en lista, ${scan?.matchedIds?.length || 0} coincidencias${scan?.matchedIds?.length ? ` (${scan.matchedIds.join(', ')})` : ''}`);
+  if (!scan?.found) return { found: false, ok: false };
+  if (scan.sent) {
+    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]}`);
+    return { found: true, ok: true, messageId: scan.messageId || null };
+  }
+  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'}`);
+  return { found: true, ok: false, error: scan.error || 'El envío por escaneo no devolvió mensaje' };
+}
+
 // Envío unificado de WhatsApp. Canal 'meta' -> API oficial de Meta;
 // canal 'qr' -> cliente whatsapp-web.js de la instancia indicada (o la
 // primera lista, si no se indica). Devuelve { ok, channel, ... } y nunca
@@ -387,6 +480,13 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   const lid = await getWaLidForDigits(digits).catch(() => null);
   const chatIds = [...new Set([canonical, lid, `${digits}@c.us`].filter(Boolean))];
   const WA_GETTER_ERROR = /must include an id property/i;
+  // v5.3.11 — PRIMERO el escaneo (sendWaByScan): si encuentra el chat en
+  // la lista y envía, listo. Si no lo encuentra o el envío por escaneo
+  // falla, se cae al camino por id de siempre (LID -> @c.us).
+  const scanRes = await sendWaByScan(waClients[target].client, target, { digits, lid, content, media });
+  if (scanRes?.ok) {
+    return { ok: true, channel: 'qr', instance: target, messageId: scanRes.messageId ? waMsgSerializedId({ id: scanRes.messageId }) : null };
+  }
   let lastError = null;
   for (const chatId of chatIds) {
     let sent;
@@ -471,10 +571,30 @@ async function handleIncomingWhatsApp({ phone: rawPhone, content, sourceName, ch
       );
     }
 
-    await client.query(
-      'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, $2, $3, $4, $5, NOW(), $6) ON CONFLICT (external_id) DO NOTHING',
-      [conversationId, sender, type, content, attachmentUrl, externalId]
-    );
+    // v5.3.11 — Dedup de ECOS propios: la librería emite message_create
+    // DOS veces por el mismo mensaje enviado desde el teléfono (eco local
+    // + versión del servidor, con 39 ms de diferencia en el log de
+    // v5.3.10) y con external_id DISTINTO, así que el dedup por
+    // external_id no los caza: 1 guardado fallido del CRM + 2 ecos = las
+    // 3 burbujas que ve el usuario. Para sender 'agent', si en los últimos
+    // 60 s ya se guardó un mensaje idéntico en esta conversación (mismo
+    // type, content y adjunto), no se guarda otra copia. No toca el dedup
+    // por external_id ni el de fallidos de 5 min.
+    let skipEcho = false;
+    if (sender === 'agent') {
+      const echo = await client.query(
+        `SELECT id FROM messages WHERE conversation_id = $1 AND sender = 'agent' AND type = $2 AND content = $3 AND attachment_url IS NOT DISTINCT FROM $4 AND timestamp > NOW() - INTERVAL '60 seconds' LIMIT 1`,
+        [conversationId, type, content, attachmentUrl]
+      );
+      skipEcho = echo.rows.length > 0;
+      if (skipEcho) logger.info(`Chat ${conversationId}: eco propio duplicado (mismo mensaje de agente en 60 s); no se guarda otra copia.`);
+    }
+    if (!skipEcho) {
+      await client.query(
+        'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, $2, $3, $4, $5, NOW(), $6) ON CONFLICT (external_id) DO NOTHING',
+        [conversationId, sender, type, content, attachmentUrl, externalId]
+      );
+    }
     await client.query('COMMIT');
   } catch (e) {
     try { await client.query('ROLLBACK'); } catch { /* noop */ }
@@ -697,6 +817,96 @@ async function resolveWaPeerPhone(peerId, getContact, name) {
 }
 
 // Descarga la media de un mensaje de WhatsApp Web y la guarda en
+// v5.3.11 — Descarga DEFENSIVA de media, con evaluate propio (no usa
+// `msg.downloadMedia()`). El log de v5.3.10 probó que la normalización del
+// id de v5.3.10 SÍ funcionó (el id ya llega con `_serialized`), pero la
+// descarga SIGUE fallando, ahora con error "t": en la librería
+// (Message.js:513) la búsqueda es `Msg.get(msgId) ||
+/// getMessagesById([msgId])` SIN try/catch alrededor del `Msg.get` — si
+// `Msg.get` LANZA (en vez de devolver undefined), el fallback a
+// `getMessagesById` nunca se ejecuta y todo el evaluate rechaza. Por eso
+// cada paso aquí tiene SU PROPIO try/catch y su línea de log: (a) Msg.get,
+// (b) getMessagesById, (c) escaneo de `Msg.getModelsArray()` buscando el
+// id serializado (mismo patrón que usa la librería para los chats), y solo
+// con el mensaje encontrado se intenta resolver la media y el
+// downloadAndMaybeDecrypt (lógica copiada de Message.js:513-590).
+// Devuelve { data, mimetype, filename, filesize, foundBy, steps } o
+// { error, found, foundBy, steps, mediaStage, hasDirectPath }.
+async function downloadWaMediaFromPage(client, name, idStr) {
+  const pupPage = client?.pupPage;
+  if (!pupPage) return { error: 'sin pupPage en el cliente' };
+  let r;
+  try {
+    r = await pupPage.evaluate(async (msgId) => {
+      const out = { found: false, foundBy: null, steps: [], mediaStage: null, hasDirectPath: false, mimetype: null, data: null, filename: null, filesize: null, error: null };
+      const MsgCol = window.require('WAWebCollections').Msg;
+      let msg = null;
+      // (a) Msg.get con try/catch propio: si lanza, no mata el resto.
+      try {
+        msg = MsgCol.get(msgId) || null;
+        if (msg) out.foundBy = 'get';
+        else out.steps.push('get: null');
+      } catch (e) { out.steps.push('get lanzó: ' + (e && e.message)); }
+      // (b) getMessagesById con try/catch propio.
+      if (!msg) {
+        try {
+          const res = await MsgCol.getMessagesById([msgId]);
+          msg = (res && res.messages && res.messages[0]) || null;
+          if (msg) out.foundBy = 'getMessagesById';
+          else out.steps.push('getMessagesById: sin mensajes');
+        } catch (e) { out.steps.push('getMessagesById lanzó: ' + (e && e.message)); }
+      }
+      // (c) Escaneo de la colección de mensajes por id serializado.
+      if (!msg && typeof MsgCol.getModelsArray === 'function') {
+        try {
+          const arr = MsgCol.getModelsArray();
+          out.steps.push('scan: ' + arr.length + ' mensajes en la colección');
+          for (const m of arr) {
+            const sid = m && m.id && (m.id._serialized || m.id.$1);
+            if (sid === msgId) { msg = m; out.foundBy = 'scan'; break; }
+          }
+          if (!msg) out.steps.push('scan: sin coincidencia');
+        } catch (e) { out.steps.push('scan lanzó: ' + (e && e.message)); }
+      }
+      if (!msg) { out.error = 'mensaje no encontrado en la colección'; return out; }
+      out.found = true;
+      out.mediaStage = (msg.mediaData && msg.mediaData.mediaStage) || null;
+      out.hasDirectPath = !!msg.directPath;
+      out.mimetype = msg.mimetype || null;
+      if (!msg.mediaData || msg.mediaData.mediaStage === 'REUPLOADING') { out.error = 'sin mediaData o REUPLOADING'; return out; }
+      if (msg.mediaData.mediaStage !== 'RESOLVED') {
+        try { await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 }); }
+        catch (e) { out.steps.push('downloadMedia lanzó: ' + (e && e.message)); }
+        out.mediaStage = (msg.mediaData && msg.mediaData.mediaStage) || null;
+      }
+      if ((msg.mediaData.mediaStage || '').includes('ERROR') || msg.mediaData.mediaStage === 'FETCHING') { out.error = 'mediaStage tras resolver: ' + msg.mediaData.mediaStage; return out; }
+      try {
+        const mockQpl = { addAnnotations: function () { return this; }, addPoint: function () { return this; } };
+        const decrypted = await window.require('WAWebDownloadManager').downloadManager.downloadAndMaybeDecrypt({
+          directPath: msg.directPath,
+          encFilehash: msg.encFilehash,
+          filehash: msg.filehash,
+          mediaKey: msg.mediaKey,
+          mediaKeyTimestamp: msg.mediaKeyTimestamp,
+          type: msg.type,
+          signal: new AbortController().signal,
+          downloadQpl: mockQpl,
+        });
+        out.data = await window.WWebJS.arrayBufferToBase64Async(decrypted);
+        out.filename = msg.filename || null;
+        out.filesize = msg.size || null;
+      } catch (e) {
+        if (e && e.status === 404) { out.error = 'descarga 404'; return out; }
+        out.error = 'downloadAndMaybeDecrypt lanzó: ' + (e && e.message);
+      }
+      return out;
+    }, idStr);
+  } catch (e) {
+    return { error: 'evaluate lanzó: ' + (e?.message || e), steps: [] };
+  }
+  return r || { error: 'evaluate devolvió vacío', steps: [] };
+}
+
 // uploads/wa-media/. Devuelve { type, attachmentUrl } en éxito,
 // { failed: true, type } si la descarga falló (el mensaje se guarda solo
 // con la etiqueta, sin descartarse), { tooLarge: true } si el archivo
@@ -707,7 +917,11 @@ async function resolveWaPeerPhone(peerId, getContact, name) {
 // (mensaje + stack + id serializado como JSON + type + from) y se reintenta
 // la descarga UNA vez tras 5 s, porque la librería devuelve undefined sin
 // lanzar cuando la media aún está en FETCHING (tarda en resolverse).
-async function downloadWaMedia(msg, name) {
+// v5.3.11: la descarga ya no usa `msg.downloadMedia()` sino el evaluate
+// defensivo `downloadWaMediaFromPage` (cada paso con su try/catch y su
+// log: encontrado por get / getMessagesById / scan, mediaStage,
+// directPath). El reintento a los 5 s y el tope de 25 MB se mantienen.
+async function downloadWaMedia(msg, name, client) {
   if (!msg.hasMedia) return null;
   // v5.3.10 — La librería busca el mensaje por `this.id._serialized`
   // (Message.js:513) y en producción ese campo viene vacío (la forma
@@ -721,7 +935,10 @@ async function downloadWaMedia(msg, name) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     let media;
     try {
-      media = await msg.downloadMedia();
+      const dl = await downloadWaMediaFromPage(client, name, idStr);
+      logger.info(`WhatsApp ${name}: descarga defensiva intento ${attempt}/2 del mensaje ${idStr || '(sin id)'} (type=${msg.type}): encontrado=${dl?.found ? 'sí' : 'no'} por=${dl?.foundBy || '-'} mediaStage=${dl?.mediaStage || '-'} directPath=${dl?.hasDirectPath ? 'sí' : 'no'}${dl?.steps?.length ? ` pasos=[${dl.steps.join(' | ')}]` : ''}${dl?.error ? ` error=${dl.error}` : ''}`);
+      if (dl?.data) media = { data: dl.data, mimetype: dl.mimetype, filename: dl.filename, filesize: dl.filesize };
+      else media = null;
     } catch (e) {
       const stack = String(e?.stack || '').split('\n').slice(0, 3).join(' | ');
       logger.warn(`WhatsApp ${name}: no se pudo descargar la media del mensaje ${idStr || '(sin id)'} (type=${msg.type} from=${msg.from} id=${idJson}): ${e?.message || e}${stack ? ` | ${stack}` : ''}`);
@@ -776,7 +993,7 @@ async function processWaMessage(msg, opts) {
   let attachmentUrl = null;
   const mediaType = waMediaTypeFromMessage(msg);
   if (mediaType) {
-    const dl = await downloadWaMedia(msg, name);
+    const dl = await downloadWaMedia(msg, name, waClients[id]?.client);
     // v5.3.9: un archivo mayor de 25 MB se sigue descartando con
     // constancia; pero una descarga fallida YA NO descarta el mensaje:
     // se guarda con su type y la etiqueta (📷 Imagen, 🎤 Nota de voz...)

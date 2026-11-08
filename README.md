@@ -1,4 +1,103 @@
-# Purifica Tu Ambiente CRM — v5.3.10 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado)
+# Purifica Tu Ambiente CRM — v5.3.11 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo)
+
+## Enviar y descargar por escaneo de la lista, no por id (v5.3.11, 2026-11-07)
+
+**Primero, la buena noticia de v5.3.10 (log 01:20-01:22 UTC):** la línea
+de arranque dice `PERSIST_DIR=/app/data waDataDir=/app/data
+uploadsDir=/app/data/uploads sesionesGuardadas=4`, se limpiaron 3 locks
+y la instancia llegó a `autenticado` y `está listo!` a los 4 segundos
+SIN pedir QR. La sesión SÍ sobrevive a los despliegues; el QR de la vez
+anterior fue un caso aislado.
+
+**Lo que sigue fallando, con evidencia nueva y decisiva:**
+
+1. **ENVÍO DE TEXTO:** el pre-chequeo `getChatById` LANZA el error de
+   una sola letra "r" para ambos ids (`pre-chequeo del chat
+   265076942618676@lid falló: r`, igual para `@c.us`), y `sendMessage`
+   devuelve undefined ("chat no encontrado"). En la librería:
+   `Client.getChatById` (Client.js:1693) hace `pupPage.evaluate(chatId
+   => window.WWebJS.getChat(chatId))` con `getAsModel=true` por defecto,
+   o sea que pasa por `getChatModel` (que llama `chat.serialize()`,
+   `chat.formattedTitle` y `Msg.get(chat.lastReceivedKey._serialized)`).
+   Y `WWebJS.getChat` (Utils.js:842) hace `Chat.get(chatWid) ||
+   findOrCreateLatestChat(chatWid)` sin try/catch en esa rama.
+2. **DESCARGA DE MEDIA:** la normalización del id de v5.3.10 SÍ
+   funcionó (el log muestra el id con `_serialized` ya presente:
+   `"false_265076942618676@lid_A579..."`), pero la descarga SIGUE
+   fallando, ahora con error "t" en vez de "r". En la librería:
+   `Message.downloadMedia` (Message.js:513) hace
+   `Msg.get(msgId) || getMessagesById([msgId])` SIN try/catch alrededor
+   del `Msg.get` — si `Msg.get` LANZA (en vez de devolver undefined),
+   el fallback a `getMessagesById` nunca se ejecuta y todo el evaluate
+   rechaza con esa letra.
+3. **LA IMAGEN NO SE VE:** la etiqueta "📷 Imagen" aparece
+   (guardado-con-etiqueta funciona), pero la foto no se descarga por el
+   punto 2.
+4. **"CUANDO ENVÍO DESDE EL CRM SALEN 3 MENSAJES":** el log lo explica
+   — en 01:21:05 hay UN POST del CRM ("hola") y DOS eventos
+   `message_create` del teléfono con 39 ms de diferencia (01:21:05.542
+   y 01:21:05.581, mismo "hola") — demasiado rápido para ser dos toques
+   del usuario: la librería emite el mensaje propio dos veces (eco
+   local + versión del servidor, con ids distintos, así que el dedup
+   por external_id no los caza). 1 guardado fallido del CRM + 2 ecos =
+   3 burbujas. El dedup de reintentos fallidos de v5.3.10 SÍ funcionó
+   (log 01:22:15: "intento fallido duplicado (mismo contenido sin
+   enviar en 5 min); no se guarda otra copia").
+5. **ENVÍO DE FOTO desde el CRM:** el banner vuelve al error original
+   del getter ("Data passed to getter must include an id property..."):
+   el envío de media llega más lejos que el de texto (revienta DENTRO
+   del send, en processMediaData o al construir el mensaje) en vez de
+   "chat no encontrado".
+
+**Patrón común probado:** todo lo que busca por id en las colecciones
+de WhatsApp Web falla o lanza para esta identidad LID (Chat.get,
+Msg.get, getChatModel), pero el sistema de eventos entrega los mensajes
+bien y el chat existe. Por eso la estrategia cambia: ESCANEAR las
+colecciones en vez de buscar por id. La propia librería lo hace en
+`getChats` (Utils.js:921: `Chat.getModelsArray()`).
+
+**Correcciones en v5.3.11:**
+
+1. **Envío por escaneo (`sendWaByScan`):** antes de probar los ids por
+   `sendMessage`, UN evaluate escanea
+   `window.require('WAWebCollections').Chat.getModelsArray()` y busca
+   un chat cuyo `id._serialized` o `id.user` contenga los dígitos del
+   LID o del teléfono; el log dice cuántos chats hay en total, cuántos
+   coincidieron y sus ids canónicos (sin contenido de mensajes). Si lo
+   encuentra, envía con ESE objeto chat en el mismo evaluate llamando a
+   `window.WWebJS.sendMessage(chat, content, options)` (replica el
+   cuerpo del evaluate de `Client.sendMessage`, sin el getChat ni el
+   sendSeen, que son los pasos que fallan). Si el escaneo no encuentra
+   el chat, cae al camino actual (LID → @c.us con pre-chequeo) como
+   antes. Si el envío por escaneo devuelve undefined o lanza, registra
+   el error completo y cae al camino actual.
+2. **Descarga defensiva (`downloadWaMediaFromPage`):** ya no usa
+   `msg.downloadMedia()`; es un evaluate propio con cada paso en su
+   propio try/catch y su línea de log: (a) `Msg.get`, (b)
+   `getMessagesById`, (c) escaneo de `Msg.getModelsArray()` por id
+   serializado; con el mensaje encontrado registra `mediaStage`,
+   `directPath` (solo si existe o no) y `mimetype`, y solo entonces
+   intenta resolver la media y el `downloadAndMaybeDecrypt` (lógica
+   copiada de Message.js:513-590). Si todo falla, el mensaje se guarda
+   con etiqueta como hoy. Se mantienen el tope de 25 MB y el reintento
+   a los 5 s.
+3. **Dedup de ecos propios:** en `handleIncomingWhatsApp`, cuando
+   `sender === 'agent'`, no se guarda el mensaje si en los últimos 60
+   segundos ya se guardó uno idéntico en esa misma conversación (mismo
+   type, content y adjunto). Esto caza los dos ecos del mismo mensaje
+   del teléfono, que tienen external_id distinto. No toca el dedup por
+   external_id ni el de fallidos de 5 min.
+
+**Plan de pruebas tras desplegar v5.3.11:**
+
+1. Texto desde el CRM — debe llegar al celular y el log debe decir
+   "chat encontrado por escaneo" (o "mensaje enviado por escaneo").
+2. Foto desde el CRM.
+3. Foto/audio entrante con vista previa (el log debe decir en qué paso
+   se encontró el mensaje: get / getMessagesById / scan).
+4. Enviar "hola" desde el teléfono y verificar que aparece UNA sola
+   vez.
+5. Enviar un texto desde el CRM y verificar que aparece UNA sola vez.
 
 ## El id de mensaje no trae `_serialized`: envío, descarga y duplicados (v5.3.10, 2026-11-07)
 
