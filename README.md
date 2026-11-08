@@ -1,4 +1,65 @@
-# Purifica Tu Ambiente CRM — v5.3.11 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo)
+# Purifica Tu Ambiente CRM — v5.3.12 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma)
+
+## Que un envío que SÍ llegó no se reporte como fallido (v5.3.12, 2026-11-07)
+
+**Lo que reportó el usuario (captura 23:29 local):** "sale ese letrero
+pero esta enviando bien los mensajes" — los mensajes SÍ llegan al
+celular, pero el letrero rojo sigue diciendo "WhatsApp no encontró el
+chat para +573116040943 (se probaron: 265076942618676@lid,
+573116040943@c.us)". Y "lo que sigue con problemas es el multimedia"
+(las fotos siguen saliendo solo como etiqueta "Imagen", sin vista
+previa). El dedup SÍ funciona ahora: "hola" y "." aparecen una sola vez
+cada uno en el chat.
+
+**La causa del letrero falso, probada en la librería:** el
+`sendMessage` inyectado (Utils.js) termina con
+`return Msg.get(newMsgKey._serialized)` — o sea, DESPUÉS de enviar el
+mensaje lo vuelve a buscar en la colección por su id, y ese `Msg.get`
+LANZA para este LID (es el mismo "t"/"r" de los logs anteriores). El
+mensaje ya se envió y llegó, pero la confirmación no se puede
+construir: `Client.sendMessage` devuelve undefined o lanza, y el código
+lo reportaba como fallido. Lo mismo valía para el envío por escaneo de
+v5.3.11 si su evaluate devolvía el modelo (vía `getMessageModel`, que
+llama a `message.serialize()`) en vez del mensaje crudo.
+
+**Correcciones en v5.3.12:**
+
+1. **Éxito por mensaje crudo en el escaneo (`sendWaByScan`):** ya no se
+   llama a `getMessageModel`. Si `WWebJS.sendMessage` devuelve un
+   objeto mensaje (truthy), el envío fue un éxito y el id se saca de
+   `msg.id` (`_serialized` o `$1`). Y si `sendMessage` LANZA, no se da
+   por perdido: se mira el último mensaje del chat (en el mismo
+   evaluate, de `chat.msgs`, sin `Msg.get`) y si es nuestro, reciente
+   (menos de 60 s) y coincide con lo enviado, también es éxito. El log
+   dice "mensaje enviado por escaneo (id: …, verificado por:
+   mensaje-crudo | ultimo-mensaje)".
+2. **Verificación por último mensaje en el respaldo
+   (`verifyWaLastMessage`):** después de que el camino por id (LID ->
+   @c.us) falle, ANTES de reportar el error se escanea el chat y se lee
+   su último mensaje — de `chat.msgs` (la colección en memoria del
+   propio chat) o, si no está ahí, por `chat.lastReceivedKey` buscado
+   DENTRO de `chat.msgs` (la librería usa ese campo en `getChatModel`,
+   Utils.js:982-998, para el último mensaje del chat). Coincide si es
+   nuestro (fromMe), tiene menos de 60 s y su body/caption es el
+   contenido enviado (texto) o su type es el del medio enviado (media
+   sin caption). Si coincide, el envío se reporta como éxito con el id
+   de ese mensaje ("envío verificado por último mensaje") y NO sale el
+   letrero. Solo si la verificación también falla se reporta el error
+   como antes. Aplica a texto Y a media.
+
+**Lo que NO se tocó en v5.3.12:** la descarga defensiva (ya registra
+cada paso; el diagnóstico de la multimedia necesita el log del usuario,
+no otro cambio a ciegas), el dedup de ecos, PERSIST_DIR, el reintento
+transitorio v5.3.8, el mapeo LID/canónico, el guardado-con-etiqueta y la
+auto-restauración.
+
+**Plan de pruebas tras desplegar v5.3.12:**
+
+1. Enviar un TEXTO desde el CRM — debe llegar Y ya no debe salir el
+   letrero.
+2. Enviar una FOTO desde el CRM — igual, sin letrero.
+3. Mandar el log para ver las líneas "descarga defensiva" de la foto
+   entrante (eso dirá en qué paso falla la multimedia).
 
 ## Enviar y descargar por escaneo de la lista, no por id (v5.3.11, 2026-11-07)
 

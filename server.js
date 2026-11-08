@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.11';
+const APP_VERSION = '5.3.12';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -356,6 +356,42 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         if (ser === out.matchedIds[0]) { chat = c; break; }
       }
       if (!chat) { out.error = 'chat no re-encontrado tras el escaneo'; return out; }
+      // v5.3.12 — El envío se confirma por el MENSAJE CRUDO y por el último
+      // mensaje del chat, NUNCA por getMessageModel: el sendMessage inyectado
+      // termina con `Msg.get(newMsgKey._serialized)` (Utils.js) y ese lookup
+      // LANZA para este LID, así que un mensaje que YA se envió se reportaba
+      // como fallido. Por eso: si sendMessage devuelve un mensaje (truthy)
+      // es éxito; si LANZA, no se da por perdido todavía: se mira el último
+      // mensaje del chat (chat.msgs, en memoria, sin Msg.get) y si es nuestro,
+      // reciente y coincide con lo enviado, también es éxito.
+      const lastMsgInfo = (c2) => {
+        try {
+          let arr = null;
+          if (c2.msgs && typeof c2.msgs.getModelsArray === 'function') arr = c2.msgs.getModelsArray();
+          else if (c2.msgs && Array.isArray(c2.msgs.models)) arr = c2.msgs.models;
+          if (arr && arr.length) {
+            const m = arr[arr.length - 1];
+            const mid = m && m.id;
+            return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0 };
+          }
+        } catch (e) { /* sin último mensaje legible */ }
+        return null;
+      };
+      const lastMatches = (info) => {
+        if (!info || !info.fromMe) return false;
+        if (Math.floor(Date.now() / 1000) - (info.t || 0) > 60) return false;
+        if (args.media) {
+          if (args.content && (info.caption === args.content || info.body === args.content)) return true;
+          if (!args.content) {
+            const expected = { image: ['image'], audio: ['audio', 'ptt'], video: ['video'], document: ['document'], sticker: ['sticker'] }[args.mediaType] || [];
+            return expected.indexOf(info.type) !== -1;
+          }
+          return false;
+        }
+        return info.body === args.content;
+      };
+      let sentMsg = null;
+      let sendError = null;
       try {
         const options = {};
         if (args.media) {
@@ -363,21 +399,28 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
           options.caption = args.caption;
           if (args.sendMediaAsDocument) options.sendMediaAsDocument = true;
         }
-        const msg = await window.WWebJS.sendMessage(chat, args.content || '', options);
-        if (!msg) { out.error = 'WWebJS.sendMessage devolvió vacío'; return out; }
-        out.sent = true;
-        try {
-          const model = window.WWebJS.getMessageModel(msg);
-          const mid = model && model.id;
-          out.messageId = typeof mid === 'string' ? mid : (mid && (mid._serialized || mid.$1)) || (msg.id && (msg.id._serialized || msg.id.$1)) || null;
-        } catch (e) {
-          out.messageId = (msg.id && (msg.id._serialized || msg.id.$1)) || null;
-        }
-        return out;
+        sentMsg = await window.WWebJS.sendMessage(chat, args.content || '', options);
       } catch (e) {
-        out.error = (e && e.message) || String(e);
+        sendError = (e && e.message) || String(e);
+      }
+      const last = lastMsgInfo(chat);
+      if (last && lastMatches(last)) {
+        out.sent = true;
+        out.messageId = last.id || (sentMsg && sentMsg.id && (sentMsg.id._serialized || sentMsg.id.$1)) || null;
+        out.verifiedBy = 'ultimo-mensaje';
         return out;
       }
+      if (sentMsg) {
+        // El mensaje crudo existe: el envío salió (la serialización con
+        // getMessageModel es lo que falla para este LID, no el envío).
+        out.sent = true;
+        const mid = sentMsg.id;
+        out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+        out.verifiedBy = 'mensaje-crudo';
+        return out;
+      }
+      out.error = sendError || 'WWebJS.sendMessage devolvió vacío y el último mensaje no coincide';
+      return out;
     }, {
       lidDigits,
       phoneDigits: digits,
@@ -385,6 +428,7 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
       media: media ? { data: media.data, mimetype: media.mimetype, filename: media.filename || 'archivo' } : null,
       caption: content || undefined,
       sendMediaAsDocument: media?.type === 'document',
+      mediaType: media?.type || null,
     });
   } catch (e) {
     logger.warn(`WhatsApp (${target}): escaneo de chats falló: ${e?.message || e}`);
@@ -393,11 +437,112 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
   logger.info(`WhatsApp (${target}): escaneo de chats: ${scan?.totalChats ?? '?'} chats en lista, ${scan?.matchedIds?.length || 0} coincidencias${scan?.matchedIds?.length ? ` (${scan.matchedIds.join(', ')})` : ''}`);
   if (!scan?.found) return { found: false, ok: false };
   if (scan.sent) {
-    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]}`);
+    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'})`);
     return { found: true, ok: true, messageId: scan.messageId || null };
   }
   logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'}`);
   return { found: true, ok: false, error: scan.error || 'El envío por escaneo no devolvió mensaje' };
+}
+
+// v5.3.12 — Verificación por último mensaje: después de que el envío por
+// escaneo y el camino por id (LID -> @c.us) fallen, ANTES de reportar el
+// fallo se comprueba si el mensaje realmente salió. El último mensaje del
+// chat se lee de `chat.msgs` (la colección en memoria del propio chat, sin
+// Msg.get — que es justo lo que lanza para este LID) o, si no está ahí, por
+// `chat.lastReceivedKey` buscado DENTRO de chat.msgs (la librería usa ese
+// campo en getChatModel, Utils.js:982-998, para el último mensaje del chat).
+// Coincide si es nuestro (fromMe), tiene menos de 60 s y su body/caption
+// es el contenido enviado (texto) o su type es el del medio enviado (media
+// sin caption: image->image, audio->audio/ptt, video->video,
+// document->document, sticker->sticker). Devuelve { ok, messageId, reason,
+// last } y nunca lanza.
+async function verifyWaLastMessage(client, target, { digits, lid, content, media }) {
+  const lidDigits = String(lid || '').replace(/@lid$/, '').replace(/\D/g, '');
+  let res;
+  try {
+    res = await client.pupPage.evaluate(async (args) => {
+      const out = { ok: false, messageId: null, reason: null, last: null };
+      let chats = null;
+      try {
+        chats = window.require('WAWebCollections').Chat.getModelsArray();
+      } catch (e) {
+        out.reason = 'escaneo de chats lanzó: ' + (e && e.message);
+        return out;
+      }
+      let chat = null;
+      for (const c of chats || []) {
+        try {
+          const id = c && c.id;
+          const ser = id && (id._serialized || id.$1);
+          const user = id && id.user;
+          if (ser === (args.lidDigits + '@lid') || user === args.lidDigits || ser === (args.phoneDigits + '@c.us') || user === args.phoneDigits) { chat = c; break; }
+        } catch (e) { /* un chat raro no tumba el escaneo */ }
+      }
+      if (!chat) { out.reason = 'chat no encontrado por escaneo'; return out; }
+      // Último mensaje: primero de chat.msgs (en memoria); si no está,
+      // por lastReceivedKey buscado dentro de chat.msgs (sin Msg.get).
+      let last = null;
+      let via = null;
+      try {
+        let arr = null;
+        if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
+        else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
+        if (arr && arr.length) { last = arr[arr.length - 1]; via = 'chat.msgs'; }
+      } catch (e) { /* sin último mensaje legible en chat.msgs */ }
+      if (!last && chat.lastReceivedKey) {
+        try {
+          const ser = chat.lastReceivedKey._serialized || chat.lastReceivedKey.$1;
+          let arr = null;
+          if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
+          else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
+          last = (arr || []).find((m) => { const id = m && m.id; return id && ((id._serialized || id.$1) === ser); }) || null;
+          if (last) via = 'lastReceivedKey-en-chat.msgs';
+        } catch (e) { /* no se pudo resolver el último mensaje */ }
+      }
+      if (!last) { out.reason = 'sin último mensaje legible en el chat'; return out; }
+      const mid = last.id;
+      const fromMe = !!last.fromMe;
+      const body = last.body || '';
+      const caption = last.caption || '';
+      const type = last.type || '';
+      const t = last.t || 0;
+      const now = Math.floor(Date.now() / 1000);
+      const bodyMatch = body === args.content;
+      const captionMatch = caption === args.content;
+      out.last = { fromMe, type, tDelta: now - t, bodyMatch, captionMatch, via };
+      if (!fromMe) { out.reason = 'el último mensaje no es nuestro'; return out; }
+      if (now - t > 60) { out.reason = 'el último mensaje es viejo'; return out; }
+      let match = false;
+      if (args.media) {
+        if (args.content && (captionMatch || bodyMatch)) match = true;
+        else if (!args.content) {
+          const expected = { image: ['image'], audio: ['audio', 'ptt'], video: ['video'], document: ['document'], sticker: ['sticker'] }[args.mediaType] || [];
+          match = expected.indexOf(type) !== -1;
+        }
+      } else {
+        match = bodyMatch;
+      }
+      if (!match) { out.reason = 'el último mensaje no coincide con el enviado'; return out; }
+      out.ok = true;
+      out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+      return out;
+    }, {
+      lidDigits,
+      phoneDigits: digits,
+      content: content || '',
+      media: !!media,
+      mediaType: media?.type || null,
+    });
+  } catch (e) {
+    logger.warn(`WhatsApp (${target}): verificación por último mensaje falló: ${e?.message || e}`);
+    return { ok: false, reason: e?.message || String(e) };
+  }
+  if (res?.ok) {
+    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'})`);
+  } else {
+    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s)`);
+  }
+  return res || { ok: false, reason: 'sin resultado' };
 }
 
 // Envío unificado de WhatsApp. Canal 'meta' -> API oficial de Meta;
@@ -521,6 +666,15 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
     }
     logger.info(`WhatsApp (${target}): mensaje enviado al chat ${chatId}`);
     return { ok: true, channel: 'qr', instance: target, messageId: sent?.id ? waMsgSerializedId(sent) : null };
+  }
+  // v5.3.12 — Verificación por último mensaje ANTES de reportar el fallo:
+  // el escaneo y el camino por id pueden fallar en la confirmación (el
+  // Msg.get final del sendMessage inyectado lanza para este LID) aunque el
+  // mensaje YA llegó al celular. Si el último mensaje del chat es nuestro,
+  // reciente y coincide, el envío fue un éxito y no sale el letrero.
+  const verified = await verifyWaLastMessage(waClients[target].client, target, { digits, lid, content, media }).catch(() => null);
+  if (verified?.ok) {
+    return { ok: true, channel: 'qr', instance: target, messageId: verified.messageId ? waMsgSerializedId({ id: verified.messageId }) : null };
   }
   // Error final claro: si fue "chat no encontrado", listar todos los ids
   // que se probaron, para que el próximo log diga exactamente qué falló.
