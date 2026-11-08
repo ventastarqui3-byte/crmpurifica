@@ -1,4 +1,74 @@
-# Purifica Tu Ambiente CRM — v5.3.7 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido)
+# Purifica Tu Ambiente CRM — v5.3.9 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID)
+
+## Multimedia de WhatsApp para contactos con dirección LID (v5.3.9, 2026-11-07)
+
+**Los dos errores (log real de producción, v5.3.8, 23:54-23:55 UTC):** el
+texto ya funciona en ambos sentidos (entran textos del contacto LID
+`265076942618676@lid` resueltos al número `573116040943` y los enviados
+desde el teléfono aparecen en el CRM vía `message_create`), pero la
+multimedia falla en ambos sentidos:
+
+1. **Saliente (23:54:46):** al enviar una foto desde el CRM, el envío
+   revienta con `Error enviando mensaje via WA Data passed to getter must
+   include an id property (it's how we memoize) but got undefined`
+   (https://static.whatsapp.net/...). El mensaje quedó guardado en el CRM
+   pero NO se envió (banner rojo "Guardado, pero WhatsApp no lo envió").
+2. **Entrante (23:55:27 video, 23:55:36 ptt, 23:55:42 image):** los tres
+   terminan en `no se pudo descargar la media del mensaje : r` — el id
+   del mensaje sale vacío y el error es una sola letra, así que el log no
+   permitía diagnosticar nada. Además `processWaMessage` descartaba el
+   mensaje por completo, así que en el CRM no aparecía ni siquiera que
+   llegó una foto/video/audio.
+
+**Hipótesis (verificada en la librería whatsapp-web.js 1.34.7):** el chat
+de este contacto vive en WhatsApp Web bajo su LID (`265076942618676@lid`)
+y nuestro código siempre lo abordaba por el número (`573116040943@c.us`).
+El `getChat` por `@c.us` no encuentra el chat real y el envío revienta
+dentro de los getters internos de WhatsApp. La librería SÍ soporta chats
+`@lid`: su `sendMessage` inyectado usa el usuario LID como remitente
+cuando `chat.id.isLid()`. No está 100% probado que el texto saliente
+también falle (solo se confirmó texto entrante y enviados desde el
+teléfono): la prueba 1 de abajo lo distingue.
+
+**La corrección (solo `server.js`):**
+
+1. **Mapeo LID→número persistido:** cada vez que `resolveWaPeerPhone`
+   resuelve un `@lid` a un número, el mapeo se guarda en settings
+   (`wa_lid_<dígitos>` = `<lid>@lid`) y en memoria (también en mensajes
+   de solo texto). La escritura es best-effort y nunca rompe el flujo de
+   mensajes.
+2. **Envío por LID con fallback (texto Y media):** `sendWhatsAppMessage`
+   busca el LID guardado para esos dígitos; si existe, envía primero al
+   `<lid>@lid` y, si falla con el error del getter (o el chat no existe),
+   reintenta UNA vez con el `@c.us`, y viceversa. Un error distinto es
+   final. Si la librería devuelve `undefined` (chat no encontrado), ahora
+   se devuelve `ok:false` con un error claro, en vez de `ok:true` con
+   `messageId` null (antes un chat inexistente se reportaba como enviado).
+3. **Descarga entrante robusta:** `downloadWaMedia` registra el error
+   COMPLETO (mensaje + stack + `JSON.stringify(msg.id)` + type + from),
+   reintenta la descarga UNA vez tras 5 s (la librería devuelve
+   `undefined` sin lanzar cuando la media aún está en FETCHING) y, si
+   aun así falla, **ya no descarta el mensaje**: se guarda con su type y
+   la etiqueta (📷 Imagen / 🎤 Nota de voz / 🎬 Video / 📎 Documento) y
+   `attachmentUrl` null, para que la conversación muestre al menos que
+   llegó algo. El tope de 25 MB y el descarte con constancia para archivos
+   demasiado grandes se mantienen.
+
+**Plan de pruebas tras desplegar (en este orden):**
+
+1. Enviar un **TEXTO** desde el CRM a este contacto y verificar que llega
+   al celular (distingue si el problema era solo media o todo lo
+   saliente).
+2. Enviar una **FOTO** desde el CRM y verificar que llega al celular.
+3. Mandar una foto/audio/video **AL** número y verificar que aparece en
+   Mensajes con vista previa.
+4. Responder desde el celular con una foto y verificar que aparece en el
+   CRM.
+
+Si la prueba 1 falla también, el problema saliente no es la media sino
+el chatId, y el log dirá qué chatId se usó en cada intento.
+
+## Reintento automático cuando el arranque de WhatsApp falla por un error transitorio (v5.3.8, 2026-11-07)
 
 Sistema de gestión integral para servicios de limpieza (Bogotá): Dashboard,
 leads y pipeline de ventas, negocios, servicios, clientes, bandeja
@@ -25,6 +95,71 @@ multi-instancia**.
 > Sistema** (solo admin), el vigilante revisa DB y WhatsApp cada 5 min y
 > avisa por **Telegram** cuando algo se rompe o se recupera, y hay respaldo
 > diario automático a las 02:00. Ver "¿Cómo sé si algo se rompió?" más abajo.
+
+## Reintento automático cuando el arranque de WhatsApp falla por un error transitorio (v5.3.8, 2026-11-07)
+
+**El bug exacto (log real de producción, v5.3.7, 23:47:55 UTC):** tras el
+redespliegue con el volumen remontado, la migración funcionó (se limpiaron
+3 SingletonLock obsoletos y la sesión vieja se encontró), pero el arranque
+falló con:
+
+```
+Error inicializando cliente alejo ochoa: ProtocolError: Protocol error
+(Runtime.callFunctionOn): Execution context was destroyed.
+    at Client.inject (whatsapp-web.js/src/Client.js:146)
+    at async Client.initialize (whatsapp-web.js/src/Client.js:493:9)
+```
+
+Es **transitorio**: la página de WhatsApp Web navegó/recargó mientras la
+librería inyectaba su JS y el contexto de ejecución murió. Pero el código
+solo reintentaba si el error era de perfil bloqueado
+(`/profile appears to be in use/i`); para **cualquier otro error** ponía
+la instancia en `'error'` y **cancelaba el vigilante** (`clearWaWatchdog`),
+así que nada reintentó jamás — el log no muestra ningún reintento entre el
+error (23:47:55) y el Reconectar manual (23:52:27). Además el vigilante
+solo actuaba sobre `'authenticated'` o `'initializing'`, nunca sobre
+`'error'`, así que aunque no se hubiera cancelado, tampoco habría actuado.
+
+**La corrección (solo `server.js`):**
+
+1. **Reintento transitorio en el arranque:** si el error del
+   `client.initialize()` coincide con
+   `/Execution context was destroyed|Target closed|Session closed|Protocol error|Failed to launch|Navigation failed|net::ERR|Timeout/i`,
+   se reintenta **hasta 3 veces con espera creciente (10 s, 30 s, 60 s)**,
+   recreando el cliente con `stopWaInstance` + `initWhatsApp`. Los archivos
+   de sesión en disco no se tocan en un inject fallido, así que el reintento
+   restaura la sesión **sin pedir QR nuevo**. Cada intento queda en el log
+   ("reintento 1/3 de arranque de WhatsApp..."). Mientras quedan reintentos,
+   el estado sigue en `'initializing'` y el vigilante NO se cancela.
+2. **El reintento de perfil bloqueado no cambia:** sigue como estaba
+   (funciona: el log mostró los 3 locks limpiados).
+3. **El vigilante ahora también actúa sobre `'error'`:** tras agotar los 3
+   reintentos, la instancia pasa a `'error'` pero el vigilante ya NO se
+   cancela, así que a los 120 s dispara su único reintento automático por
+   arranque (guard `waReadyAutoRetried`). Un fallo de arranque ya no es un
+   callejón sin salida. Sin bucles infinitos: 3 reintentos transitorios por
+   cadena + 1 reintento del vigilante por arranque.
+4. **Los errores NO transitorios** (p. ej. fallos de autenticación) mantienen
+   el comportamiento de siempre: `'error'` + evento en `system_events`, sin
+   reintento, y el vigilante se cancela como antes.
+
+**El endpoint de Reconectar no se tocó** (está bien: `stopWaInstance` +
+`initWhatsApp` con el mismo id/canal). Tras el Reconectar manual del log
+apareció un QR nuevo en vez de reutilizar la sesión guardada; el motivo no
+está en el log y no se investigó aquí — con el reintento automático, ese
+camino manual debería dejar de ser necesario.
+
+### Qué comprobar tras desplegar
+
+1. Que el servicio arranque y `/api/health` diga versión **5.3.8**.
+2. Si la página de WhatsApp Web recarga durante el arranque, el log debe
+   mostrar "reintento 1/3 de arranque de WhatsApp..." y la instancia debe
+   volver a `ready` **sin QR nuevo** y sin tocar Reconectar.
+3. Si los 3 reintentos se agotan, la instancia queda en `'error'` y el
+   vigilante intenta una re-inicialización más a los 120 s (queda en el log
+   y en Estado del Sistema).
+4. En VPS/docker-compose: sin cambios (sin `PERSIST_DIR` todo igual que en
+   la v5.3.7).
 
 ## Un solo volumen en Railway: sesión de WhatsApp + archivos (v5.3.7, 2026-11-07)
 

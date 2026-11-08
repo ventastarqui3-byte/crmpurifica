@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.7';
+const APP_VERSION = '5.3.9';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -368,18 +368,45 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   if (instanceId && waClients[instanceId]?.status === 'ready' && waClients[instanceId].client) target = instanceId;
   else target = Object.keys(waClients).find((k) => waClients[k].status === 'ready' && waClients[k].channel !== 'meta' && waClients[k].client);
   if (!target) return { ok: false, channel: 'qr', error: 'Ninguna instancia de WhatsApp por QR lista' };
-  try {
+  // v5.3.9 — Envío por LID con fallback (texto Y media): el chat de un
+  // contacto LID vive en WhatsApp Web bajo su @lid; enviar al @c.us revienta
+  // en los getters internos ("Data passed to getter must include an id
+  // property..."). La librería SÍ soporta chats @lid (su sendMessage usa
+  // el usuario LID como remitente cuando chat.id.isLid()). Si se conoce el
+  // LID se prueba primero y, si falla con ese error (o el chat no existe),
+  // se reintenta UNA vez con el @c.us, y viceversa. Un error distinto es
+  // final: no se prueba el otro id para no enmascarar el fallo real.
+  const lid = await getWaLidForDigits(digits).catch(() => null);
+  const chatIds = lid ? [lid, `${digits}@c.us`] : [`${digits}@c.us`];
+  const WA_GETTER_ERROR = /must include an id property/i;
+  let lastError = null;
+  for (const chatId of chatIds) {
     let sent;
-    if (media) {
-      const waMedia = new MessageMedia(media.mimetype, media.data, media.filename || 'archivo');
-      sent = await waClients[target].client.sendMessage(`${digits}@c.us`, waMedia, { caption: content || undefined, sendMediaAsDocument: media.type === 'document' });
-    } else {
-      sent = await waClients[target].client.sendMessage(`${digits}@c.us`, content);
+    try {
+      if (media) {
+        const waMedia = new MessageMedia(media.mimetype, media.data, media.filename || 'archivo');
+        sent = await waClients[target].client.sendMessage(chatId, waMedia, { caption: content || undefined, sendMediaAsDocument: media.type === 'document' });
+      } else {
+        sent = await waClients[target].client.sendMessage(chatId, content);
+      }
+    } catch (e) {
+      lastError = e;
+      const m = e?.message || String(e);
+      logger.warn(`WhatsApp (${target}): envío al chat ${chatId} falló: ${m}`);
+      if (!WA_GETTER_ERROR.test(m)) break; // otro error: probar el otro id no ayudaría
+      continue; // error del getter: probar con el otro chatId
     }
+    if (!sent) {
+      // La librería devuelve undefined cuando getChat no encontró el chat:
+      // antes se reportaba como enviado (ok:true, messageId null).
+      lastError = new Error(`WhatsApp no encontró el chat ${chatId}`);
+      logger.warn(`WhatsApp (${target}): la librería devolvió undefined al enviar al chat ${chatId} (chat no encontrado)`);
+      continue; // probar con el otro chatId, si lo hay
+    }
+    logger.info(`WhatsApp (${target}): mensaje enviado al chat ${chatId}`);
     return { ok: true, channel: 'qr', instance: target, messageId: sent?.id?._serialized || null };
-  } catch (e) {
-    return { ok: false, channel: 'qr', error: e.message };
   }
+  return { ok: false, channel: 'qr', error: lastError?.message || 'No se pudo enviar el mensaje' };
 }
 
 // Entrada de mensajes: la MISMA lógica para el QR (whatsapp-web.js) y para
@@ -525,6 +552,38 @@ async function getPublicBaseUrl() {
   return '';
 }
 
+// v5.3.9 — Mapeo LID→número persistido.
+// En producción el chat de un contacto LID vive en WhatsApp Web bajo su
+// @lid (265076942618676@lid) y abordarlo por el número (@c.us) revienta
+// dentro de los getters internos de WhatsApp ("Data passed to getter must
+// include an id property (it's how we memoize) but got undefined").
+// Cada vez que un mensaje LID se resuelve a un número, el mapeo se guarda
+// en settings (wa_lid_<dígitos> = <lid>@lid) y en memoria, para que el
+// envío use el LID. La escritura es best-effort y nunca rompe el flujo de
+// mensajes: si la DB no está disponible, queda solo en memoria y se
+// re-aprende con el próximo mensaje del contacto.
+const waLidByDigits = new Map(); // dígitos -> '2650...@lid'
+async function saveWaLidMapping(digits, lid) {
+  const d = String(digits || '').replace(/\D/g, '');
+  const l = String(lid || '').trim();
+  if (!d || !/^\d+@lid$/.test(l)) return;
+  waLidByDigits.set(d, l);
+  try {
+    await pool.query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [`wa_lid_${d}`, l]);
+  } catch { /* solo memoria: se re-aprende con el próximo mensaje */ }
+}
+async function getWaLidForDigits(digits) {
+  const d = String(digits || '').replace(/\D/g, '');
+  if (!d) return null;
+  if (waLidByDigits.has(d)) return waLidByDigits.get(d);
+  try {
+    const v = await getSettingValue(`wa_lid_${d}`, '');
+    const l = String(v || '').trim();
+    if (/^\d+@lid$/.test(l)) { waLidByDigits.set(d, l); return l; }
+  } catch { /* sin mapeo guardado */ }
+  return null;
+}
+
 // Resuelve el teléfono del interlocutor de un mensaje de WhatsApp Web.
 // peerId es msg.from (entrante) o msg.to (enviado desde el teléfono).
 // getContact es la forma de pedir el contacto: entrante usa msg.getContact()
@@ -548,6 +607,10 @@ async function resolveWaPeerPhone(peerId, getContact, name) {
       const candidate = candidates.find((c) => c && c !== lidDigits && /^\d{7,15}$/.test(c));
       if (candidate) {
         logger.info(`WhatsApp ${name}: remitente LID ${raw} resuelto al número ${candidate}`);
+        // v5.3.9: persistir el mapeo LID→número (también en mensajes de
+        // solo texto) para que el envío use el LID. Sin await: best-effort,
+        // la promesa nunca rechaza (el upsert lleva su propio try/catch).
+        saveWaLidMapping(candidate, raw);
         return { phone: candidate, senderName };
       }
       logger.warn(`WhatsApp ${name}: no se pudo resolver el número del remitente LID ${raw} (contacto id=${idSerialized || 'desconocido'} number=${numberField || 'vacío'}); mensaje descartado.`);
@@ -562,36 +625,56 @@ async function resolveWaPeerPhone(peerId, getContact, name) {
 }
 
 // Descarga la media de un mensaje de WhatsApp Web y la guarda en
-// uploads/wa-media/. Devuelve { type, attachmentUrl } o null (sin media,
-// descarga fallida o archivo mayor de 25 MB — en ese caso deja constancia
-// en el log y no tumba nada).
+// uploads/wa-media/. Devuelve { type, attachmentUrl } en éxito,
+// { failed: true, type } si la descarga falló (el mensaje se guarda solo
+// con la etiqueta, sin descartarse), { tooLarge: true } si el archivo
+// supera 25 MB (ese sí se descarta, con constancia en el log), o null si
+// no hay media. v5.3.9: el log de v5.3.6 solo mostraba "no se pudo
+// descargar la media del mensaje : r" (id vacío, error de una letra) y era
+// imposible diagnosticar nada; ahora se registra el error completo
+// (mensaje + stack + id serializado como JSON + type + from) y se reintenta
+// la descarga UNA vez tras 5 s, porque la librería devuelve undefined sin
+// lanzar cuando la media aún está en FETCHING (tarda en resolverse).
 async function downloadWaMedia(msg, name) {
   if (!msg.hasMedia) return null;
-  let media;
-  try {
-    media = await msg.downloadMedia();
-  } catch (e) {
-    logger.warn(`WhatsApp ${name}: no se pudo descargar la media del mensaje ${msg.id?._serialized || ''}: ${e?.message || e}`);
-    return null;
+  const idStr = (() => { try { return String(msg.id?._serialized || ''); } catch { return ''; } })();
+  const idJson = (() => { try { return JSON.stringify(msg.id); } catch { return 'no-serializable'; } })();
+  const type = waMediaTypeFromMessage(msg) || 'document';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let media;
+    try {
+      media = await msg.downloadMedia();
+    } catch (e) {
+      const stack = String(e?.stack || '').split('\n').slice(0, 3).join(' | ');
+      logger.warn(`WhatsApp ${name}: no se pudo descargar la media del mensaje ${idStr || '(sin id)'} (type=${msg.type} from=${msg.from} id=${idJson}): ${e?.message || e}${stack ? ` | ${stack}` : ''}`);
+      media = null;
+    }
+    if (media?.data) {
+      const size = Math.ceil((media.data.length * 3) / 4);
+      if (size > WA_MEDIA_MAX_BYTES) {
+        logger.warn(`WhatsApp ${name}: media de ${Math.round(size / 1024 / 1024)} MB supera el tope de 25 MB; mensaje descartado.`);
+        return { tooLarge: true };
+      }
+      const dlType = waMediaTypeFromMessage(msg) || waMediaTypeFromMime(media.mimetype);
+      const ext = waMediaExtFromMime(media.mimetype, media.filename);
+      const safeId = String(msg.id?._serialized || `${Date.now()}`).replace(/[^A-Za-z0-9]/g, '_');
+      const filename = `${safeId}.${ext}`;
+      try {
+        fs.mkdirSync(waMediaDir(), { recursive: true });
+        fs.writeFileSync(path.join(waMediaDir(), filename), Buffer.from(media.data, 'base64'));
+      } catch (e) {
+        logger.error(`WhatsApp ${name}: no se pudo guardar la media en disco`, e?.message || e);
+        return { failed: true, type: dlType };
+      }
+      return { type: dlType, attachmentUrl: `/uploads/wa-media/${filename}` };
+    }
+    if (attempt === 1) {
+      logger.info(`WhatsApp ${name}: descarga de media sin datos (intento 1/2, type=${msg.type}); reintentando en 5 s.`);
+      await sleep(5000);
+    }
   }
-  if (!media?.data) return null;
-  const size = Math.ceil((media.data.length * 3) / 4);
-  if (size > WA_MEDIA_MAX_BYTES) {
-    logger.warn(`WhatsApp ${name}: media de ${Math.round(size / 1024 / 1024)} MB supera el tope de 25 MB; mensaje descartado.`);
-    return { tooLarge: true };
-  }
-  const type = waMediaTypeFromMessage(msg) || waMediaTypeFromMime(media.mimetype);
-  const ext = waMediaExtFromMime(media.mimetype, media.filename);
-  const safeId = String(msg.id?._serialized || `${Date.now()}`).replace(/[^A-Za-z0-9]/g, '_');
-  const filename = `${safeId}.${ext}`;
-  try {
-    fs.mkdirSync(waMediaDir(), { recursive: true });
-    fs.writeFileSync(path.join(waMediaDir(), filename), Buffer.from(media.data, 'base64'));
-  } catch (e) {
-    logger.error(`WhatsApp ${name}: no se pudo guardar la media en disco`, e?.message || e);
-    return null;
-  }
-  return { type, attachmentUrl: `/uploads/wa-media/${filename}` };
+  logger.warn(`WhatsApp ${name}: la media del mensaje ${idStr || '(sin id)'} (type=${msg.type}) no se pudo descargar tras 2 intentos; el mensaje se guarda solo con la etiqueta.`);
+  return { failed: true, type };
 }
 
 // Procesa UN mensaje de WhatsApp Web (entrante o enviado desde el teléfono)
@@ -611,9 +694,21 @@ async function processWaMessage(msg, opts) {
   const mediaType = waMediaTypeFromMessage(msg);
   if (mediaType) {
     const dl = await downloadWaMedia(msg, name);
-    if (!dl || dl.tooLarge) return false;
-    type = dl.type;
-    attachmentUrl = dl.attachmentUrl;
+    // v5.3.9: un archivo mayor de 25 MB se sigue descartando con
+    // constancia; pero una descarga fallida YA NO descarta el mensaje:
+    // se guarda con su type y la etiqueta (📷 Imagen, 🎤 Nota de voz...)
+    // para que la conversación muestre al menos que llegó algo.
+    if (dl && dl.tooLarge) return false;
+    if (!dl) {
+      type = mediaType;
+      attachmentUrl = null;
+    } else if (dl.failed) {
+      type = dl.type;
+      attachmentUrl = null;
+    } else {
+      type = dl.type;
+      attachmentUrl = dl.attachmentUrl;
+    }
     if (!content) content = WA_MEDIA_LABELS[type] || '📎 Archivo';
   } else if (msg.type !== 'chat') {
     return false;
@@ -670,6 +765,25 @@ const waClients = {}; // Almacén de instancias activas
 //  (3) el servidor no restauraba las instancias al arrancar.
 const waReadyAutoRetried = new Set(); // 1 reintento automático por instancia y arranque
 let waWatchdogSeq = 0; // generación del vigilante: ignora temporizadores viejos
+
+// v5.3.8 — Reintento automático por error TRANSITORIO de arranque.
+// En producción (log real v5.3.7, 23:47:55 UTC) el arranque falló con
+// "ProtocolError: Protocol error (Runtime.callFunctionOn): Execution
+// context was destroyed" en Client.inject: la página de WhatsApp Web
+// navegó/recargó mientras la librería inyectaba su JS y el contexto de
+// ejecución murió. Es transitorio: reintentando, la sesión guardada se
+// restaura sin pedir QR nuevo. Se reintenta hasta 3 veces con espera
+// creciente (10 s, 30 s, 60 s). El contador vive fuera de initWhatsApp
+// porque cada reintento recrea la instancia (nuevo closure); se reinicia
+// en cada arranque "fresco" (restaurar al boot, Reconectar manual, cambio
+// de canal, reintento del vigilante) y al llegar a 'ready'. Los errores NO
+// transitorios (p. ej. fallos de autenticación) no reintentan.
+const WA_TRANSIENT_RETRY_DELAYS = [10000, 30000, 60000];
+const WA_TRANSIENT_ERROR = /Execution context was destroyed|Target closed|Session closed|Protocol error|Failed to launch|Navigation failed|net::ERR|Timeout/i;
+const waTransientAttempts = {}; // id -> reintentos transitorios hechos en la cadena actual
+function isTransientWaError(detail) {
+  return WA_TRANSIENT_ERROR.test(String(detail || ''));
+}
 
 function clearWaWatchdog(id) {
   const t = waClients[id]?.readyWatchdog;
@@ -749,6 +863,11 @@ async function stopWaInstance(id) {
 // ese reintento, solo deja el estado visible para que el admin reconecte
 // a mano. El token de generación evita que un temporizador viejo actúe
 // sobre una instancia nueva con el mismo id.
+// v5.3.8: el vigilante también actúa sobre 'error' por arranque fallido
+// (tras agotar los 3 reintentos transitorios, el catch ya no lo cancela):
+// un fallo de arranque no es nunca un callejón sin salida. Los errores
+// NO transitorios siguen cancelando el vigilante en el catch, así que
+// sobre esos no hay reintento.
 function armReadyWatchdog(id, name) {
   const entry = waClients[id];
   if (!entry || (entry.channel || 'qr') !== 'qr') return;
@@ -758,8 +877,10 @@ function armReadyWatchdog(id, name) {
   entry.readyWatchdog = setTimeout(async () => {
     const cur = waClients[id];
     if (!cur || cur.watchdogSeq !== seq) return; // instancia reemplazada o borrada
-    if (!['authenticated', 'initializing'].includes(cur.status)) return;
-    const msg = `WhatsApp ${name} autenticado pero sin quedar listo después de 120 s (estado: ${cur.status}). Se intenta una re-inicialización automática.`;
+    if (!['authenticated', 'initializing', 'error'].includes(cur.status)) return;
+    const msg = cur.status === 'error'
+      ? `WhatsApp ${name} quedó en error tras fallar el arranque. Se intenta una re-inicialización automática.`
+      : `WhatsApp ${name} autenticado pero sin quedar listo después de 120 s (estado: ${cur.status}). Se intenta una re-inicialización automática.`;
     logger.warn(msg);
     await recordEvent('warn', 'whatsapp', msg, { instance: id, status: cur.status });
     if (waReadyAutoRetried.has(id)) {
@@ -812,7 +933,7 @@ async function restoreWhatsAppInstances() {
   }
 }
 
-const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
+const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry = false) => {
   // v5.3.4: si ya existe una instancia en memoria, se ignora la llamada
   // pero se deja constancia de quién la hizo (el 'authenticated' x5 del
   // log de producción se investigó y NO era esto: es la librería, que
@@ -822,6 +943,11 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
     logger.warn(`initWhatsApp(${id}): ya existe una instancia en memoria (estado: ${waClients[id].status}, canal: ${waClients[id].channel || 'qr'}); se ignora la llamada.`);
     return;
   }
+  // v5.3.8: un arranque fresco (restaurar al boot, Reconectar manual,
+  // cambio de canal, reintento del vigilante) abre una cadena nueva de
+  // reintentos transitorios. El reintento automático NO reinicia el
+  // contador, o la cadena no terminaría nunca.
+  if (!isAutoRetry) waTransientAttempts[id] = 0;
   channel = channel === 'meta' ? 'meta' : 'qr';
 
   // Instancia Meta (Cloud API): no hay navegador ni QR que escanear, solo
@@ -909,6 +1035,7 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
     if (!isCurrent()) return;
     logger.info(`WhatsApp ${name} está listo!`);
     clearWaWatchdog(id);
+    waTransientAttempts[id] = 0; // v5.3.8: cadena de reintentos cerrada con éxito
     waClients[id].status = 'ready';
     waClients[id].qr = null;
     waClients[id].lastSeen = new Date().toISOString();
@@ -1025,7 +1152,49 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr') => {
         startClient();
         return;
       }
-      clearWaWatchdog(id);
+      // v5.3.8 — Reintento por error TRANSITORIO de arranque. Log real de
+      // producción (v5.3.7, 23:47:55 UTC): "ProtocolError: Protocol error
+      // (Runtime.callFunctionOn): Execution context was destroyed" en
+      // Client.inject durante Client.initialize — la página de WhatsApp
+      // Web navegó/recargó mientras la librería inyectaba su JS y el
+      // contexto de ejecución murió. Antes, cualquier error que no fuera
+      // de perfil bloqueado ponía la instancia en 'error' y cancelaba el
+      // vigilante: nada reintentaba jamás y solo quedaba el Reconectar
+      // manual. Ahora se reintenta hasta 3 veces con espera creciente
+      // (10 s, 30 s, 60 s), recreando el cliente con stopWaInstance +
+      // initWhatsApp; los archivos de sesión en disco no se tocan en un
+      // inject fallido, así que el reintento restaura la sesión sin pedir
+      // QR nuevo. Mientras quedan reintentos, el estado sigue en
+      // 'initializing' y el vigilante NO se cancela. Solo al agotar los 3
+      // intentos la instancia pasa a 'error' — y el vigilante (que ahora
+      // también actúa sobre 'error') intentará una re-inicialización más.
+      if (isTransientWaError(detail)) {
+        const done = waTransientAttempts[id] || 0;
+        if (done < WA_TRANSIENT_RETRY_DELAYS.length) {
+          const delay = WA_TRANSIENT_RETRY_DELAYS[done];
+          waTransientAttempts[id] = done + 1;
+          logger.warn(`WhatsApp ${name}: arranque fallido por error transitorio (${err?.message || err}); reintento ${done + 1}/3 en ${delay / 1000} s.`);
+          const timer = setTimeout(async () => {
+            const cur = waClients[id];
+            if (!cur || cur.client !== client) return; // borrada o reemplazada entretanto (p. ej. Reconectar manual)
+            try {
+              await stopWaInstance(id);
+              await initWhatsApp(id, name, 'qr', true);
+            } catch (e) {
+              logger.error(`WhatsApp ${name}: falló el reintento automático de arranque`, e);
+            }
+          }, delay);
+          if (timer.unref) timer.unref();
+          return;
+        }
+        logger.warn(`WhatsApp ${name}: se agotaron los 3 reintentos automáticos por error transitorio; queda en 'error' y el vigilante intentará una re-inicialización más.`);
+        // NO se cancela el vigilante: con estado 'error' el vigilante de
+        // v5.3.8 dispara su único reintento automático por arranque.
+      } else {
+        // Error NO transitorio (p. ej. fallo de autenticación): se mantiene
+        // el comportamiento de siempre — 'error' + evento, sin reintento.
+        clearWaWatchdog(id);
+      }
       logger.error(`Error inicializando cliente ${name}: ${detail}`);
       waClients[id].status = 'error';
       recordEvent('error', 'whatsapp', `No se pudo iniciar WhatsApp (${name}): ${err?.message || err}`, { instance: id });
