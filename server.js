@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.21';
+const APP_VERSION = '5.3.22';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -439,6 +439,52 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         }
         return info.body === args.content;
       };
+      // v5.3.22 — Separar PREPARACIÓN de ENVÍO: el sendMessage inyectado
+      // hace las dos cosas en una sola llamada (processMediaData: crear el
+      // archivo, prepRawMedia, subida MMS; y luego addAndSendMsgToChat /
+      // construcción del mensaje / Msg.get), así que el error opaco del
+      // getter no decía en cuál de las dos fallaba. La 5.3.21 probó que el
+      // LID de la cuenta SÍ está resuelto (53786529792040@lid) y que el
+      // reintento como documento falla con el mismo error y stack, así que
+      // la vista previa no es el problema. Aquí se llama a
+      // processMediaData POR SEPARADO, con las mismas opciones del envío
+      // normal. Si la preparación FALLA, no se intenta el sendMessage ni
+      // el reintento como documento (fallarían igual) y se devuelve el
+      // error de la preparación. Si sale BIEN, se sigue con el sendMessage
+      // normal (que sube el medio una segunda vez: costo del diagnóstico).
+      // El camino de texto (sin media) no pasa por aquí.
+      if (args.media) {
+        try {
+          const prepData = await window.WWebJS.processMediaData(args.media, {
+            forceSticker: false,
+            forceGif: false,
+            forceVoice: false,
+            forceDocument: !!args.sendMediaAsDocument,
+            forceMediaHd: false,
+            sendToChannel: false,
+            sendToStatus: false,
+          });
+          let prepInfo = {};
+          try {
+            prepInfo = {
+              type: prepData ? prepData.type : null,
+              mimetype: prepData ? prepData.mimetype : null,
+              hasFilehash: !!(prepData && prepData.filehash),
+              size: prepData ? prepData.size : null,
+            };
+          } catch (e) { prepInfo = {}; }
+          out.prep = { ok: true, ...prepInfo };
+        } catch (e) {
+          out.prep = {
+            ok: false,
+            error: (e && e.message) || String(e),
+            stack: (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null),
+          };
+          out.prepFailed = true;
+          out.error = 'processMediaData falló: ' + out.prep.error;
+          return out;
+        }
+      }
       let sentMsg = null;
       let sendError = null;
       let sendStack = null;
@@ -455,7 +501,9 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         // v5.3.21 — El mensaje del error es opaco ("Data passed to
         // getter..."); el stack dice en qué paso dentro de la página
         // falló (processMediaData, addAndSendMsgToChat o el Msg.get final).
-        sendStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' | ') : null);
+        // v5.3.22 — el stack se recorta a 10 líneas, no a 3: el log de la
+        // 5.3.21 solo mostró 2 frames (s e I) y no se veía nada debajo.
+        sendStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null);
       }
       const recent = recentMsgsInfo(chat);
       const hit = [...recent].reverse().find(lastMatches);
@@ -489,7 +537,7 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
           retryMsg = await window.WWebJS.sendMessage(chat, args.content || '', { media: args.media, caption: args.caption, sendMediaAsDocument: true });
         } catch (e) {
           retryError = (e && e.message) || String(e);
-          retryStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' | ') : null);
+          retryStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null);
         }
         const recent2 = recentMsgsInfo(chat);
         const hit2 = [...recent2].reverse().find(lastMatches);
@@ -535,7 +583,11 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
     logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'}${scan.retriedAsDocument ? ', tras reintento como documento' : ''})`);
     return { found: true, ok: true, messageId: scan.messageId || null };
   }
-  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'} (LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}${scan.sendStack ? `; stack: ${scan.sendStack}` : ''}${scan.retriedAsDocument ? `; reintento como documento: ${scan.retryError || 'sin error'}${scan.retryStack ? `; stack: ${scan.retryStack}` : ''}` : ''})`);
+  // v5.3.22 — La línea de fallo incluye el resultado de la preparación
+  // por separado: OK (type/mimetype/filehash) o FALLÓ (error + stack).
+  // Sin media (texto) no hay preparación y no se añade nada.
+  const prepTxt = scan.prep ? (scan.prep.ok ? `; preparación: OK (type=${scan.prep.type || '?'}; mimetype=${scan.prep.mimetype || '?'}; filehash=${scan.prep.hasFilehash ? 'sí' : 'no'})` : `; preparación: FALLÓ (${scan.prep.error || 'sin error'}${scan.prep.stack ? `; stack: ${scan.prep.stack}` : ''})`) : '';
+  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'} (LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}${prepTxt}${scan.sendStack ? `; stack: ${scan.sendStack}` : ''}${scan.retriedAsDocument ? `; reintento como documento: ${scan.retryError || 'sin error'}${scan.retryStack ? `; stack: ${scan.retryStack}` : ''}` : ''})`);
   return { found: true, ok: false, error: scan.error || 'El envío por escaneo no devolvió mensaje' };
 }
 

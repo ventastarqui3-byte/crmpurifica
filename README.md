@@ -1,4 +1,29 @@
-# Purifica Tu Ambiente CRM — v5.3.21 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia)
+# Purifica Tu Ambiente CRM — v5.3.22 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia)
+
+## Separación preparación/envío de multimedia (v5.3.22, 2026-11-08)
+
+**Qué probó el log de la 5.3.21 (2026-11-08, 15:03–15:09 UTC):** la 5.3.21 está en vivo y su diagnóstico funcionó: el log mostró el medio (image/webp 42 KB, image/jpeg 331 KB, video/mp4 1938 KB — archivos normales), el LID de la cuenta y el stack. El **LID de la cuenta SÍ está resuelto: 53786529792040@lid; yo: 573222468509@c.us** — esa hipótesis queda descartada (la clave del mensaje nuevo sale con `from` válido). El **reintento como documento TAMBIÉN falló con el error y el stack idénticos** (mismo `s` en gXHQbmRh8og.js:85:180 llamado desde `I` en el bundle es_LA ...js:4915:5475) — así que NO es la vista previa/miniatura de la foto o el video. El texto plano desde el CRM SÍ se envía (verificado por último-mensaje) y recibir multimedia SÍ funciona (imagen y video entrantes se descargaron bien, mediaStage=RESOLVED, directPath=sí). El fallo es idéntico para imagen y video, en escaneo (normal y documento) y en los dos caminos por id (LID y @c.us). El stack actual solo mostró 2 frames porque se recortó a 3 líneas.
+
+**Qué separa este diagnóstico (preparación vs envío):** el `sendMessage` inyectado de WhatsApp Web hace dos cosas en una sola llamada: primero `processMediaData` (crear el archivo desde el base64, `prepRawMedia`, subida MMS a los servidores de WhatsApp) y luego la construcción del mensaje + `addAndSendMsgToChat` + el `Msg.get` final. El error opaco del getter no decía en cuál de las dos fallaba. En esta versión, el envío por escaneo llama a `window.WWebJS.processMediaData` **POR SEPARADO, antes** del `sendMessage`, con las mismas opciones del envío normal (forceSticker:false, forceGif:false, forceVoice:false, forceDocument: igual que el envío, forceMediaHd:false, sendToChannel:false, sendToStatus:false), dentro de su propio try/catch. El camino de texto (sin media) no hace esta preparación ni se toca.
+
+**Qué significa cada resultado posible:**
+
+- **Si falla `processMediaData`:** el problema está en la preparación o la subida MMS del medio (crear el archivo, la preparación del medio crudo o la subida a los servidores de WhatsApp). En ese caso NO se intenta el `sendMessage` ni el reintento como documento (fallarían igual) y el log dice `processMediaData falló: <mensaje>` con su stack de hasta 10 líneas. El error del envío pasa a ser ese.
+- **Si la preparación sale BIEN y falla el envío:** la preparación y la subida MMS funcionan; el problema está en la construcción del mensaje o en el `addAndSendMsgToChat` (o en el `Msg.get` final, aunque ese ya no debería ser porque el texto sí se envía y llega). El log dice `preparación: OK (type=...; mimetype=...; filehash=sí/no)` y luego el error del envío con su stack de hasta 10 líneas.
+
+**Otros cambios en esta versión:**
+
+- El stack capturado pasa de 3 a 10 líneas en el error del envío (`sendStack`) y en el del reintento como documento (`retryStack`): el log de la 5.3.21 solo mostró 2 frames (`s` e `I`) y no se veía nada debajo de `I`.
+- La línea de log "envío por escaneo ... falló:" incluye ahora el resultado de la preparación (OK con type/mimetype/filehash, o FALLÓ con su error y stack) además del LID y el stack del envío.
+- El reintento como documento sigue existiendo (solo en el camino de escaneo, solo para image/video): salta cuando la preparación sale bien pero el envío normal falla con el error del getter. No hay reintento como documento en el camino por id.
+
+**Costo del diagnóstico (doble subida):** cuando la preparación por separado sale bien, el `sendMessage` normal vuelve a llamar a `processMediaData` por dentro, así que el medio se sube a los servidores de WhatsApp **dos veces** en ese caso (una en la preparación de diagnóstico y otra en el envío). Es el precio de separar las dos fases; cuando el diagnóstico diga en qué fase está el fallo, se podrá quitar la llamada extra. Si la preparación falla, no hay doble subida porque no se intenta el envío.
+
+**Plan de pruebas tras desplegar v5.3.22:**
+
+1. Una foto desde Mensajes y ver si llega (normal o como documento).
+2. Un video desde Mensajes, o reintentar la campaña del video, y ver si llega.
+3. Mandar el log con la línea de preparación: ahí debe decir si `processMediaData` salió OK o FALLÓ (con su stack de hasta 10 líneas), y si el envío falló después, con su propio stack.
 
 ## Envío saliente de multimedia: diagnóstico y reintento como documento (v5.3.21, 2026-11-08)
 
