@@ -1,4 +1,89 @@
-# Purifica Tu Ambiente CRM — v5.3.9 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID)
+# Purifica Tu Ambiente CRM — v5.3.10 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado)
+
+## El id de mensaje no trae `_serialized`: envío, descarga y duplicados (v5.3.10, 2026-11-07)
+
+**Lo que pasó en producción con v5.3.9 (log 00:39-00:44 UTC):** la
+instancia arrancó pidiendo QR (la sesión NO se restauró al arrancar; el
+usuario tuvo que darle a Reconectar y volver a escanear; autenticado
+00:42:57, listo 00:42:58). Al probar, tres problemas:
+
+1. **EL LETRERO SIGUE:** "WhatsApp no encontró el chat
+   `573116040943@c.us`". Y el LID tampoco bastó: el log muestra que el
+   envío por LID también devuelve undefined (`la librería devolvió
+   undefined al enviar al chat 265076942618676@lid`) y luego lo mismo con
+   `@c.us`. O sea que `window.WWebJS.getChat` devuelve null para AMBOS
+   ids. El mapeo LID sí se guardó (el segundo intento ya probó el LID
+   primero), pero no bastó.
+2. **DUPLICADOS:** "hola" x4 y "holmo" x3 en el chat. Mecanismo: (a) cada
+   intento fallido desde el CRM se guarda igual, así que cada reintento
+   del usuario es una burbuja más; (b) el evento `message_create` se
+   dispara DOS veces por el mismo mensaje del teléfono (00:43:24.189 y
+   00:43:24.211, "hola" dos veces con 22 ms de diferencia) y AMBAS se
+   guardan porque el dedup por `external_id` no funciona: el external_id
+   queda NULL.
+3. **LA MEDIA SALE SOLO COMO ICONO:** las etiquetas "📷 Imagen" y
+   "🎤 Nota de voz" sí aparecen (el guardado-con-etiqueta de v5.3.9
+   funciona), pero sin la foto ni el audio. La descarga sigue fallando.
+
+**La causa raíz común, probada por el log completo:** el id del mensaje
+NO trae `_serialized`. La línea de descarga muestra el id crudo:
+`{"fromMe":true,"remote":"265076942618676@lid","id":"AC426D0F43A9E3C1CEA515495A4EFC45","$1":"true_265076942618676@lid_AC426D0F43A9E3C1CEA515495A4EFC45"}`
+— la forma serializada está en `$1`, no en `_serialized`. Por eso:
+(a) `msg.downloadMedia()` falla, porque la librería busca el mensaje por
+`this.id._serialized` (undefined) — el error que llega es una "r" (el
+evaluate de puppeteer rechaza con ese valor); (b)
+`externalId: msg.id?._serialized || null` queda NULL y el
+`ON CONFLICT (external_id) DO NOTHING` nunca deduplica (los NULL no
+chocan); (c) el `messageId` de los envíos también queda NULL.
+En la librería (whatsapp-web.js 1.34.7): `Client.sendMessage` hace
+`window.WWebJS.getChat(chatId, {getAsModel:false})` y `if (!chat) return
+null;` — por eso un chat no encontrado se veía como undefined.
+`WWebJS.getChat` usa `Chat.get(chatWid) || findOrCreateLatestChat(chatWid)`.
+Y `Message.getChat()` es `getChatById(this.fromMe ? this.to : this.from)`
+(Message.js:388, `_getChatId` :347-349): el id canónico del chat 1:1 ES
+el id del interlocutor.
+
+**Correcciones en v5.3.10:**
+
+1. **Normalización del id (`waMsgSerializedId`):**
+   `msg.id?._serialized || msg.id?.$1 || fromMe_remote_id`. Se usa en
+   todos los sitios que hoy usan `msg.id?._serialized`: en
+   `downloadWaMedia` se asigna `msg.id._serialized` ANTES de llamar
+   `msg.downloadMedia()` (para que la librería busque con el id
+   correcto), en el `externalId` de `processWaMessage` (el dedup por
+   external_id vuelve a funcionar para los `message_create` duplicados),
+   en el `messageId` de `sendWhatsAppMessage` y en los logs de descarga.
+2. **Id canónico del chat desde el tráfico en vivo:** cada mensaje que
+   se procesa guarda su peerId como setting `wa_chatid_<dígitos>`
+   (mismo patrón que `wa_lid_`). En `sendWhatsAppMessage` el orden de
+   chatIds pasa a ser: [id canónico guardado, `<lid>@lid` si hay mapeo,
+   `<dígitos>@c.us`]. Antes de enviar, se resuelve el chat con
+   `client.getChatById(chatId)` y se registra en el log si se encontró y
+   con qué id canónico; el envío se intenta igual. El fallback sigue
+   siendo solo ante el error del getter y ante undefined. Si ningún id
+   funciona, el error final lista todos los ids probados.
+3. **Dedup de reintentos fallidos:** en `POST /api/chats/:id/messages`,
+   cuando el envío FALLA, si en los últimos 5 minutos ya se guardó un
+   mensaje idéntico sin enviar en esa conversación (mismo sender
+   'agent', type, content, adjunto, external_id NULL), no se inserta
+   otra copia. El caso de éxito no cambia.
+4. **Diagnóstico de arranque:** al arrancar, una línea de log con el
+   `PERSIST_DIR` efectivo, el `waDataDir()`, el `uploadsDir()` y cuántas
+   carpetas `session-wa-session-*` hay en el volumen (solo el conteo).
+   Sirve para probar si la sesión sobrevive al despliegue.
+
+**Plan de pruebas tras desplegar (en este orden):**
+
+1. Enviar un **TEXTO** desde el CRM y verificar que llega al celular
+   (mirar en el log qué chatId se usó y si el chat se encontró por
+   `getChatById`).
+2. Enviar una **FOTO** desde el CRM.
+3. Mandar una foto y una nota de voz **AL** número y verificar que
+   aparecen con vista previa/reproductor, no solo la etiqueta.
+4. Mandar dos "hola" seguidos desde el teléfono y verificar que NO se
+   duplican.
+5. Tras el próximo despliegue, verificar en el log la línea de arranque
+   con `PERSIST_DIR` y si la sesión se restauró sin QR.
 
 ## Multimedia de WhatsApp para contactos con dirección LID (v5.3.9, 2026-11-07)
 

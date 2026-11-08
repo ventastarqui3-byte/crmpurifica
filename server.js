@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.9';
+const APP_VERSION = '5.3.10';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -376,12 +376,28 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   // LID se prueba primero y, si falla con ese error (o el chat no existe),
   // se reintenta UNA vez con el @c.us, y viceversa. Un error distinto es
   // final: no se prueba el otro id para no enmascarar el fallo real.
+  // v5.3.10 — Orden de chatIds: [id canónico guardado del tráfico en
+  // vivo, LID mapeado, @c.us]. El log de v5.3.9 probó que el LID solo no
+  // bastó: getChat devolvió null tanto para el @lid como para el @c.us.
+  // Por eso, antes de enviar se resuelve el chat con getChatById (método
+  // público de la librería) y se registra si se encontró y con qué id
+  // canónico; el envío se intenta igual (el getChat interno del envío
+  // hace findOrCreateLatestChat), pero el log ya dice la verdad.
+  const canonical = await getWaChatIdForDigits(digits).catch(() => null);
   const lid = await getWaLidForDigits(digits).catch(() => null);
-  const chatIds = lid ? [lid, `${digits}@c.us`] : [`${digits}@c.us`];
+  const chatIds = [...new Set([canonical, lid, `${digits}@c.us`].filter(Boolean))];
   const WA_GETTER_ERROR = /must include an id property/i;
   let lastError = null;
   for (const chatId of chatIds) {
     let sent;
+    // Pre-chequeo diagnóstico: ¿existe el chat bajo este id?
+    try {
+      const chat = await waClients[target].client.getChatById(chatId);
+      const foundId = chat?.id?._serialized || chat?.id?.$1 || null;
+      logger.info(`WhatsApp (${target}): pre-chequeo del chat ${chatId}: ${chat ? `encontrado (canónico: ${foundId || chatId})` : 'NO encontrado por getChatById; se intenta el envío igual'}`);
+    } catch (e) {
+      logger.warn(`WhatsApp (${target}): pre-chequeo del chat ${chatId} falló: ${e?.message || e}; se intenta el envío igual`);
+    }
     try {
       if (media) {
         const waMedia = new MessageMedia(media.mimetype, media.data, media.filename || 'archivo');
@@ -404,7 +420,12 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
       continue; // probar con el otro chatId, si lo hay
     }
     logger.info(`WhatsApp (${target}): mensaje enviado al chat ${chatId}`);
-    return { ok: true, channel: 'qr', instance: target, messageId: sent?.id?._serialized || null };
+    return { ok: true, channel: 'qr', instance: target, messageId: sent?.id ? waMsgSerializedId(sent) : null };
+  }
+  // Error final claro: si fue "chat no encontrado", listar todos los ids
+  // que se probaron, para que el próximo log diga exactamente qué falló.
+  if (lastError && /no encontró el chat/.test(lastError.message)) {
+    return { ok: false, channel: 'qr', error: `WhatsApp no encontró el chat para ${phone} (se probaron: ${chatIds.join(', ')})` };
   }
   return { ok: false, channel: 'qr', error: lastError?.message || 'No se pudo enviar el mensaje' };
 }
@@ -552,6 +573,57 @@ async function getPublicBaseUrl() {
   return '';
 }
 
+// v5.3.10 — Normalización del id de mensaje de WhatsApp Web.
+// En producción (log v5.3.9) el id NO trae `_serialized`: la forma
+// serializada está en `$1`:
+// {"fromMe":true,"remote":"265076942618676@lid","id":"AC426D0F43A9E3C1CEA515495A4EFC45",
+//  "$1":"true_265076942618676@lid_AC426D0F43A9E3C1CEA515495A4EFC45"}.
+// Por eso: (a) `msg.downloadMedia()` fallaba, porque la librería busca el
+// mensaje por `this.id._serialized` (undefined) — el evaluate de puppeteer
+// rechaza con el valor "r"; (b) el external_id quedaba NULL y el dedup por
+// external_id nunca funcionaba (los NULL no chocan en el UNIQUE);
+// (c) el messageId de los envíos también quedaba NULL.
+// Orden: _serialized, $1, y como último recurso fromMe_remote_id.
+function waMsgSerializedId(msg) {
+  const id = msg?.id;
+  if (!id) return null;
+  if (typeof id === 'string') return id;
+  if (id._serialized) return String(id._serialized);
+  if (id.$1) return String(id.$1);
+  if (id.remote && id.id) return `${id.fromMe ? 'true' : 'false'}_${id.remote}_${id.id}`;
+  return null;
+}
+
+// v5.3.10 — Id canónico del chat, persistido desde el tráfico en vivo.
+// En la librería (whatsapp-web.js 1.34.7, Message.js:388 y _getChatId
+// :347-349): `Message.getChat()` es `getChatById(this.fromMe ? this.to
+// : this.from)` — o sea que el id canónico del chat 1:1 ES el id del
+// interlocutor (msg.from en entrantes, msg.to en enviados desde el
+// teléfono). Se guarda en settings (wa_chatid_<dígitos>) cada vez que
+// llega un mensaje de esa conversación, para que el envío lo pruebe
+// primero. Misma mecánica best-effort que el mapeo LID.
+const waChatIdByDigits = new Map(); // dígitos -> '2650...@lid' o '57311...@c.us'
+async function saveWaChatIdMapping(digits, chatId) {
+  const d = String(digits || '').replace(/\D/g, '');
+  const c = String(chatId || '').trim();
+  if (!d || !/^(\d+@lid|\d+@c\.us)$/.test(c)) return;
+  waChatIdByDigits.set(d, c);
+  try {
+    await pool.query("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [`wa_chatid_${d}`, c]);
+  } catch { /* solo memoria: se re-aprende con el próximo mensaje */ }
+}
+async function getWaChatIdForDigits(digits) {
+  const d = String(digits || '').replace(/\D/g, '');
+  if (!d) return null;
+  if (waChatIdByDigits.has(d)) return waChatIdByDigits.get(d);
+  try {
+    const v = await getSettingValue(`wa_chatid_${d}`, '');
+    const c = String(v || '').trim();
+    if (/^(\d+@lid|\d+@c\.us)$/.test(c)) { waChatIdByDigits.set(d, c); return c; }
+  } catch { /* sin id guardado */ }
+  return null;
+}
+
 // v5.3.9 — Mapeo LID→número persistido.
 // En producción el chat de un contacto LID vive en WhatsApp Web bajo su
 // @lid (265076942618676@lid) y abordarlo por el número (@c.us) revienta
@@ -637,7 +709,13 @@ async function resolveWaPeerPhone(peerId, getContact, name) {
 // lanzar cuando la media aún está en FETCHING (tarda en resolverse).
 async function downloadWaMedia(msg, name) {
   if (!msg.hasMedia) return null;
-  const idStr = (() => { try { return String(msg.id?._serialized || ''); } catch { return ''; } })();
+  // v5.3.10 — La librería busca el mensaje por `this.id._serialized`
+  // (Message.js:513) y en producción ese campo viene vacío (la forma
+  // serializada está en `$1`): se normaliza ANTES de descargar para que
+  // el evaluate encuentre el mensaje. Si el objeto id no se deja escribir,
+  // se sigue igual y el log lo dirá.
+  try { if (msg?.id && typeof msg.id === 'object') msg.id._serialized = waMsgSerializedId(msg); } catch { /* id no escribible */ }
+  const idStr = waMsgSerializedId(msg) || '';
   const idJson = (() => { try { return JSON.stringify(msg.id); } catch { return 'no-serializable'; } })();
   const type = waMediaTypeFromMessage(msg) || 'document';
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -657,7 +735,7 @@ async function downloadWaMedia(msg, name) {
       }
       const dlType = waMediaTypeFromMessage(msg) || waMediaTypeFromMime(media.mimetype);
       const ext = waMediaExtFromMime(media.mimetype, media.filename);
-      const safeId = String(msg.id?._serialized || `${Date.now()}`).replace(/[^A-Za-z0-9]/g, '_');
+      const safeId = String(waMsgSerializedId(msg) || `${Date.now()}`).replace(/[^A-Za-z0-9]/g, '_');
       const filename = `${safeId}.${ext}`;
       try {
         fs.mkdirSync(waMediaDir(), { recursive: true });
@@ -688,6 +766,11 @@ async function processWaMessage(msg, opts) {
   const resolved = await resolveWaPeerPhone(peerId, getContact, name);
   if (!resolved) return false;
   const { phone, senderName } = resolved;
+  // v5.3.10 — Persistir el id canónico del chat desde el tráfico en vivo:
+  // en la librería, `Message.getChat()` es `getChatById(fromMe ? to :
+  // from)`, así que el id canónico del chat 1:1 ES el peerId. Se guarda
+  // para que el próximo envío lo pruebe primero. Best-effort, sin await.
+  saveWaChatIdMapping(phone.replace(/\D/g, ''), peerId);
   let type = 'text';
   let content = (msg.body || '').trim();
   let attachmentUrl = null;
@@ -718,7 +801,7 @@ async function processWaMessage(msg, opts) {
   waClients[id].lastMessageAt = new Date().toISOString();
   logger.info(`Mensaje recibido en ${name} de ${phone}: ${content}`);
   try {
-    await handleIncomingWhatsApp({ phone, content, type, attachmentUrl, sender, incrementUnread, sourceName, channel, externalId: msg.id?._serialized || null, senderName });
+    await handleIncomingWhatsApp({ phone, content, type, attachmentUrl, sender, incrementUnread, sourceName, channel, externalId: waMsgSerializedId(msg), senderName });
   } catch (err) {
     logger.error('Error procesando mensaje de WhatsApp', err);
   }
@@ -1282,6 +1365,18 @@ fs.mkdirSync(uploadsDir(), { recursive: true });
 // v5.3.6: adjuntos de WhatsApp (fotos, audios, videos, documentos).
 fs.mkdirSync(waMediaDir(), { recursive: true });
 app.use('/uploads', express.static(uploadsDir()));
+
+// v5.3.10 — Diagnóstico de arranque en UNA línea: el PERSIST_DIR
+// efectivo, las rutas reales de sesión y archivos, y cuántas sesiones
+// guardadas hay en el volumen (solo el conteo, nunca el contenido).
+// Sirve para probar en el próximo log si la sesión sobrevive al
+// despliegue y si PERSIST_DIR sigue puesto.
+try {
+  const bootDataDir = waDataDir();
+  let savedSessions = 0;
+  try { savedSessions = fs.readdirSync(bootDataDir).filter((f) => String(f).startsWith('session-wa-session-')).length; } catch { savedSessions = 0; }
+  logger.info(`Arranque: PERSIST_DIR=${process.env.PERSIST_DIR || '(no definido)'} waDataDir=${bootDataDir} uploadsDir=${uploadsDir()} sesionesGuardadas=${savedSessions}`);
+} catch (e) { logger.warn('Arranque: no se pudo leer el diagnóstico de persistencia', e?.message || e); }
 
 // Middleware de Logs de peticiones
 app.use((req, res, next) => {
@@ -2885,10 +2980,27 @@ app.post('/api/chats/:id/messages', async (req, res) => {
     // 3. Guardar mensaje localmente con su external_id (o NULL si no se
     // envió). ON CONFLICT DO NOTHING: si message_create ya lo guardó
     // (el evento puede llegar antes que este INSERT), no se duplica.
-    await pool.query(
-      'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, $2, $3, $4, $5, NOW(), $6) ON CONFLICT (external_id) DO NOTHING',
-      [id, 'agent', msgType, content || '', attachmentUrl || null, messageId]
-    );
+    // v5.3.10 — Dedup de intentos fallidos: si el envío FALLÓ y en los
+    // últimos 5 minutos ya se guardó un mensaje idéntico sin enviar en
+    // esta misma conversación (mismo sender, type, content, adjunto y
+    // external_id NULL), NO se inserta otra copia: cada reintento del
+    // usuario era una burbuja más ("hola" x4, "holmo" x3 en producción).
+    // El caso de éxito no cambia.
+    let skippedDuplicate = false;
+    if (!sent) {
+      const dup = await pool.query(
+        `SELECT id FROM messages WHERE conversation_id = $1 AND sender = 'agent' AND type = $2 AND content = $3 AND attachment_url IS NOT DISTINCT FROM $4 AND external_id IS NULL AND timestamp > NOW() - INTERVAL '5 minutes' LIMIT 1`,
+        [id, msgType, content || '', attachmentUrl || null]
+      );
+      skippedDuplicate = dup.rows.length > 0;
+      if (skippedDuplicate) logger.info(`Chat ${id}: intento fallido duplicado (mismo contenido sin enviar en 5 min); no se guarda otra copia.`);
+    }
+    if (!skippedDuplicate) {
+      await pool.query(
+        'INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, $2, $3, $4, $5, NOW(), $6) ON CONFLICT (external_id) DO NOTHING',
+        [id, 'agent', msgType, content || '', attachmentUrl || null, messageId]
+      );
+    }
 
     // 4. Actualizar conversación
     await pool.query(`UPDATE conversations SET last_message = $1, last_message_time = NOW(), unread_count = 0 WHERE id = $2`, [lastMsgPreview, id]);
