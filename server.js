@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.20';
+const APP_VERSION = '5.3.21';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -342,6 +342,20 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
   try {
     scan = await client.pupPage.evaluate(async (args) => {
       const out = { found: false, totalChats: 0, matchedIds: [], sent: false, messageId: null, error: null };
+      // v5.3.21 — Diagnóstico: ¿la cuenta tiene usuario LID resuelto? El
+      // sendMessage inyectado construye newMsgKey con `from:
+      // chat.id.isLid() ? lidUser : meUser` (lidUser =
+      // getMaybeMeLidUser(), módulo 'WAWebUserPrefsMeUser'). Si el LID de
+      // la cuenta no está resuelto, la clave del mensaje nuevo sale rota
+      // y los getters internos lanzan ("Data passed to getter must
+      // include an id property..."). Solo se registra la forma
+      // serializada, con try/catch; si no se puede leer, queda null.
+      try {
+        const mePrefs = window.require('WAWebUserPrefsMeUser');
+        const serOf = (u) => (u && (u._serialized || u.$1)) || (typeof u === 'string' ? u : null);
+        out.lidUser = (mePrefs && typeof mePrefs.getMaybeMeLidUser === 'function') ? serOf(mePrefs.getMaybeMeLidUser()) : null;
+        out.meUser = (mePrefs && typeof mePrefs.getMaybeMePnUser === 'function') ? serOf(mePrefs.getMaybeMePnUser()) : null;
+      } catch (e) { out.lidUser = null; out.meUser = null; }
       let chats = null;
       try {
         chats = window.require('WAWebCollections').Chat.getModelsArray();
@@ -427,6 +441,7 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
       };
       let sentMsg = null;
       let sendError = null;
+      let sendStack = null;
       try {
         const options = {};
         if (args.media) {
@@ -437,6 +452,10 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         sentMsg = await window.WWebJS.sendMessage(chat, args.content || '', options);
       } catch (e) {
         sendError = (e && e.message) || String(e);
+        // v5.3.21 — El mensaje del error es opaco ("Data passed to
+        // getter..."); el stack dice en qué paso dentro de la página
+        // falló (processMediaData, addAndSendMsgToChat o el Msg.get final).
+        sendStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' | ') : null);
       }
       const recent = recentMsgsInfo(chat);
       const hit = [...recent].reverse().find(lastMatches);
@@ -456,6 +475,45 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         out.verifiedBy = 'mensaje-crudo';
         return out;
       }
+      // v5.3.21 — Reintento como documento (solo media image/video; el
+      // document ya se manda así en el primer intento y sticker/audio
+      // quedan fuera): si el envío normal lanzó el error del getter y la
+      // comprobación no encontró nuestro mensaje, el fallo puede estar en
+      // la generación de vista previa/miniatura del medio
+      // (processMediaData). Como documento ese paso se salta. UNA sola vez.
+      if (args.media && (args.mediaType === 'image' || args.mediaType === 'video') && !args.sendMediaAsDocument && sendError && /must include an id property/i.test(sendError)) {
+        let retryMsg = null;
+        let retryError = null;
+        let retryStack = null;
+        try {
+          retryMsg = await window.WWebJS.sendMessage(chat, args.content || '', { media: args.media, caption: args.caption, sendMediaAsDocument: true });
+        } catch (e) {
+          retryError = (e && e.message) || String(e);
+          retryStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' | ') : null);
+        }
+        const recent2 = recentMsgsInfo(chat);
+        const hit2 = [...recent2].reverse().find(lastMatches);
+        if (hit2) {
+          out.sent = true;
+          out.messageId = hit2.id || (retryMsg && retryMsg.id && (retryMsg.id._serialized || retryMsg.id.$1)) || null;
+          out.verifiedBy = 'ultimo-mensaje-documento';
+          out.checked = recent2.length;
+          out.retriedAsDocument = true;
+          return out;
+        }
+        if (retryMsg) {
+          out.sent = true;
+          const mid = retryMsg.id;
+          out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+          out.verifiedBy = 'mensaje-crudo-documento';
+          out.retriedAsDocument = true;
+          return out;
+        }
+        out.retriedAsDocument = true;
+        out.retryError = retryError || 'el reintento como documento devolvió vacío';
+        out.retryStack = retryStack;
+      }
+      out.sendStack = sendStack;
       out.error = sendError || ('WWebJS.sendMessage devolvió vacío y ninguno de los últimos ' + recent.length + ' mensajes coincide');
       return out;
     }, {
@@ -474,10 +532,10 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
   logger.info(`WhatsApp (${target}): escaneo de chats: ${scan?.totalChats ?? '?'} chats en lista, ${scan?.matchedIds?.length || 0} coincidencias${scan?.matchedIds?.length ? ` (${scan.matchedIds.join(', ')})` : ''}`);
   if (!scan?.found) return { found: false, ok: false };
   if (scan.sent) {
-    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'})`);
+    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'}${scan.retriedAsDocument ? ', tras reintento como documento' : ''})`);
     return { found: true, ok: true, messageId: scan.messageId || null };
   }
-  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'}`);
+  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'} (LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}${scan.sendStack ? `; stack: ${scan.sendStack}` : ''}${scan.retriedAsDocument ? `; reintento como documento: ${scan.retryError || 'sin error'}${scan.retryStack ? `; stack: ${scan.retryStack}` : ''}` : ''})`);
   return { found: true, ok: false, error: scan.error || 'El envío por escaneo no devolvió mensaje' };
 }
 
@@ -525,10 +583,12 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
       // Msg.get). v5.3.13: son 5, no solo el último (ver comentario arriba).
       let cands = [];
       let via = null;
+      let totalMsgs = 0;
       try {
         let arr = null;
         if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
         else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
+        totalMsgs = arr ? arr.length : 0;
         if (arr && arr.length) { cands = arr.slice(-5); via = 'chat.msgs'; }
       } catch (e) { /* sin mensajes legibles en chat.msgs */ }
       if (!cands.length && chat.lastReceivedKey) {
@@ -541,7 +601,7 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
           if (found) { cands = [found]; via = 'lastReceivedKey-en-chat.msgs'; }
         } catch (e) { /* no se pudo resolver el último mensaje */ }
       }
-      if (!cands.length) { out.reason = 'sin mensajes legibles en el chat'; return out; }
+      if (!cands.length) { out.reason = 'sin mensajes legibles en el chat'; out.totalMsgs = totalMsgs; return out; }
 // v5.3.14 — "Nuestro" se decide por REMITENTE, no por fromMe: en este
 // chat LID los mensajes propios guardados en chat.msgs leen fromMe=false
 // (probado en el log de v5.3.13: la verificación siempre decía
@@ -587,6 +647,10 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
       const newest = cands[cands.length - 1];
       out.last = { fromMe: !!newest.fromMe, idFromMe: !!(newest.id && newest.id.fromMe), sender: msgSender(newest), type: newest.type || '', tDelta: now - (newest.t || 0), bodyMatch: (newest.body || '') === args.content, captionMatch: (newest.caption || '') === args.content, via };
       out.checked = cands.length;
+      // v5.3.21 — Total de mensajes en chat.msgs, no solo los revisados:
+      // distingue "colección casi vacía" (sesión fresca) de "el mensaje
+      // no está".
+      out.totalMsgs = totalMsgs;
       let hit = null;
       for (let i = cands.length - 1; i >= 0; i--) { if (matches(cands[i])) { hit = cands[i]; break; } }
       if (!hit) { out.reason = 'ninguno de los últimos ' + cands.length + ' mensajes es nuestro y coincide con el enviado'; return out; }
@@ -606,9 +670,9 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
     return { ok: false, reason: e?.message || String(e) };
   }
   if (res?.ok) {
-    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'}, revisados: ${res.checked ?? '?'})`);
+    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'}, revisados: ${res.checked ?? '?'}, total en chat: ${res.totalMsgs ?? '?'})`);
   } else {
-    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, idFromMe=${res?.last?.idFromMe}, remitente=${res?.last?.sender || '?'}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'})`);
+    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, idFromMe=${res?.last?.idFromMe}, remitente=${res?.last?.sender || '?'}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'}, total en chat: ${res?.totalMsgs ?? '?'})`);
   }
   return res || { ok: false, reason: 'sin resultado' };
 }
@@ -716,6 +780,10 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
     if (v?.ok) logger.info(`WhatsApp (${target}): envío confirmado tras intento ${tag} (id: ${v.messageId || 'sin id'})`);
     return v;
   };
+  // v5.3.21 — Diagnóstico: con medio, registrar qué archivo es antes de
+  // intentar el envío (mimetype y tamaño), para que el próximo log muestre
+  // qué foto/video falló.
+  if (media) logger.info(`WhatsApp (${target}): envío con medio ${media.type || '?'} (${media.mimetype || 'sin mimetype'}, ~${Math.round((String(media.data || '').length * 3) / 4 / 1024)} KB, archivo: ${media.filename || 'sin nombre'}) a ${digits}`);
   const scanRes = await sendWaByScan(waClients[target].client, target, { digits, lid, content, media });
   if (scanRes?.ok) {
     return { ok: true, channel: 'qr', instance: target, messageId: scanRes.messageId ? waMsgSerializedId({ id: scanRes.messageId }) : null };

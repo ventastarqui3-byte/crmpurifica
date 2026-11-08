@@ -1,4 +1,23 @@
-# Purifica Tu Ambiente CRM — v5.3.20 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento)
+# Purifica Tu Ambiente CRM — v5.3.21 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia)
+
+## Envío saliente de multimedia: diagnóstico y reintento como documento (v5.3.21, 2026-11-08)
+
+**Qué pasaba:** en producción, enviar foto o video desde Mensajes (y desde una campaña) fallaba siempre con el error opaco "Data passed to getter must include an id property (it's how we memoize) but got undefined" y el mensaje no llegaba al teléfono. Recibir multimedia sí funciona. En la era v5.3.13 ese mismo error aparecía y la foto SÍ llegaba (el error saltaba después de enviar, en el `Msg.get` final); ahora el fallo ocurre ANTES de transmitir, en el procesamiento del medio o en el envío mismo dentro de la página. El error no decía en qué paso fallaba.
+
+**Qué se añadió (diagnóstico):**
+
+1. En el envío por escaneo, antes de enviar se registra si la cuenta tiene usuario LID resuelto (`getMaybeMeLidUser()` / `getMaybeMePnUser()`): el `sendMessage` inyectado construye la clave del mensaje nuevo con `from: chat.id.isLid() ? lidUser : meUser`, y si el LID no está resuelto esa clave sale rota. La línea de log "envío por escaneo ... falló:" ahora incluye el LID de la cuenta (o "sin LID") y el fragmento del stack (primeras 3 líneas), que dice en qué paso dentro de la página falló.
+2. Cuando un envío lleva medio, el log registra antes de intentarlo su mimetype y su tamaño en KB.
+3. La verificación por último mensaje registra ahora también el total de mensajes en `chat.msgs`, no solo los revisados: distingue "colección casi vacía" (sesión fresca, solo 1 mensaje en memoria) de "el mensaje no está".
+
+**Qué se añadió (intento de arreglo — reintento como documento):** solo en el camino de escaneo, solo para imagen o video (el documento ya se manda así, y sticker/audio quedan fuera): si el envío normal de media lanza el error del getter Y la comprobación de mensajes recientes no encuentra nuestro mensaje, se reintenta UNA sola vez con `sendMediaAsDocument: true`. Como documento se salta la generación de vista previa/miniatura del medio, que es uno de los pasos que pueden estar fallando. Queda en el log como "tras reintento como documento" si sale, o con su error si también falla (en ese caso se reporta el error original). No hay reintento en el camino por id, para no multiplicar intentos.
+
+**Plan de pruebas tras desplegar v5.3.21:**
+
+1. Enviar UN texto plano desde Mensajes y decir si llega (discriminador: si el texto llega, el problema es el medio; si no, es el envío en esta sesión).
+2. Enviar una foto desde Mensajes y ver si llega (normal o como documento).
+3. Reintentar la campaña del video y ver si llega.
+4. Mandar el log después de esas pruebas: ahora debe decir el mimetype y el tamaño del medio, si la cuenta tiene LID resuelto, y el stack del error.
 
 ## Campañas personalizadas en Seguimiento (v5.3.20, 2026-11-08)
 
