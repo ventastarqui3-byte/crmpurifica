@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.12';
+const APP_VERSION = '5.3.13';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -361,21 +361,26 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
       // termina con `Msg.get(newMsgKey._serialized)` (Utils.js) y ese lookup
       // LANZA para este LID, así que un mensaje que YA se envió se reportaba
       // como fallido. Por eso: si sendMessage devuelve un mensaje (truthy)
-      // es éxito; si LANZA, no se da por perdido todavía: se mira el último
-      // mensaje del chat (chat.msgs, en memoria, sin Msg.get) y si es nuestro,
-      // reciente y coincide con lo enviado, también es éxito.
-      const lastMsgInfo = (c2) => {
+      // es éxito; si LANZA, no se da por perdido todavía: se miran los
+      // ÚLTIMOS 5 mensajes del chat (chat.msgs, en memoria, sin Msg.get) y
+      // si alguno es nuestro, reciente y coincide con lo enviado, también
+      // es éxito. v5.3.13: son los últimos 5 y no solo el último, porque
+      // el log probó que la respuesta del contacto puede caer entre nuestro
+      // envío y la verificación (el último mensaje era del contacto,
+      // "hace 0 s") y el nuestro quedaba segundo.
+      const recentMsgsInfo = (c2) => {
         try {
           let arr = null;
           if (c2.msgs && typeof c2.msgs.getModelsArray === 'function') arr = c2.msgs.getModelsArray();
           else if (c2.msgs && Array.isArray(c2.msgs.models)) arr = c2.msgs.models;
           if (arr && arr.length) {
-            const m = arr[arr.length - 1];
-            const mid = m && m.id;
-            return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0 };
+            return arr.slice(-5).map((m) => {
+              const mid = m && m.id;
+              return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0 };
+            });
           }
-        } catch (e) { /* sin último mensaje legible */ }
-        return null;
+        } catch (e) { /* sin mensajes legibles */ }
+        return [];
       };
       const lastMatches = (info) => {
         if (!info || !info.fromMe) return false;
@@ -403,11 +408,13 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
       } catch (e) {
         sendError = (e && e.message) || String(e);
       }
-      const last = lastMsgInfo(chat);
-      if (last && lastMatches(last)) {
+      const recent = recentMsgsInfo(chat);
+      const hit = [...recent].reverse().find(lastMatches);
+      if (hit) {
         out.sent = true;
-        out.messageId = last.id || (sentMsg && sentMsg.id && (sentMsg.id._serialized || sentMsg.id.$1)) || null;
+        out.messageId = hit.id || (sentMsg && sentMsg.id && (sentMsg.id._serialized || sentMsg.id.$1)) || null;
         out.verifiedBy = 'ultimo-mensaje';
+        out.checked = recent.length;
         return out;
       }
       if (sentMsg) {
@@ -419,7 +426,7 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         out.verifiedBy = 'mensaje-crudo';
         return out;
       }
-      out.error = sendError || 'WWebJS.sendMessage devolvió vacío y el último mensaje no coincide';
+      out.error = sendError || ('WWebJS.sendMessage devolvió vacío y ninguno de los últimos ' + recent.length + ' mensajes coincide');
       return out;
     }, {
       lidDigits,
@@ -446,16 +453,20 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
 
 // v5.3.12 — Verificación por último mensaje: después de que el envío por
 // escaneo y el camino por id (LID -> @c.us) fallen, ANTES de reportar el
-// fallo se comprueba si el mensaje realmente salió. El último mensaje del
-// chat se lee de `chat.msgs` (la colección en memoria del propio chat, sin
-// Msg.get — que es justo lo que lanza para este LID) o, si no está ahí, por
+// fallo se comprueba si el mensaje realmente salió. Los mensajes se leen
+// de `chat.msgs` (la colección en memoria del propio chat, sin Msg.get —
+// que es justo lo que lanza para este LID) o, si no está ahí, por
 // `chat.lastReceivedKey` buscado DENTRO de chat.msgs (la librería usa ese
 // campo en getChatModel, Utils.js:982-998, para el último mensaje del chat).
+// v5.3.13 — se miran los ÚLTIMOS 5 mensajes, no solo el último: el log de
+// v5.3.12 probó que la respuesta del contacto puede caer entre nuestro
+// envío y la verificación ("el último mensaje no es nuestro (último:
+// fromMe=false, type=chat, hace 0 s)") y el nuestro quedaba segundo.
 // Coincide si es nuestro (fromMe), tiene menos de 60 s y su body/caption
 // es el contenido enviado (texto) o su type es el del medio enviado (media
 // sin caption: image->image, audio->audio/ptt, video->video,
 // document->document, sticker->sticker). Devuelve { ok, messageId, reason,
-// last } y nunca lanza.
+// last, checked } y nunca lanza.
 async function verifyWaLastMessage(client, target, { digits, lid, content, media }) {
   const lidDigits = String(lid || '').replace(/@lid$/, '').replace(/\D/g, '');
   let res;
@@ -479,50 +490,53 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
         } catch (e) { /* un chat raro no tumba el escaneo */ }
       }
       if (!chat) { out.reason = 'chat no encontrado por escaneo'; return out; }
-      // Último mensaje: primero de chat.msgs (en memoria); si no está,
-      // por lastReceivedKey buscado dentro de chat.msgs (sin Msg.get).
-      let last = null;
+      // Últimos 5 mensajes: primero de chat.msgs (en memoria); si no hay
+      // ninguno, por lastReceivedKey buscado dentro de chat.msgs (sin
+      // Msg.get). v5.3.13: son 5, no solo el último (ver comentario arriba).
+      let cands = [];
       let via = null;
       try {
         let arr = null;
         if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
         else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
-        if (arr && arr.length) { last = arr[arr.length - 1]; via = 'chat.msgs'; }
-      } catch (e) { /* sin último mensaje legible en chat.msgs */ }
-      if (!last && chat.lastReceivedKey) {
+        if (arr && arr.length) { cands = arr.slice(-5); via = 'chat.msgs'; }
+      } catch (e) { /* sin mensajes legibles en chat.msgs */ }
+      if (!cands.length && chat.lastReceivedKey) {
         try {
           const ser = chat.lastReceivedKey._serialized || chat.lastReceivedKey.$1;
           let arr = null;
           if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
           else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
-          last = (arr || []).find((m) => { const id = m && m.id; return id && ((id._serialized || id.$1) === ser); }) || null;
-          if (last) via = 'lastReceivedKey-en-chat.msgs';
+          const found = (arr || []).find((m) => { const id = m && m.id; return id && ((id._serialized || id.$1) === ser); }) || null;
+          if (found) { cands = [found]; via = 'lastReceivedKey-en-chat.msgs'; }
         } catch (e) { /* no se pudo resolver el último mensaje */ }
       }
-      if (!last) { out.reason = 'sin último mensaje legible en el chat'; return out; }
-      const mid = last.id;
-      const fromMe = !!last.fromMe;
-      const body = last.body || '';
-      const caption = last.caption || '';
-      const type = last.type || '';
-      const t = last.t || 0;
+      if (!cands.length) { out.reason = 'sin mensajes legibles en el chat'; return out; }
       const now = Math.floor(Date.now() / 1000);
-      const bodyMatch = body === args.content;
-      const captionMatch = caption === args.content;
-      out.last = { fromMe, type, tDelta: now - t, bodyMatch, captionMatch, via };
-      if (!fromMe) { out.reason = 'el último mensaje no es nuestro'; return out; }
-      if (now - t > 60) { out.reason = 'el último mensaje es viejo'; return out; }
-      let match = false;
-      if (args.media) {
-        if (args.content && (captionMatch || bodyMatch)) match = true;
-        else if (!args.content) {
-          const expected = { image: ['image'], audio: ['audio', 'ptt'], video: ['video'], document: ['document'], sticker: ['sticker'] }[args.mediaType] || [];
-          match = expected.indexOf(type) !== -1;
+      const matches = (m) => {
+        if (!m || !m.fromMe) return false;
+        if (now - (m.t || 0) > 60) return false;
+        const body = m.body || '';
+        const caption = m.caption || '';
+        const type = m.type || '';
+        if (args.media) {
+          if (args.content && (caption === args.content || body === args.content)) return true;
+          if (!args.content) {
+            const expected = { image: ['image'], audio: ['audio', 'ptt'], video: ['video'], document: ['document'], sticker: ['sticker'] }[args.mediaType] || [];
+            return expected.indexOf(type) !== -1;
+          }
+          return false;
         }
-      } else {
-        match = bodyMatch;
-      }
-      if (!match) { out.reason = 'el último mensaje no coincide con el enviado'; return out; }
+        return body === args.content;
+      };
+      // Info del mensaje más reciente (para el log), aunque no sea el nuestro.
+      const newest = cands[cands.length - 1];
+      out.last = { fromMe: !!newest.fromMe, type: newest.type || '', tDelta: now - (newest.t || 0), bodyMatch: (newest.body || '') === args.content, captionMatch: (newest.caption || '') === args.content, via };
+      out.checked = cands.length;
+      let hit = null;
+      for (let i = cands.length - 1; i >= 0; i--) { if (matches(cands[i])) { hit = cands[i]; break; } }
+      if (!hit) { out.reason = 'ninguno de los últimos ' + cands.length + ' mensajes es nuestro y coincide con el enviado'; return out; }
+      const mid = hit.id;
       out.ok = true;
       out.messageId = (mid && (mid._serialized || mid.$1)) || null;
       return out;
@@ -538,9 +552,9 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
     return { ok: false, reason: e?.message || String(e) };
   }
   if (res?.ok) {
-    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'})`);
+    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'}, revisados: ${res.checked ?? '?'})`);
   } else {
-    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s)`);
+    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'})`);
   }
   return res || { ok: false, reason: 'sin resultado' };
 }
@@ -628,11 +642,36 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   // v5.3.11 — PRIMERO el escaneo (sendWaByScan): si encuentra el chat en
   // la lista y envía, listo. Si no lo encuentra o el envío por escaneo
   // falla, se cae al camino por id de siempre (LID -> @c.us).
+  // v5.3.13 — ANTI-TRIPLICACIÓN: el log de v5.3.12 probó que UN solo POST
+  // llegaba x3 al celular del contacto ("buenas" x3, "hjj" x3). Mecanismo:
+  // los tres caminos SÍ transmiten (el sendMessage inyectado envía
+  // primero y solo después falla en Msg.get/getMessageModel; el getChat
+  // del respaldo usa getAsModel=false y sí puede encontrar el chat aunque
+  // getChatById/getChatModel lance "r"), pero ninguno puede confirmarlo,
+  // así que el código probaba los tres y el contacto recibía 3 copias.
+  // Por eso ahora, DESPUÉS DE CADA intento (escaneo, luego cada id) se
+  // verifica ANTES de probar el siguiente camino: se esperan ~2 s y se
+  // buscan NUESTRO mensaje entre los ÚLTIMOS 5 mensajes del chat
+  // (verifyWaLastMessage). Si aparece, éxito y PARAR — no se prueba
+  // ningún otro camino. Solo si no aparece se prueba el siguiente. El
+  // error final solo se reporta si TODOS los intentos verificaron que el
+  // mensaje no salió.
+  const verifyAfterAttempt = async (tag) => {
+    await sleep(2000);
+    const v = await verifyWaLastMessage(waClients[target].client, target, { digits, lid, content, media }).catch(() => null);
+    if (v?.ok) logger.info(`WhatsApp (${target}): envío confirmado tras intento ${tag} (id: ${v.messageId || 'sin id'})`);
+    return v;
+  };
   const scanRes = await sendWaByScan(waClients[target].client, target, { digits, lid, content, media });
   if (scanRes?.ok) {
     return { ok: true, channel: 'qr', instance: target, messageId: scanRes.messageId ? waMsgSerializedId({ id: scanRes.messageId }) : null };
   }
+  let v = await verifyAfterAttempt('escaneo');
+  if (v?.ok) {
+    return { ok: true, channel: 'qr', instance: target, messageId: v.messageId ? waMsgSerializedId({ id: v.messageId }) : null };
+  }
   let lastError = null;
+  let idAttemptReturnedUndefined = false;
   for (const chatId of chatIds) {
     let sent;
     // Pre-chequeo diagnóstico: ¿existe el chat bajo este id?
@@ -654,32 +693,49 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
       lastError = e;
       const m = e?.message || String(e);
       logger.warn(`WhatsApp (${target}): envío al chat ${chatId} falló: ${m}`);
+      // Aunque el envío haya lanzado, pudo haber salido (el Msg.get
+      // final del sendMessage inyectado lanza DESPUÉS de enviar): se
+      // verifica antes de probar otro id o de darlo por perdido.
+      v = await verifyAfterAttempt(`id ${chatId}`);
+      if (v?.ok) {
+        return { ok: true, channel: 'qr', instance: target, messageId: v.messageId ? waMsgSerializedId({ id: v.messageId }) : null };
+      }
       if (!WA_GETTER_ERROR.test(m)) break; // otro error: probar el otro id no ayudaría
       continue; // error del getter: probar con el otro chatId
     }
     if (!sent) {
-      // La librería devuelve undefined cuando getChat no encontró el chat:
-      // antes se reportaba como enviado (ok:true, messageId null).
-      lastError = new Error(`WhatsApp no encontró el chat ${chatId}`);
-      logger.warn(`WhatsApp (${target}): la librería devolvió undefined al enviar al chat ${chatId} (chat no encontrado)`);
+      // v5.3.13 — La etiqueta vieja decía "chat no encontrado" y era
+      // engañosa: la librería devuelve undefined cuando NO PUEDE
+      // CONFIRMAR el envío (el getMessageModel/Msg.get final falla para
+      // este LID), no cuando el chat no existe — el escaneo ya probó que
+      // el chat SÍ está en la lista. El envío pudo haber salido; por eso
+      // se verifica por escaneo antes de probar otro id.
+      idAttemptReturnedUndefined = true;
+      lastError = new Error(`La librería devolvió undefined al enviar al chat ${chatId} (el envío pudo haber salido; se verifica por escaneo)`);
+      logger.warn(`WhatsApp (${target}): la librería devolvió undefined al enviar al chat ${chatId}; el envío pudo haber salido y se verifica por escaneo antes de probar otro id`);
+      v = await verifyAfterAttempt(`id ${chatId}`);
+      if (v?.ok) {
+        return { ok: true, channel: 'qr', instance: target, messageId: v.messageId ? waMsgSerializedId({ id: v.messageId }) : null };
+      }
       continue; // probar con el otro chatId, si lo hay
     }
     logger.info(`WhatsApp (${target}): mensaje enviado al chat ${chatId}`);
     return { ok: true, channel: 'qr', instance: target, messageId: sent?.id ? waMsgSerializedId(sent) : null };
   }
-  // v5.3.12 — Verificación por último mensaje ANTES de reportar el fallo:
-  // el escaneo y el camino por id pueden fallar en la confirmación (el
-  // Msg.get final del sendMessage inyectado lanza para este LID) aunque el
-  // mensaje YA llegó al celular. Si el último mensaje del chat es nuestro,
-  // reciente y coincide, el envío fue un éxito y no sale el letrero.
+  // Verificación final (cubre el caso en que el loop salió por `break`
+  // tras un error distinto del getter, o la lista de ids estaba vacía):
+  // si el mensaje está entre los últimos 5, fue un éxito y no sale el
+  // letrero.
   const verified = await verifyWaLastMessage(waClients[target].client, target, { digits, lid, content, media }).catch(() => null);
   if (verified?.ok) {
     return { ok: true, channel: 'qr', instance: target, messageId: verified.messageId ? waMsgSerializedId({ id: verified.messageId }) : null };
   }
-  // Error final claro: si fue "chat no encontrado", listar todos los ids
-  // que se probaron, para que el próximo log diga exactamente qué falló.
-  if (lastError && /no encontró el chat/.test(lastError.message)) {
-    return { ok: false, channel: 'qr', error: `WhatsApp no encontró el chat para ${phone} (se probaron: ${chatIds.join(', ')})` };
+  // Error final: los intentos por id devolvieron undefined sin poder
+  // confirmar; la verificación por escaneo no encontró el mensaje, así
+  // que se reporta como no confirmado (no como "chat no encontrado": el
+  // chat sí existe, es la confirmación la que falla para este LID).
+  if (idAttemptReturnedUndefined) {
+    return { ok: false, channel: 'qr', error: `No se pudo confirmar el envío a ${phone} (se probaron: ${chatIds.join(', ')}; la verificación por escaneo no encontró el mensaje en el chat)` };
   }
   return { ok: false, channel: 'qr', error: lastError?.message || 'No se pudo enviar el mensaje' };
 }
@@ -820,7 +876,11 @@ const WA_MIME_EXT = {
   'text/plain': 'txt',
 };
 function waMediaExtFromMime(mimetype, filename) {
-  if (WA_MIME_EXT[mimetype]) return WA_MIME_EXT[mimetype];
+  // v5.3.13 — el mimetype efectivo puede llevar parámetros (p. ej.
+  // 'audio/ogg; codecs=opus' de las notas de voz): se quitan para la
+  // búsqueda de la extensión, si no la nota se guardaba como .bin.
+  const base = String(mimetype || '').split(';')[0].trim();
+  if (WA_MIME_EXT[base]) return WA_MIME_EXT[base];
   const fromName = String(filename || '').split('.').pop();
   if (fromName && /^[A-Za-z0-9]{2,5}$/.test(fromName)) return fromName.toLowerCase();
   return 'bin';
@@ -1027,6 +1087,31 @@ async function downloadWaMediaFromPage(client, name, idStr) {
       out.mediaStage = (msg.mediaData && msg.mediaData.mediaStage) || null;
       out.hasDirectPath = !!msg.directPath;
       out.mimetype = msg.mimetype || null;
+      // v5.3.13 — MIMETYPE EXPLÍCITO: el log de v5.3.12 probó que el
+      // mensaje SE encuentra, el stage es RESOLVED y hay directPath, pero
+      // downloadAndMaybeDecrypt lanza "Unexpected mimetype
+      // application/octet-stream for media type image". La llamada de la
+      // librería (Message.js:562) NO pasa ningún mimetype, así que el
+      // gestor de descargas de WhatsApp Web usa el del mensaje, que para
+      // este contacto viene como application/octet-stream, y lo rechaza
+      // para un type=image. Por eso se le pasa un mimetype explícito: el
+      // del mensaje cuando es un tipo real para ese medio, y si no (o es
+      // octet-stream), uno derivado del type. Se registran ambos.
+      const rawMime = msg.mimetype || '';
+      const msgType = msg.type || '';
+      let effectiveMime = null;
+      if (rawMime && rawMime !== 'application/octet-stream') {
+        if (msgType === 'sticker') effectiveMime = 'image/webp';
+        else if (msgType === 'document') effectiveMime = rawMime;
+        else if (msgType === 'image' && rawMime.startsWith('image/')) effectiveMime = rawMime;
+        else if (msgType === 'video' && rawMime.startsWith('video/')) effectiveMime = rawMime;
+        else if ((msgType === 'audio' || msgType === 'ptt') && rawMime.startsWith('audio/')) effectiveMime = rawMime;
+      }
+      if (!effectiveMime) {
+        effectiveMime = { image: 'image/jpeg', video: 'video/mp4', audio: 'audio/ogg; codecs=opus', ptt: 'audio/ogg; codecs=opus', sticker: 'image/webp', document: (rawMime && rawMime !== 'application/octet-stream') ? rawMime : 'application/octet-stream' }[msgType] || 'application/octet-stream';
+      }
+      out.msgMimetype = rawMime || null;
+      out.effectiveMimetype = effectiveMime;
       if (!msg.mediaData || msg.mediaData.mediaStage === 'REUPLOADING') { out.error = 'sin mediaData o REUPLOADING'; return out; }
       if (msg.mediaData.mediaStage !== 'RESOLVED') {
         try { await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 }); }
@@ -1043,10 +1128,12 @@ async function downloadWaMediaFromPage(client, name, idStr) {
           mediaKey: msg.mediaKey,
           mediaKeyTimestamp: msg.mediaKeyTimestamp,
           type: msg.type,
+          mimetype: effectiveMime,
           signal: new AbortController().signal,
           downloadQpl: mockQpl,
         });
         out.data = await window.WWebJS.arrayBufferToBase64Async(decrypted);
+        out.mimetype = effectiveMime;
         out.filename = msg.filename || null;
         out.filesize = msg.size || null;
       } catch (e) {
@@ -1090,7 +1177,7 @@ async function downloadWaMedia(msg, name, client) {
     let media;
     try {
       const dl = await downloadWaMediaFromPage(client, name, idStr);
-      logger.info(`WhatsApp ${name}: descarga defensiva intento ${attempt}/2 del mensaje ${idStr || '(sin id)'} (type=${msg.type}): encontrado=${dl?.found ? 'sí' : 'no'} por=${dl?.foundBy || '-'} mediaStage=${dl?.mediaStage || '-'} directPath=${dl?.hasDirectPath ? 'sí' : 'no'}${dl?.steps?.length ? ` pasos=[${dl.steps.join(' | ')}]` : ''}${dl?.error ? ` error=${dl.error}` : ''}`);
+      logger.info(`WhatsApp ${name}: descarga defensiva intento ${attempt}/2 del mensaje ${idStr || '(sin id)'} (type=${msg.type}): encontrado=${dl?.found ? 'sí' : 'no'} por=${dl?.foundBy || '-'} mediaStage=${dl?.mediaStage || '-'} directPath=${dl?.hasDirectPath ? 'sí' : 'no'} mimetypeMsg=${dl?.msgMimetype || dl?.mimetype || '-'} mimetypeEfectivo=${dl?.effectiveMimetype || '-'}${dl?.steps?.length ? ` pasos=[${dl.steps.join(' | ')}]` : ''}${dl?.error ? ` error=${dl.error}` : ''}`);
       if (dl?.data) media = { data: dl.data, mimetype: dl.mimetype, filename: dl.filename, filesize: dl.filesize };
       else media = null;
     } catch (e) {

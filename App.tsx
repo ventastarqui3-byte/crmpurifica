@@ -302,7 +302,25 @@ export default function App() {
     const currentName = leadData.name || leadData.clientName || chat?.clientName || '';
     const currentValue = leadData.value || leadData.estimatedValue || chat?.leadData?.estimatedValue || 0;
 
-    if (existing) {
+    // v5.3.13 — Un cliente que ya tiene un servicio NO lo pierde al pedir
+    // otro: si el servicio existente ya es una cita en firme (AGENDADO,
+    // CONFIRMADO, REAGENDADO) o está en estado terminal (REALIZADO,
+    // PAGADO, CANCELADO), se abre el formulario como servicio NUEVO
+    // prellenado con los datos del cliente, en vez de editar el anterior
+    // y sobrescribirlo. Solo se sigue editando el existente cuando aún no
+    // tiene estado (fila heredada sin dealStatus). OJO con los valores:
+    // COTIZADO / EN_DECISION / PERDIDO / NUEVO son estados del LEAD, no
+    // del servicio; el deal_status real del servicio (DealStatus en
+    // types.ts, columna deal_status con DEFAULT 'AGENDADO', y el backend
+    // guarda `s.dealStatus || 'AGENDADO'`) solo puede ser AGENDADO,
+    // CONFIRMADO, REALIZADO, PAGADO, CANCELADO o REAGENDADO — REALIZADO
+    // es el "completado" de los servicios. Si el cliente tiene varios
+    // servicios, la regla se aplica al primero que encuentra services.find,
+    // como hoy.
+    const FIRM_DEAL_STATUSES = ['AGENDADO', 'CONFIRMADO', 'REAGENDADO', 'REALIZADO', 'PAGADO', 'CANCELADO'];
+    const existingIsFirm = !!existing?.dealStatus && FIRM_DEAL_STATUSES.includes(existing.dealStatus);
+
+    if (existing && !existingIsFirm) {
       setEditingService({ 
         ...existing, 
         itemsToClean: currentItems || existing.itemsToClean,
@@ -313,6 +331,11 @@ export default function App() {
         technicalImages: [...new Set([...(existing.technicalImages || []), ...leadImages])] 
       });
     } else {
+      // Servicio nuevo prellenado: se limpia editingService a propósito,
+      // porque ServiceForm da prioridad a initialData y un resto de una
+      // edición anterior haría que el "nuevo" formulario editara el
+      // servicio viejo (justo lo que esta versión evita).
+      setEditingService(null);
       setPrefillData({
         name: currentName,
         phone: phone,

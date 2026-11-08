@@ -1,4 +1,116 @@
-# Purifica Tu Ambiente CRM — v5.3.12 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma)
+# Purifica Tu Ambiente CRM — v5.3.13 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir)
+
+## Enviar UNA vez (anti-triplicación) + multimedia con mimetype + segundo servicio sin sobrescribir (v5.3.13, 2026-11-08)
+
+**Lo que probó el usuario con la v5.3.12 (log 05:16:59–05:19:11 UTC,
+capturas 00:18–00:19 local):** "no nada" — dos problemas:
+
+1. **TRIPLICACIÓN:** el celular del contacto recibe "buenas" x3 y "hjj"
+   x3 por UN solo envío desde el CRM. El log muestra por cada POST: el
+   escaneo ENCUENTRA el chat ("64 chats en lista, 1 coincidencias
+   (265076942618676@lid)") pero "WWebJS.sendMessage devolvió vacío y el
+   último mensaje no coincide"; el respaldo LID y @c.us devuelven
+   undefined (el pre-chequeo getChatById lanza "r"); la verificación
+   falla ("el último mensaje no es nuestro (último: fromMe=false,
+   type=chat, hace 0 s)").
+2. **MULTIMEDIA:** la descarga defensiva por fin dijo la causa: el
+   mensaje SE encuentra, el stage es RESOLVED y hay directPath, pero
+   "downloadAndMaybeDecrypt lanzó: Unexpected mimetype
+   application/octet-stream for media type image".
+
+**Por qué se triplicaba:** los tres caminos SÍ transmiten (el
+sendMessage inyectado envía primero y solo después falla en
+Msg.get/getMessageModel; el getChat del respaldo usa getAsModel=false y
+sí puede encontrar el chat aunque getChatById/getChatModel lance "r"),
+pero ninguno puede confirmarlo, así que el código probaba los tres y el
+contacto recibía 3 copias. La etiqueta del log "chat no encontrado" era
+engañosa: significa "la librería devolvió undefined", no que el chat no
+exista (el escaneo ya probó que sí está en la lista).
+
+**Correcciones en v5.3.13 (envío):**
+
+1. **Enviar una vez, verificar, y solo reintentar si la verificación
+   prueba que no salió:** después de CADA intento (escaneo, luego LID,
+   luego @c.us) se espera ~2 s y se verifica ANTES de probar el
+   siguiente camino. La verificación busca NUESTRO mensaje entre los
+   ÚLTIMOS 5 mensajes del chat (fromMe, mismo body/caption o mismo type
+   de media, menos de 60 s). Si aparece, éxito y PARAR: no se prueba
+   ningún otro camino. Solo si no aparece se prueba el siguiente. El
+   error final solo se reporta si TODOS los intentos verificaron que el
+   mensaje no salió. Cada verificación queda en el log (encontrado/no
+   encontrado, cuántos mensajes se revisaron).
+2. **La verificación interna del escaneo y `verifyWaLastMessage` miran
+   los últimos 5 mensajes, no solo el último:** el log probó que la
+   respuesta del contacto puede caer entre nuestro envío y la
+   verificación (el último mensaje era del contacto, "hace 0 s") y el
+   nuestro quedaba segundo.
+3. **Etiqueta corregida:** donde el log decía "chat no encontrado" al
+   devolver undefined la librería, ahora dice que la librería devolvió
+   undefined y que el envío pudo haber salido (se verifica por escaneo).
+   El error final ya no dice "no encontró el chat" sino "No se pudo
+   confirmar el envío a … (se probaron: …; la verificación por escaneo
+   no encontró el mensaje en el chat)".
+
+**Corrección en v5.3.13 (multimedia):** la llamada de la librería a
+`downloadAndMaybeDecrypt` (Message.js:562) NO pasa ningún mimetype, así
+que el gestor de descargas de WhatsApp Web usa el del mensaje, que para
+este contacto viene como `application/octet-stream`, y lo rechaza para
+un type=image. Ahora `downloadWaMediaFromPage` le pasa un `mimetype`
+explícito: el del mensaje cuando es un tipo real para ese medio
+(image/* para image, video/* para video, audio/* para audio/ptt,
+image/webp para sticker); si es `application/octet-stream` o no
+corresponde, se deriva del type (image → `image/jpeg`, video →
+`video/mp4`, audio/ptt → `audio/ogg; codecs=opus`, sticker →
+`image/webp`, document → su mimetype o `application/octet-stream`). La
+línea "descarga defensiva" registra tanto el mimetype del mensaje como
+el efectivo pasado. El tope de 25 MB, el reintento y el guardado con
+etiqueta no cambian. Además `waMediaExtFromMime` ahora quita los
+parámetros del mimetype antes de buscar la extensión, para que una nota
+de voz no se guarde como `.bin`.
+
+**Corrección en v5.3.13 (segundo servicio sin sobrescribir):** un cliente
+que ya tiene un servicio agendado y pide OTRO ya no pierde el anterior.
+Antes, `handleOpenFullService` (App.tsx) buscaba el primer servicio del
+cliente y lo abría para editarlo, así que el servicio anterior se
+sobrescribía y no quedaban dos servicios separados. Ahora: si el
+servicio existente ya es una cita en firme (AGENDADO, CONFIRMADO,
+REAGENDADO) o está en estado terminal (REALIZADO, PAGADO, CANCELADO),
+se abre el formulario como servicio NUEVO prellenado con los datos del
+cliente (nombre, teléfono, ítems, dirección, valor e imágenes del lead);
+solo se sigue editando el existente cuando aún no tiene estado (fila
+heredada sin dealStatus). La BD ya soporta varios servicios por cliente
+(POST /api/services inserta una fila nueva por id; ServiceForm genera el
+id nuevo con `Date.now().toString()`), y el cliente y el lead no se
+duplican (clients es único por teléfono, el lead se actualiza por
+conversation_id). OJO con los valores: COTIZADO / EN_DECISION / PERDIDO
+/ NUEVO son estados del LEAD, no del servicio; el deal_status real del
+servicio (DealStatus en types.ts, columna deal_status con DEFAULT
+'AGENDADO') solo puede ser AGENDADO, CONFIRMADO, REALIZADO, PAGADO,
+CANCELADO o REAGENDADO — REALIZADO es el "completado" de los servicios.
+Por eso la regla se escribió con los valores reales y no con los del
+lead. Si el cliente tiene varios servicios, la regla se aplica al
+primero que encuentra `services.find`, como hoy.
+
+**Lo que NO se tocó en v5.3.13:** PERSIST_DIR, el reintento transitorio
+v5.3.8, el mapeo LID/canónico, el dedup de ecos, el guardado-con-etiqueta
+y la auto-restauración.
+
+**Plan de pruebas tras desplegar v5.3.13:**
+
+1. Enviar UN texto desde el CRM — debe llegar UNA sola vez al celular
+   del contacto y sin letrero.
+2. Enviar una foto desde el CRM — una sola vez, sin letrero.
+3. Recibir una foto desde el teléfono — debe aparecer con vista previa
+   y el log debe decir el mimetype usado
+   (`mimetypeMsg=… mimetypeEfectivo=…`).
+4. Cliente con servicio AGENDADO → Sincronizar Venta abre un formulario
+   NUEVO prellenado con sus datos (no edita el agendado).
+5. Al guardar ese segundo servicio, el cliente tiene 2 servicios en la
+   lista de Servicios. (El caso "editar como antes" solo se da si el
+   servicio existente no tiene estado; en la práctica no ocurre porque
+   el backend guarda AGENDADO por defecto — por eso no hay un paso de
+   prueba con servicio COTIZADO: COTIZADO es estado del lead, no del
+   servicio.)
 
 ## Que un envío que SÍ llegó no se reporte como fallido (v5.3.12, 2026-11-07)
 
