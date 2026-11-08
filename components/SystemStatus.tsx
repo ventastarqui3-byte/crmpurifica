@@ -5,7 +5,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Activity, CheckCircle2, AlertTriangle, XCircle, RefreshCw, Play,
   Database, Smartphone, Server, MessagesSquare, HardDrive, Bell,
-  Loader2, RotateCcw, Download, Send, CalendarDays,
+  Loader2, RotateCcw, Download, Send, CalendarDays, Eraser,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type { SystemComponentStatus, SystemEvent, SelfTestResult } from '../types';
@@ -40,6 +40,10 @@ interface StatusData {
   version: string;
   uptime_seconds: number;
   alerts: { telegramConfigured: boolean; emailConfigured: boolean };
+  // v5.3.16 Desglose de almacenamiento del volumen (sesión WhatsApp vs
+  // fotos subidas vs total del volumen). volumeMB puede ser null si no se
+  // pudo medir.
+  storage?: { sessionMB: number; uploadsMB: number; volumeMB: { freeMB: number; totalMB: number } | null };
   components: SystemComponentStatus[];
   criticalEvents: SystemEvent[];
 }
@@ -180,6 +184,20 @@ export const SystemStatus: React.FC = () => {
       if (!json.sent) throw new Error(json.reason || 'Telegram no configurado');
       return { message: 'Alerta de prueba enviada a Telegram. Revisa tu teléfono.' };
     });
+
+  // v5.3.16 Limpiar la caché de WhatsApp: libera espacio sin borrar la
+  // sesión ni las fotos; WhatsApp se reconecta solo con la misma sesión.
+  // El confirm explica en una frase qué se borra y qué no, porque borrar
+  // el volumen desde Railway sí borraría sesión + fotos.
+  const cleanCache = async () => {
+    if (!window.confirm('Limpiar la caché de WhatsApp libera espacio sin borrar la sesión ni las fotos: WhatsApp se para, se borran solo las cachés de Chrome y se reconecta solo con la misma sesión (sin escanear QR).')) return;
+    await runAction('clean-cache', async () => {
+      const res = await apiFetch('/api/system/whatsapp/clean-cache', { method: 'POST' });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'No se pudo limpiar la caché');
+      return { message: `Caché limpiada: se liberaron ${json.freedMB} MB · Sesión ${json.sessionMB} MB · Fotos ${json.uploadsMB} MB. WhatsApp se está reconectando solo.` };
+    });
+  };
 
   // v5.3.15 Guardar una clave en settings (POST /api/settings, una llamada
   // por clave). Solo admin (el backend lo exige).
@@ -336,6 +354,12 @@ export const SystemStatus: React.FC = () => {
                   ))}
                 </div>
               )}
+              {c.key === 'whatsapp' && data?.storage && (
+                <p className="text-xs text-slate-400 mt-1">
+                  Almacenamiento: sesión {data.storage.sessionMB} MB · Fotos {data.storage.uploadsMB} MB
+                  {data.storage.volumeMB ? ` · Volumen libre: ${data.storage.volumeMB.freeMB} MB de ${data.storage.volumeMB.totalMB} MB` : ''}
+                </p>
+              )}
               {c.key === 'backup' && c.backup?.file && (
                 <p className="text-xs text-slate-400 mt-1">
                   Archivo: {c.backup.file} · {Math.round((c.backup.sizeBytes || 0) / 1024)} KB
@@ -477,6 +501,10 @@ export const SystemStatus: React.FC = () => {
           <button onClick={testAlert} disabled={busy === 'alert'}
             className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-900 disabled:opacity-60 flex items-center gap-2">
             <Send className="w-4 h-4" /> Probar alerta de Telegram
+          </button>
+          <button onClick={cleanCache} disabled={busy === 'clean-cache'}
+            className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-900 disabled:opacity-60 flex items-center gap-2">
+            {busy === 'clean-cache' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eraser className="w-4 h-4" />} Limpiar caché de WhatsApp
           </button>
           <button onClick={() => load()} disabled={loading}
             className="border border-slate-300 px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-50 disabled:opacity-60 flex items-center gap-2">

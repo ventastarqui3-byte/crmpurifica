@@ -12,7 +12,7 @@ import { LoginScreen } from './components/LoginScreen';
 import { ClientsList } from './components/ClientsList';
 import { WhatsAppChannels } from './components/WhatsAppChannels';
 import { CapacityWidget } from './components/CapacityWidget';
-import { AuditModule } from './components/AuditModule';
+import { FollowUps } from './components/FollowUps';
 import { DashboardSkeleton, ListSkeleton } from './components/Skeleton';
 import { MessageSquare, X, BellRing, ChevronRight, CheckCircle2, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -463,9 +463,9 @@ export default function App() {
             currentUser={currentUser} 
           />
         );
-      case 'audit':
+      case 'followups':
         if (currentUser.role !== 'admin') return <Dashboard currentUser={currentUser} staff={staff} onNavigate={setCurrentView} />;
-        return <AuditModule leads={leads} services={services} onRefresh={fetchData} />;
+        return <FollowUps />;
       case 'inbox':
         return (
           <ChatInbox 

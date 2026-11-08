@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.15';
+const APP_VERSION = '5.3.18';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -906,6 +906,84 @@ function waDataDir() {
   return p || path.resolve('.wwebjs_auth');
 }
 function waMediaDir() { return path.join(uploadsDir(), 'wa-media'); }
+
+// ---------- TAMAÑO DE ALMACENAMIENTO Y LIMPIEZA DE CACHÉ (v5.3.16) ----------
+// El volumen de Railway (PERSIST_DIR=/app/data) guarda dos cosas: la sesión
+// de WhatsApp (carpetas session-wa-session-<id>/) y la media subida
+// (uploads/wa-media/). Lo que más pesa es el perfil de Chrome de la sesión.
+// Borrar el volumen desde Railway borra sesión + fotos y obliga a reescanear
+// el QR: nunca se hace. El botón de Estado del Sistema solo borra carpetas
+// de caché REGENERABLES de Chrome (lista explícita WA_CACHE_DIR_ALLOWLIST),
+// nunca la sesión (Local Storage / IndexedDB / raíz) ni uploads/.
+
+// Tamaño en bytes de un directorio (recursión propia con fs, sin shell).
+// No sigue enlaces simbólicos (anti-bucle) y un archivo que desaparece a
+// mitad no rompe la medición. Directorio inexistente = 0.
+function dirSizeBytes(dir) {
+  let total = 0;
+  const seenInodes = new Set();
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      try {
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isDirectory()) {
+          const st = fs.statSync(full);
+          if (seenInodes.has(st.ino)) continue;
+          seenInodes.add(st.ino);
+          stack.push(full);
+        } else if (entry.isFile()) {
+          total += fs.statSync(full).size;
+        }
+      } catch { /* archivo que desaparece a mitad: se ignora */ }
+    }
+  }
+  return total;
+}
+const MB = 1048576;
+const round1MB = (bytes) => Math.round((bytes / MB) * 10) / 10;
+
+// Carpetas de caché de Chrome que se pueden borrar sin perder la sesión:
+// Chrome las vuelve a crear solo. Cualquier cosa fuera de esta lista NO se
+// toca: ni "Local Storage", ni "IndexedDB", ni la raíz de la sesión, ni
+// uploads/ (las fotos del historial se quedan).
+const WA_CACHE_DIR_ALLOWLIST = [
+  'Cache',
+  'Code Cache',
+  'GPUCache',
+  'Service Worker/CacheStorage',
+  'ShaderCache',
+  'Crashpad',
+  'DawnCache',
+  'GraphiteDawnCache',
+  'blob_storage',
+];
+
+// Desglose de almacenamiento con caché de 60 s: medir en cada GET
+// /api/system/status (que se refresca cada 30 s en el frontend) sería
+// recorrer el perfil de Chrome dos veces por minuto sin necesidad.
+let storageInfoCache = null; // { at, data }
+async function getStorageInfo(force = false) {
+  const now = Date.now();
+  if (!force && storageInfoCache && now - storageInfoCache.at < 60000) return storageInfoCache.data;
+  const sessionMB = round1MB(dirSizeBytes(waDataDir()));
+  const uploadsMB = round1MB(dirSizeBytes(uploadsDir()));
+  let volumeMB = null;
+  try {
+    const s = await fs.promises.statfs(waDataDir());
+    volumeMB = {
+      freeMB: Math.round(s.bfree * s.bsize / MB),
+      totalMB: Math.round(s.blocks * s.bsize / MB),
+    };
+  } catch { volumeMB = null; }
+  const data = { sessionMB, uploadsMB, volumeMB };
+  storageInfoCache = { at: now, data };
+  return data;
+}
 const WA_MEDIA_LABELS = { image: '📷 Imagen', audio: '🎤 Nota de voz', video: '🎬 Video', document: '📎 Documento', sticker: '😀 Sticker' };
 // Tipos de whatsapp-web.js que son media real (además de 'chat' = texto).
 // 'ptt' es nota de voz y se guarda como 'audio', igual que el composer.
@@ -2184,6 +2262,10 @@ async function getSystemStatus() {
     version: APP_VERSION,
     uptime_seconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
     alerts: { telegramConfigured: await telegramConfigured(), emailConfigured: nodemailerAvailable && Boolean((process.env.SMTP_HOST || '').trim() && (process.env.ALERT_EMAIL || '').trim()) },
+    // v5.3.16 Desglose de almacenamiento del volumen (sesión WhatsApp vs
+    // fotos subidas vs total del volumen). Con caché de 60 s (ver
+    // getStorageInfo): el frontend refresca el estado cada 30 s.
+    storage: await getStorageInfo(),
     components: [
       { key: 'db', label: 'Base de datos', status: db.status, detail: db.detail, latencyMs: db.ms },
       { key: 'whatsapp', label: 'WhatsApp por QR', status: waStatus, detail: wa.total === 0 ? 'Sin instancias configuradas' : `${wa.connected} de ${wa.total} instancias conectadas`, instances: wa.instances },
@@ -2325,6 +2407,91 @@ app.post('/api/system/whatsapp/reconnect', requireAdmin, async (req, res) => {
     }
   }
   res.json({ results });
+});
+
+// v5.3.16 Limpieza segura de la caché de WhatsApp (botón en Estado del
+// Sistema, solo admin). El volumen de Railway está casi lleno (0.5 GB en
+// Trial) y lo que más pesa es el perfil de Chrome de la sesión. Borrar el
+// volumen desde Railway borra sesión + fotos y obliga a reescanear el QR:
+// eso NUNCA se hace. Aquí solo se borran carpetas de caché regenerables
+// (WA_CACHE_DIR_ALLOWLIST) dentro de cada perfil session-wa-session-*/:
+// la sesión (Local Storage / IndexedDB / raíz) y uploads/wa-media (las
+// fotos del historial) NO se tocan. Orden: parar la instancia (nunca
+// borrar cachés con Chrome corriendo), medir, borrar, reiniciar la
+// instancia con la misma sesión (sin QR). La respuesta no espera al ready:
+// el estado se ve en Estado del Sistema.
+app.post('/api/system/whatsapp/clean-cache', requireAdmin, async (req, res) => {
+  try {
+    const before = await getStorageInfo(true);
+    // 1) Instancias QR en memoria: se paran con stopWaInstance (la misma
+    // parada centralizada de Reconectar) y se vuelven a levantar después.
+    // Las instancias Meta no tienen navegador ni caché que limpiar.
+    const qrInstances = Object.keys(waClients)
+      .filter((id) => (waClients[id].channel || 'qr') === 'qr')
+      .map((id) => ({ id, name: waClients[id].name || id }));
+    for (const t of qrInstances) {
+      await stopWaInstance(t.id);
+    }
+    // Dar un respiro para que Chrome suelte los archivos antes de borrar.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    // 2) Borrar solo las carpetas de la allow-list dentro de
+    // <sesión>/Default/. Cada ruta se resuelve y se valida que empiece por
+    // waDataDir(): nada fuera del volumen se toca jamás.
+    const root = path.resolve(waDataDir());
+    const freedByDir = {};
+    let sessionDirs = [];
+    try {
+      sessionDirs = fs.readdirSync(waDataDir(), { withFileTypes: true })
+        .filter((e) => e.isDirectory() && e.name.startsWith('session-wa-session-'))
+        .map((e) => path.join(waDataDir(), e.name));
+    } catch { sessionDirs = []; }
+    for (const sdir of sessionDirs) {
+      for (const rel of WA_CACHE_DIR_ALLOWLIST) {
+        const target = path.resolve(sdir, 'Default', rel);
+        if (!(target === root || target.startsWith(root + path.sep))) continue;
+        const size = dirSizeBytes(target);
+        if (size <= 0) continue;
+        try {
+          fs.rmSync(target, { recursive: true, force: true });
+          freedByDir[rel] = round1MB((freedByDir[rel] || 0) * MB + size);
+        } catch (e) {
+          logger.warn(`Limpieza de caché: no se pudo borrar ${rel} de ${path.basename(sdir)}: ${e.message}`);
+        }
+      }
+    }
+    // 3) Reiniciar las instancias paradas con la misma sesión guardada
+    // (sin QR). No se espera al ready: el estado se ve en Estado del
+    // Sistema y el vigilante de ready actúa si algo se atasca.
+    const restarted = [];
+    for (const t of qrInstances) {
+      try {
+        initWhatsApp(t.id, t.name, 'qr').catch((e) => {
+          logger.error(`Limpieza de caché: no se pudo reiniciar WhatsApp ${t.name} tras limpiar`, e);
+          recordEvent('error', 'whatsapp', `No se pudo reiniciar WhatsApp (${t.name}) tras limpiar la caché: ${e?.message || e}`, { instance: t.id });
+        });
+        restarted.push(t.id);
+      } catch (e) {
+        logger.error(`Limpieza de caché: no se pudo lanzar el reinicio de ${t.name}`, e);
+      }
+    }
+    const after = await getStorageInfo(true);
+    const beforeMB = round1MB((before.sessionMB + before.uploadsMB) * MB);
+    const afterMB = round1MB((after.sessionMB + after.uploadsMB) * MB);
+    const result = {
+      beforeMB,
+      afterMB,
+      freedMB: Math.max(0, round1MB((beforeMB - afterMB) * MB)),
+      sessionMB: after.sessionMB,
+      uploadsMB: after.uploadsMB,
+      instances: restarted,
+      freedByDir,
+    };
+    logger.info(`Limpieza de caché de WhatsApp: se liberaron ${result.freedMB} MB (antes ${beforeMB} MB, después ${afterMB} MB; sesión ${after.sessionMB} MB, fotos ${after.uploadsMB} MB).`);
+    recordEvent('info', 'whatsapp', `Limpieza de caché de WhatsApp: se liberaron ${result.freedMB} MB (sesión ${result.sessionMB} MB, fotos ${result.uploadsMB} MB)`, result);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/system/alerts/test', requireAdmin, async (req, res) => {
@@ -2803,6 +2970,23 @@ const initDB = async () => {
         created_by VARCHAR(100),
         created_at TIMESTAMP DEFAULT NOW()
       );
+      -- v5.3.17 Seguimiento automático de clientes: un pendiente por
+      -- servicio REALIZADO o PAGADO (service_id UNIQUE: el trabajo diario
+      -- nunca crea dos pendientes del mismo servicio).
+      CREATE TABLE IF NOT EXISTS followups (
+        id VARCHAR(50) PRIMARY KEY,
+        service_id VARCHAR(50) UNIQUE,
+        client_phone VARCHAR(50),
+        client_name VARCHAR(100),
+        service_name VARCHAR(200),
+        service_date DATE,
+        due_date DATE,
+        message TEXT,
+        attachment_url TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        sent_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS leads (
         id SERIAL PRIMARY KEY,
         conversation_id VARCHAR(50) UNIQUE,
@@ -3001,6 +3185,10 @@ const initDB = async () => {
     // v5.3 Google Calendar: id del evento en Calendar para actualizarlo o
     // borrarlo al reprogramar/cancelar. Las bases viejas no tienen la columna.
     await client.query('ALTER TABLE services ADD COLUMN IF NOT EXISTS google_calendar_event_id TEXT');
+
+    // v5.3.18 Seguimiento con imagen/video: qué medio se mandó con el aviso.
+    // Las bases creadas en v5.3.17 tienen la tabla followups sin esta columna.
+    await client.query('ALTER TABLE followups ADD COLUMN IF NOT EXISTS attachment_url TEXT');
 
     // --- OPTIMIZACIÓN: ÍNDICES PARA VELOCIDAD ---
     await client.query(`
@@ -3402,6 +3590,268 @@ app.delete('/api/reminders/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ---------- v5.3.17 SEGUIMIENTO AUTOMÁTICO DE CLIENTES ----------
+// Cuando un servicio REALIZADO o PAGADO cumple N meses, el CRM avisa al
+// cliente por WhatsApp que ya es hora de otra limpieza. El admin lo
+// personaliza todo (intervalo, mensaje, modo manual/automático y hora) desde
+// la página Seguimiento. Un servicio genera UN solo pendiente (service_id
+// UNIQUE + chequeo previo): nunca se le escribe dos veces al mismo cliente
+// por el mismo trabajo.
+const FOLLOWUP_DEFAULT_MESSAGE = 'Hola {{nombre}}, soy de Purifica Tu Ambiente. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?';
+
+function renderFollowupMessage(template, { name, service, date, months }) {
+  // La fecha llega como DATE de Postgres (medianoche UTC): se formatea en
+  // UTC para no restar un día por la zona horaria de Bogotá.
+  let dateStr = '';
+  try {
+    const d = date instanceof Date ? date : new Date(date);
+    dateStr = d.toLocaleDateString('es-CO', { timeZone: 'UTC', day: 'numeric', month: 'long', year: 'numeric' });
+  } catch { dateStr = String(date || ''); }
+  return String(template || FOLLOWUP_DEFAULT_MESSAGE)
+    .replaceAll('{{nombre}}', name || '')
+    .replaceAll('{{servicio}}', service || 'limpieza')
+    .replaceAll('{{fecha}}', dateStr)
+    .replaceAll('{{meses}}', String(months));
+}
+
+async function getFollowupConfig() {
+  const enabled = (await getSettingValue('followup_enabled', 'false')) === 'true';
+  const monthsRaw = parseInt(await getSettingValue('followup_months', '3'), 10);
+  const months = Number.isFinite(monthsRaw) && monthsRaw >= 1 && monthsRaw <= 12 ? monthsRaw : 3;
+  const message = (await getSettingValue('followup_message', ''))?.trim() || FOLLOWUP_DEFAULT_MESSAGE;
+  const modeRaw = (await getSettingValue('followup_mode', 'manual'))?.trim();
+  const mode = modeRaw === 'auto' ? 'auto' : 'manual';
+  const hourRaw = parseInt(await getSettingValue('followup_hour', '9'), 10);
+  const hour = Number.isFinite(hourRaw) && hourRaw >= 0 && hourRaw <= 23 ? hourRaw : 9;
+  // v5.3.18 Medio del seguimiento (uno solo para todos los avisos, se
+  // cambia en los ajustes): se lee en el MOMENTO DEL ENVÍO, no al crear el
+  // pendiente, así que cambiar la promoción afecta a los pendientes que aún
+  // no se han enviado. Solo vale una ruta dentro de uploads/wa-media/.
+  const mediaUrlRaw = (await getSettingValue('followup_media_url', ''))?.trim() || '';
+  const mediaTypeRaw = (await getSettingValue('followup_media_type', ''))?.trim() || '';
+  const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'video' ? mediaTypeRaw : '';
+  const mediaUrl = mediaType && mediaUrlRaw.startsWith('/uploads/wa-media/') ? mediaUrlRaw : '';
+  return { enabled, months, message, mode, hour, mediaUrl, mediaType: mediaUrl ? mediaType : '' };
+}
+
+// Envía un seguimiento por el MISMO flujo que el inbox (POST
+// /api/chats/:id/messages): sendWhatsAppMessage y luego
+// handleIncomingWhatsApp guarda el mensaje como propio (sender 'agent',
+// sin subir el contador de no leídos) en la conversación del cliente, con
+// su external_id. Si el evento message_create ya lo guardó, el dedup por
+// external_id / eco de 60 s evita la copia doble.
+async function sendFollowupMessage(f) {
+  const { phone } = normalizePhoneCO(f.client_phone);
+  if (!phone) return { ok: false, error: 'Teléfono vacío o inválido' };
+  let channel = 'qr';
+  try {
+    const c = await pool.query('SELECT channel FROM conversations WHERE client_phone = $1', [phone]);
+    if (c.rows[0]?.channel) channel = c.rows[0].channel;
+  } catch { /* sin conversación previa: QR por defecto */ }
+  // v5.3.18 Medio configurado (imagen o video) para todos los seguimientos.
+  // Se lee de settings en el momento del envío. Si el archivo no existe o
+  // no se puede leer, el aviso sale SOLO CON TEXTO (warn en el log): el
+  // recordatorio no se pierde por una promoción borrada o movida.
+  let media = null;
+  try {
+    const cfg = await getFollowupConfig();
+    if (cfg.mediaUrl && cfg.mediaType) {
+      const file = readWaAttachmentFile(cfg.mediaUrl);
+      if (file.error) {
+        logger.warn(`Seguimiento a ${phone}: medio ${cfg.mediaUrl} no se pudo leer (${file.error}); se envía solo el texto.`);
+      } else {
+        media = { type: cfg.mediaType, mimetype: file.mimetype, data: file.data, filename: file.filename, attachmentUrl: cfg.mediaUrl };
+      }
+    }
+  } catch (e) {
+    logger.warn(`Seguimiento a ${phone}: no se pudo cargar el medio configurado (${e.message}); se envía solo el texto.`);
+  }
+  const result = await sendWhatsAppMessage({ phone, content: f.message, channel, media });
+  if (!result.ok) return { ok: false, error: result.error };
+  try {
+    await handleIncomingWhatsApp({ phone, content: f.message, sourceName: 'seguimiento', channel, externalId: result.messageId || null, senderName: f.client_name, sender: 'agent', incrementUnread: false, type: media ? media.type : 'text', attachmentUrl: media ? media.attachmentUrl : null });
+  } catch (e) {
+    logger.error('Seguimiento enviado pero no se pudo guardar en la conversación', e.message);
+  }
+  // v5.3.18 Qué medio se mandó con este aviso (para instalaciones viejas la
+  // columna se añade con ALTER en el init; si no existe, no se rompe nada).
+  if (media) {
+    try { await pool.query('UPDATE followups SET attachment_url = $1 WHERE id = $2', [media.attachmentUrl, f.id]); } catch { /* columna ausente en DB vieja sin migrar */ }
+  }
+  return { ok: true, messageId: result.messageId || null };
+}
+
+let followupRunning = false;
+let followupSending = false;
+
+async function runFollowupScan() {
+  if (followupRunning) return { created: 0, sent: 0, failed: 0, reason: 'ya hay un escaneo en curso' };
+  followupRunning = true;
+  try {
+    const cfg = await getFollowupConfig();
+    if (!cfg.enabled) {
+      logger.info('Seguimiento: deshabilitado (followup_enabled=false); no se crean pendientes.');
+      return { created: 0, sent: 0, failed: 0, reason: 'deshabilitado' };
+    }
+    // Servicios REALIZADO o PAGADO con fecha hace >= N meses. La fecha se
+    // compara en SQL (CURRENT_DATE en zona Bogotá, igual que el respaldo).
+    const r = await pool.query(
+      `SELECT id, date, client_name, client_phone, service_performed, items_to_clean
+       FROM services
+       WHERE deal_status IN ('REALIZADO', 'PAGADO')
+         AND date IS NOT NULL
+         AND client_phone IS NOT NULL AND client_phone <> ''
+         AND date <= CURRENT_DATE - make_interval(months => $1)
+       ORDER BY date ASC`,
+      [cfg.months]
+    );
+    let created = 0;
+    const createdRows = [];
+    for (const s of r.rows) {
+      const exists = await pool.query('SELECT id FROM followups WHERE service_id = $1', [s.id]);
+      if (exists.rows.length > 0) continue; // idempotente: un servicio, un pendiente
+      const serviceName = (s.service_performed || '').trim() || (s.items_to_clean || '').trim() || 'limpieza';
+      const message = renderFollowupMessage(cfg.message, { name: s.client_name, service: serviceName, date: s.date, months: cfg.months });
+      const id = `fu_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const ins = await pool.query(
+        `INSERT INTO followups (id, service_id, client_phone, client_name, service_name, service_date, due_date, message, status)
+         VALUES ($1, $2, $3, $4, $5, $6, ($6::date + make_interval(months => $7))::date, $8, 'pending')
+         ON CONFLICT (service_id) DO NOTHING RETURNING *`,
+        [id, s.id, s.client_phone, s.client_name, serviceName, s.date, cfg.months, message]
+      );
+      if (ins.rows.length > 0) { created++; createdRows.push(ins.rows[0]); }
+    }
+    let sent = 0, failed = 0;
+    // Modo automático: enviar los pendientes recién creados, con pausa de
+    // 8 s entre envíos para no parecer una ráfaga. En modo manual no se
+    // envía nada: el admin los ve en Seguimiento y los manda cuando quiera.
+    if (cfg.mode === 'auto' && createdRows.length > 0 && !followupSending) {
+      followupSending = true;
+      try {
+        for (let i = 0; i < createdRows.length; i++) {
+          if (i > 0) await sleep(8000);
+          const f = createdRows[i];
+          const res = await sendFollowupMessage(f);
+          if (res.ok) {
+            await pool.query("UPDATE followups SET status = 'sent', sent_at = NOW() WHERE id = $1", [f.id]);
+            sent++;
+          } else {
+            await pool.query("UPDATE followups SET status = 'failed' WHERE id = $1", [f.id]);
+            failed++;
+            logger.error(`Seguimiento ${f.id} no se pudo enviar a ${f.client_phone}: ${res.error}`);
+            await recordEvent('error', 'followups', `Seguimiento a ${f.client_name} (${f.client_phone}) falló: ${res.error}`, { followup: f.id });
+          }
+        }
+      } finally { followupSending = false; }
+    }
+    await recordEvent('info', 'followups', `Escaneo de seguimiento: ${created} pendientes nuevos (${sent} enviados, ${failed} fallidos, modo ${cfg.mode})`, { created, sent, failed, mode: cfg.mode });
+    notifyUpdate('followup');
+    return { created, sent, failed, mode: cfg.mode };
+  } catch (err) {
+    logger.error('Escaneo de seguimiento falló', err.message);
+    await recordEvent('error', 'followups', `Escaneo de seguimiento falló: ${err.message}`, {});
+    return { created: 0, sent: 0, failed: 0, reason: err.message };
+  } finally {
+    followupRunning = false;
+  }
+}
+
+// Trabajo diario a la hora configurada (America/Bogota, mismo patrón que el
+// respaldo diario): si la hora ya pasó hoy, corre mañana. Se reprograma
+// después de cada corrida, así que cambiar la hora en Seguimiento se aplica
+// sin reiniciar.
+async function scheduleFollowupScan() {
+  const cfg = await getFollowupConfig().catch(() => ({ hour: 9 }));
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(cfg.hour, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  setTimeout(async () => {
+    await runFollowupScan();
+    scheduleFollowupScan();
+  }, next.getTime() - now.getTime());
+}
+scheduleFollowupScan();
+
+// ---------- ENDPOINTS DE SEGUIMIENTO (solo admin en v1) ----------
+app.get('/api/followups', requireAdmin, async (req, res) => {
+  try {
+    const status = String(req.query.status || '');
+    const valid = ['pending', 'sent', 'failed', 'skipped'];
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '100'), 10) || 100, 1), 200);
+    const r = valid.includes(status)
+      ? await pool.query('SELECT * FROM followups WHERE status = $1 ORDER BY due_date ASC, created_at ASC LIMIT $2', [status, limit])
+      : await pool.query('SELECT * FROM followups ORDER BY due_date ASC, created_at ASC LIMIT $1', [limit]);
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/followups/:id/send', requireAdmin, async (req, res) => {
+  try {
+    const cur = await pool.query('SELECT * FROM followups WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Seguimiento no encontrado' });
+    const f = cur.rows[0];
+    if (f.status === 'sent') return res.status(400).json({ error: 'Este seguimiento ya fue enviado' });
+    if (f.status === 'skipped') return res.status(400).json({ error: 'Este seguimiento fue omitido' });
+    const edited = typeof req.body?.message === 'string' && req.body.message.trim() ? req.body.message.trim() : null;
+    if (edited) await pool.query('UPDATE followups SET message = $1 WHERE id = $2', [edited, f.id]);
+    const res2 = await sendFollowupMessage({ ...f, message: edited || f.message });
+    if (!res2.ok) {
+      await pool.query("UPDATE followups SET status = 'failed' WHERE id = $1", [f.id]);
+      await recordEvent('error', 'followups', `Seguimiento a ${f.client_name} (${f.client_phone}) falló: ${res2.error}`, { followup: f.id });
+      notifyUpdate('followup');
+      return res.json({ success: false, sent: false, error: res2.error });
+    }
+    await pool.query("UPDATE followups SET status = 'sent', sent_at = NOW() WHERE id = $1", [f.id]);
+    notifyUpdate('followup');
+    res.json({ success: true, sent: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/followups/:id/skip', requireAdmin, async (req, res) => {
+  try {
+    const cur = await pool.query('SELECT id, status FROM followups WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Seguimiento no encontrado' });
+    if (cur.rows[0].status === 'sent') return res.status(400).json({ error: 'Este seguimiento ya fue enviado' });
+    await pool.query("UPDATE followups SET status = 'skipped' WHERE id = $1", [req.params.id]);
+    notifyUpdate('followup');
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/followups/send-all', requireAdmin, async (req, res) => {
+  try {
+    if (followupSending) return res.status(409).json({ error: 'Ya hay un envío de seguimiento en curso' });
+    const r = await pool.query("SELECT * FROM followups WHERE status = 'pending' ORDER BY due_date ASC, created_at ASC");
+    followupSending = true;
+    let sent = 0, failed = 0;
+    try {
+      for (let i = 0; i < r.rows.length; i++) {
+        if (i > 0) await sleep(8000);
+        const f = r.rows[i];
+        const res2 = await sendFollowupMessage(f);
+        if (res2.ok) {
+          await pool.query("UPDATE followups SET status = 'sent', sent_at = NOW() WHERE id = $1", [f.id]);
+          sent++;
+        } else {
+          await pool.query("UPDATE followups SET status = 'failed' WHERE id = $1", [f.id]);
+          failed++;
+          logger.error(`Seguimiento ${f.id} no se pudo enviar a ${f.client_phone}: ${res2.error}`);
+        }
+      }
+    } finally { followupSending = false; }
+    notifyUpdate('followup');
+    res.json({ success: true, total: r.rows.length, sent, failed });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/followups/run-now', requireAdmin, async (req, res) => {
+  try {
+    const summary = await runFollowupScan();
+    res.json({ success: true, ...summary });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/availability', async (req, res) => {
   try {
     // time es VARCHAR y se comparaba como texto: '9:00' < '13:00' es falso
@@ -3564,6 +4014,41 @@ app.post('/api/chats/:id/attachments', async (req, res) => {
     const type = waMediaTypeFromMime(mimetype);
     res.json({ success: true, attachmentUrl: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
   });
+});
+
+// v5.3.18 — Imagen o video del seguimiento (UNO solo para todos los avisos,
+// se cambia en los ajustes). Reutiliza el mismo multer del chat (disco a
+// uploads/wa-media/, tope 25 MB) y solo admite imagen o video: nada de audio
+// ni documentos en esta versión. El endpoint solo SUBE el archivo y devuelve
+// su URL; el frontend guarda followup_media_url y followup_media_type con
+// POST /api/settings, como el resto de ajustes de seguimiento.
+app.post('/api/followups/media', requireAdmin, async (req, res) => {
+  waMediaUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) return res.status(400).json({ error: 'Sube una imagen o un video' });
+    const mimetype = req.file.mimetype || '';
+    if (!mimetype.startsWith('image/') && !mimetype.startsWith('video/')) {
+      try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
+      return res.status(400).json({ error: 'Solo se admite imagen o video' });
+    }
+    const type = waMediaTypeFromMime(mimetype);
+    res.json({ success: true, url: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
+  });
+});
+
+// v5.3.18 — Quitar el medio del seguimiento: solo vacía los ajustes. El
+// archivo NO se borra del disco: los mensajes ya enviados apuntan a esa URL
+// y borrarlo rompería sus vistas previas en Mensajes.
+app.post('/api/followups/media/remove', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("INSERT INTO settings (key, value) VALUES ('followup_media_url', '') ON CONFLICT (key) DO UPDATE SET value = ''");
+    await pool.query("INSERT INTO settings (key, value) VALUES ('followup_media_type', '') ON CONFLICT (key) DO UPDATE SET value = ''");
+    notifyUpdate('settings');
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/ranking', async (req, res) => {
@@ -5242,7 +5727,7 @@ app.post('/api/settings', async (req, res) => {
     // resolución de facturación. invoice_next_number NO está aquí a propósito:
     // el consecutivo solo lo mueve la creación de facturas, no un formulario.
     // v5 Parte 2B Meta: token y phone number id de WhatsApp Cloud API.
-    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id'];
+    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type'];
     if (!ALLOWED_SETTINGS_KEYS.includes(key)) return res.status(400).json({ error: `Clave no permitida: ${key}` });
     // Las claves de Meta son credenciales: solo el admin las escribe.
     if (key.startsWith('meta_wa_') && (req.user?.role || '').toLowerCase() !== 'admin') {
@@ -5251,7 +5736,7 @@ app.post('/api/settings', async (req, res) => {
     // v5.2 Facturación (B6): el tipo de factura por defecto y los datos de
     // la empresa para facturar son solo admin, aunque el asesor (vendedor)
     // ya puede crear facturas y cobrar.
-    const ADMIN_ONLY_SETTINGS = new Set(['invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id']);
+    const ADMIN_ONLY_SETTINGS = new Set(['invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type']);
     if (ADMIN_ONLY_SETTINGS.has(key) && normalizeRoleValue(req.user?.role) !== 'admin') {
       return res.status(403).json({ error: 'Solo el administrador puede cambiar esa configuración' });
     }
@@ -5261,6 +5746,27 @@ app.post('/api/settings', async (req, res) => {
     // v5.1 El tipo de factura por defecto solo admite los dos tipos válidos.
     if (key === 'invoice_default_type' && value && !INVOICE_TYPES.includes(String(value).trim())) {
       return res.status(400).json({ error: "invoice_default_type debe ser 'normal' o 'electronica'" });
+    }
+    // v5.3.17 Seguimiento automático: validar los ajustes antes de guardar.
+    if (key === 'followup_enabled' && value && !['true', 'false'].includes(String(value).trim())) {
+      return res.status(400).json({ error: "followup_enabled debe ser 'true' o 'false'" });
+    }
+    if (key === 'followup_months' && value && (!/^\d+$/.test(String(value).trim()) || +value < 1 || +value > 12)) {
+      return res.status(400).json({ error: 'followup_months debe ser un número entre 1 y 12' });
+    }
+    if (key === 'followup_mode' && value && !['manual', 'auto'].includes(String(value).trim())) {
+      return res.status(400).json({ error: "followup_mode debe ser 'manual' o 'auto'" });
+    }
+    if (key === 'followup_hour' && value && (!/^\d+$/.test(String(value).trim()) || +value < 0 || +value > 23)) {
+      return res.status(400).json({ error: 'followup_hour debe ser un número entre 0 y 23' });
+    }
+    // v5.3.18 Medio del seguimiento: solo imagen o video, y solo una ruta
+    // dentro de uploads/wa-media/ (la que devuelve el endpoint de subida).
+    if (key === 'followup_media_type' && value && !['', 'image', 'video'].includes(String(value).trim())) {
+      return res.status(400).json({ error: "followup_media_type debe ser '' (sin medio), 'image' o 'video'" });
+    }
+    if (key === 'followup_media_url' && value && !String(value).trim().startsWith('/uploads/wa-media/')) {
+      return res.status(400).json({ error: 'followup_media_url debe ser una ruta dentro de /uploads/wa-media/' });
     }
     await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, value]);
     notifyUpdate('settings');

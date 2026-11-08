@@ -16,7 +16,7 @@ import {
   Smartphone,
   Volume2,
   VolumeX,
-  ShieldAlert,
+  Clock,
   Palette,
   Activity,
   Receipt
@@ -102,13 +102,9 @@ export const Layout: React.FC<LayoutProps> = ({ currentView, onNavigate, childre
       items.push({ view: 'wa-channels', icon: Smartphone, label: 'Canales WhatsApp' });
       items.push({ view: 'branding', icon: Palette, label: 'Personalización' });
       items.push({ view: 'system-status', icon: Activity, label: 'Estado del Sistema' });
-      // MODIFICACIÓN: Resaltado visual para el módulo de auditoría
-      items.push({ 
-        view: 'audit', 
-        icon: ShieldAlert, 
-        label: 'Auditoría & Limpieza', 
-        isCritical: true 
-      });
+      // v5.3.17 Seguimiento automático de clientes (reemplaza a
+      // Auditoría & Limpieza, que solo mostraba duplicados y se veía vacío).
+      items.push({ view: 'followups', icon: Clock, label: 'Seguimiento' });
     }
 
     items.push({ view: 'services', icon: CalendarCheck, label: 'Servicios' });

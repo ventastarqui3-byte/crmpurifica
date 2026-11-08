@@ -1,4 +1,110 @@
-# Purifica Tu Ambiente CRM — v5.3.15 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM)
+# Purifica Tu Ambiente CRM — v5.3.18 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento)
+
+## Imagen o video en el seguimiento, cambiable cuando se quiera (v5.3.18, 2026-11-08)
+
+**Qué es:** el seguimiento puede llevar UNA imagen o un video, el mismo para todos los avisos. Se sube en la página Seguimiento (ajustes, sección “Imagen o video del seguimiento”) y se manda junto con el mensaje de texto (el texto va como pie de la imagen o del video). Cuando se quiere mandar otra promoción, se sube otro archivo y listo: no hay que tocar nada más.
+
+**Cómo funciona:**
+
+- Ajustes nuevos (en `POST /api/settings`, solo admin, no son secretos): `followup_media_url` (ruta `/uploads/wa-media/<archivo>`, vacía = sin medio) y `followup_media_type` (`'image'` | `'video'` | `''`). El servidor solo acepta URLs dentro de `/uploads/wa-media/`.
+- Subida (`POST /api/followups/media`, solo admin): reutiliza el mismo multer del chat (disco a `uploads/wa-media/`, tope 25 MB) y solo admite imagen o video (nada de audio ni documentos en esta versión). Devuelve `{ url, type, mimetype }` y el frontend guarda las dos claves de ajuste. Quitar (`POST /api/followups/media/remove`, solo admin) solo vacía los ajustes: **el archivo NO se borra del disco**, porque los mensajes ya enviados apuntan a esa URL y borrarlo rompería sus vistas previas en Mensajes.
+- El medio se lee de settings **en el momento del envío**, no al crear el pendiente: si se cambia la promoción, los pendientes que aún no se han enviado llevan la nueva. El texto del mensaje sí queda congelado en la fila, como antes. Al enviar, la fila guarda también la `attachment_url` (columna nueva en `followups`, con `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` para las bases de v5.3.17).
+- El envío reutiliza el flujo del inbox (`sendWhatsAppMessage` con `media` + `handleIncomingWhatsApp` con `type` y `attachmentUrl`): por QR la imagen o el video salen con `MessageMedia` y el texto como pie; por Meta, por enlace público (si no hay URL pública, Meta no acepta media). En Mensajes el aviso se ve como imagen o video con su texto, como un mensaje propio más. Si el archivo no existe o no se puede leer, el aviso sale **solo con texto** (warn en el log): el recordatorio no se pierde por una promoción borrada o movida.
+
+**Plan de pruebas tras desplegar v5.3.18:**
+
+1. En Seguimiento, subir una imagen y enviar un pendiente: debe llegar la imagen con el texto y verse en Mensajes.
+2. Cambiarla por un video y enviar otro pendiente: debe llegar el video con el texto.
+3. Quitarla y enviar otro pendiente: debe llegar solo el texto.
+4. En modo automático, comprobar que el envío lleva el medio que esté configurado en ese momento.
+
+## Seguimiento automático de clientes y adiós a Auditoría & Limpieza (v5.3.17, 2026-11-08)
+
+**Qué se borró:** el módulo “Auditoría & Limpieza” (`components/AuditModule.tsx`, su caso en `App.tsx` y su entrada en el menú). Solo buscaba servicios duplicados (mismo teléfono y misma fecha) y dejaba borrarlos uno por uno; sin duplicados se veía vacío y parecía que no hacía nada. El endpoint `GET /api/stats/overview` SE QUEDA (lo usa el Dashboard); solo se borró la pantalla. En su lugar, en el menú, quedó **Seguimiento** (solo admin).
+
+**Cómo funciona el seguimiento:** cuando un servicio con estado REALIZADO o PAGADO cumple el intervalo configurado (por defecto 3 meses desde la fecha del trabajo), el CRM crea un pendiente en la tabla `followups` y, según el modo, lo envía por WhatsApp:
+
+- **Modo manual (por defecto):** el trabajo diario solo crea los pendientes. El admin los ve en Seguimiento, puede editar el mensaje de cada uno y pulsar Enviar (o “Enviar todos los pendientes”), o Omitir el que no quiera mandar.
+- **Modo automático:** el trabajo diario crea los pendientes y los envía solo a la hora configurada, con pausa de 8 s entre envíos. Si un envío falla queda en “Fallido” con botón Reintentar.
+
+**Personalizable por el admin (página Seguimiento, ajustes guardados en settings, solo admin):**
+
+- `followup_enabled` (activado o no, por defecto apagado), `followup_months` (1–12, por defecto 3), `followup_mode` (`manual` | `auto`, por defecto `manual`), `followup_hour` (0–23, por defecto 9, hora de Bogotá) y `followup_message` (plantilla con variables `{{nombre}}`, `{{servicio}}`, `{{fecha}}` y `{{meses}}`). Plantilla por defecto: “Hola {{nombre}}, soy de Purifica Tu Ambiente. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?”
+- El trabajo diario corre a la hora configurada (mismo patrón que el respaldo diario) y se reprograma tras cada corrida, así que cambiar la hora no necesita reinicio. El botón “Buscar pendientes ahora” (`POST /api/followups/run-now`) ejecuta el escaneo sin esperar a mañana.
+
+**Una sola vez por servicio:** `followups.service_id` es UNIQUE y el escaneo salta los servicios que ya tienen fila, así que un cliente nunca recibe dos veces el aviso por el mismo trabajo. Los enviados no se pueden reenviar desde la lista (solo los fallidos se reintentan).
+
+**El mensaje queda en la conversación:** el envío reutiliza el flujo del inbox (`sendWhatsAppMessage` + `handleIncomingWhatsApp` con sender `agent`): el mensaje aparece en Mensajes como uno propio más, con su `external_id`, y el dedup por `external_id` / eco de 60 s evita copias dobles. Por QR se puede enviar en cualquier momento (sin la regla de 24 h de la API de Meta); si la conversación ya tenía canal Meta, sale por Meta.
+
+**Endpoints (todos solo admin en v1):** `GET /api/followups?status=&limit=100`, `POST /api/followups/:id/send` (body opcional `{ message }` para enviar el texto editado), `POST /api/followups/:id/skip`, `POST /api/followups/send-all` (todos los pendientes, pausa de 8 s), `POST /api/followups/run-now`.
+
+**Plan de pruebas tras desplegar v5.3.17:**
+
+1. En Seguimiento, poner intervalo 3 meses y modo manual, activar el seguimiento, guardar y pulsar “Buscar pendientes ahora”: debe aparecer la lista de pendientes (servicios REALIZADO/PAGADO de hace 3 meses o más).
+2. Editar el mensaje de un pendiente y enviarlo: debe llegar una sola vez al cliente y aparecer en Mensajes como mensaje propio.
+3. Poner modo automático y una hora cercana, esperar al día siguiente (o a la hora): debe enviarse solo y quedar en “Enviados”.
+4. Confirmar que “Auditoría & Limpieza” ya no aparece en el menú y que en su lugar está “Seguimiento”.
+
+## Limpiar la caché de WhatsApp sin borrar la sesión ni las fotos (v5.3.16, 2026-11-08)
+
+**El problema:** el volumen de Railway está casi lleno (81 % de 0.5 GB en
+Trial) y el usuario lo quiere limpio para enseñárselo al cliente. Lo que
+más pesa en ese volumen es el perfil de Chrome de la sesión de WhatsApp
+(sus cachés crecen con el uso), más las fotos subidas.
+
+**Qué hay en el volumen (`/app/data`, env `PERSIST_DIR=/app/data`):**
+
+- La sesión de WhatsApp: carpetas `session-wa-session-<id>/` (LocalAuth).
+  Sus credenciales viven en archivos de la sesión (Local Storage /
+  IndexedDB / raíz de la sesión).
+- La media subida: `uploads/wa-media/` (las fotos, audios y videos del
+  historial de chats).
+
+**Por qué NO hay que borrar el volumen desde Railway:** borrar el volumen
+borra la sesión de WhatsApp Y todas las fotos, y obliga a reescanear el QR
+desde cero. Nunca se hace para “limpiar”.
+
+**Qué hace el botón nuevo (Estado del Sistema → Acciones → “Limpiar caché
+de WhatsApp”, solo admin, endpoint `POST /api/system/whatsapp/clean-cache`):**
+
+1. Para las instancias QR con `stopWaInstance` (la misma parada
+   centralizada de Reconectar). Nunca se borran cachés con Chrome
+   corriendo. Las instancias Meta no tienen navegador: no se tocan.
+2. Mide el tamaño antes (sesión y fotos por separado).
+3. Borra SOLO carpetas de caché regenerables de Chrome dentro de cada
+   perfil `session-wa-session-*/Default/`, lista explícita
+   (`WA_CACHE_DIR_ALLOWLIST`): `Cache`, `Code Cache`, `GPUCache`,
+   `Service Worker/CacheStorage`, `ShaderCache`, `Crashpad`, `DawnCache`,
+   `GraphiteDawnCache`, `blob_storage`. Chrome las vuelve a crear solo.
+   Cada ruta se resuelve y se valida que empiece por `waDataDir()` antes
+   de borrar.
+4. Reinicia las instancias paradas con la misma sesión guardada (sin QR).
+   La respuesta no espera al ready: el estado se ve en Estado del
+   Sistema y el vigilante de ready actúa si algo se atasca.
+5. Devuelve `{ beforeMB, afterMB, freedMB, sessionMB, uploadsMB }` y
+   registra un `system_event` con el resultado.
+
+**Qué NO toca:** la raíz de la sesión, `Default` entero, `Local Storage`,
+`IndexedDB`, ni `uploads/wa-media` (las fotos del historial se quedan; si
+se borraran, las fotos del chat se romperían). El desglose de
+almacenamiento (sesión vs fotos vs libre del volumen) se muestra en la
+tarjeta de WhatsApp de Estado del Sistema y viaja en `GET
+/api/system/status` como bloque `storage` (con caché de 60 s, para no
+recorrer el perfil en cada refresco de 30 s).
+
+**El arreglo de fondo sigue siendo pasar a Hobby (5 $/mes):** el volumen
+pasa de 0.5 GB a 5 GB y la limpieza deja de ser urgente. La limpieza es
+para estirar el Trial y para mantener el volumen sano, no sustituye el
+cambio de plan.
+
+**Plan de pruebas tras desplegar v5.3.16:**
+
+1. En Estado del Sistema, ver el desglose (sesión X MB · Fotos Y MB ·
+   Volumen libre Z MB de W MB).
+2. Pulsar “Limpiar caché de WhatsApp” y confirmar: debe decir cuántos MB
+   liberó, y WhatsApp debe volver a “ready” solo, SIN pedir QR nuevo.
+3. Mandar un texto y una foto desde el CRM: deben llegar una sola vez y
+   la foto debe verse (la limpieza no toca ni la sesión ni la media).
 
 ## Configuración de Google Calendar y Telegram en el CRM (v5.3.15, 2026-11-08)
 

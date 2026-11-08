@@ -95,6 +95,26 @@ export interface ClientReminder {
   created_by: string;
 }
 
+// v5.3.17 Seguimiento automático: un pendiente por servicio realizado o
+// pagado (service_id único: nunca se duplica). El mensaje ya va renderizado
+// con la plantilla; el estado lo mueve el trabajo diario o el admin.
+export type FollowupStatus = 'pending' | 'sent' | 'failed' | 'skipped';
+
+export interface FollowupRow {
+  id: string;
+  service_id: string;
+  client_phone: string;
+  client_name: string;
+  service_name: string;
+  service_date: string;
+  due_date: string;
+  message: string;
+  attachment_url: string | null;
+  status: FollowupStatus;
+  sent_at: string | null;
+  created_at: string;
+}
+
 export interface ClientSummary {
   clientPhone: string;
   clientName: string;
@@ -107,7 +127,7 @@ export interface ClientSummary {
   source: string;
 }
 
-export type ViewState = 'dashboard' | 'leads' | 'services' | 'team' | 'inbox' | 'deals' | 'clients' | 'audit' | 'wa-channels' | 'branding' | 'system-status' | 'invoices';
+export type ViewState = 'dashboard' | 'leads' | 'services' | 'team' | 'inbox' | 'deals' | 'clients' | 'followups' | 'wa-channels' | 'branding' | 'system-status' | 'invoices';
 
 // v5 Parte 2A Facturación: factura interna (NO es factura electrónica DIAN).
 // v5.1 Tipo de factura: 'normal' (factura de venta sin DIAN, por defecto) o
