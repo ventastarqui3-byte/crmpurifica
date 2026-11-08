@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.18';
+const APP_VERSION = '5.3.20';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -2987,6 +2987,35 @@ const initDB = async () => {
         sent_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW()
       );
+      -- v5.3.20 Campañas personalizadas (dentro de Seguimiento): el admin
+      -- escoge clientes de la lista y les manda un mensaje con su nombre
+      -- (y una imagen o video opcional), cuando él quiera. A diferencia del
+      -- seguimiento automático (que es por servicio vencido), la campaña es
+      -- manual y a los clientes que se escojan. Tope de 100 destinatarios
+      -- por campaña y pausa de 8 s entre envíos (anti-bloqueo por QR).
+      CREATE TABLE IF NOT EXISTS campaigns (
+        id VARCHAR(50) PRIMARY KEY,
+        name VARCHAR(200),
+        message TEXT,
+        media_url TEXT DEFAULT '',
+        media_type VARCHAR(20) DEFAULT '',
+        status VARCHAR(20) DEFAULT 'draft',
+        created_by VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS campaign_recipients (
+        id VARCHAR(50) PRIMARY KEY,
+        campaign_id VARCHAR(50),
+        client_phone VARCHAR(50),
+        client_name VARCHAR(100),
+        message TEXT,
+        attachment_url TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        sent_at TIMESTAMP,
+        error TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(campaign_id, client_phone)
+      );
       CREATE TABLE IF NOT EXISTS leads (
         id SERIAL PRIMARY KEY,
         conversation_id VARCHAR(50) UNIQUE,
@@ -3849,6 +3878,238 @@ app.post('/api/followups/run-now', requireAdmin, async (req, res) => {
   try {
     const summary = await runFollowupScan();
     res.json({ success: true, ...summary });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ---------- v5.3.20 CAMPAÑAS PERSONALIZADAS (dentro de Seguimiento) ----------
+// A diferencia del seguimiento automático (un aviso por servicio vencido),
+// la campaña la crea el admin cuando quiere, escogiendo los clientes de la
+// lista. Cada destinatario recibe el mensaje con SU nombre ({{nombre}}) y
+// el nombre de la empresa ({{empresa}}), más la imagen o el video de la
+// campaña si tiene. El envío va EN SEGUNDO PLANO (con 100 destinatarios y
+// 8 s de pausa son ~13 min: la petición HTTP no puede esperar tanto) y el
+// frontend consulta el progreso cada 5 s mientras la campaña está
+// 'sending'. Cada mensaje queda en la conversación de Mensajes como propio,
+// igual que el seguimiento. Tope de 100 destinatarios por campaña (v1).
+
+const CAMPAIGN_MAX_RECIPIENTS = 100;
+const CAMPAIGN_SEND_PAUSE_MS = 8000;
+const campaignSending = new Set();
+
+function renderCampaignMessage(template, clientName, companyName) {
+  return String(template || '')
+    .replace(/\{\{\s*nombre\s*\}\}/gi, clientName || 'cliente')
+    .replace(/\{\{\s*empresa\s*\}\}/gi, companyName || 'Purifica Tu Ambiente');
+}
+
+// Envía la campaña a UN destinatario por el mismo flujo que el inbox y el
+// seguimiento: sendWhatsAppMessage y luego handleIncomingWhatsApp guarda el
+// mensaje como propio (sender 'agent', sin subir no leídos) en la
+// conversación del cliente, con su external_id. El medio se lee de la
+// campaña (no de settings): si el archivo no existe, sale solo texto.
+async function sendCampaignMessage(campaign, recipient) {
+  const { phone } = normalizePhoneCO(recipient.client_phone);
+  if (!phone) return { ok: false, error: 'Teléfono vacío o inválido' };
+  let channel = 'qr';
+  try {
+    const c = await pool.query('SELECT channel FROM conversations WHERE client_phone = $1', [phone]);
+    if (c.rows[0]?.channel) channel = c.rows[0].channel;
+  } catch { /* sin conversación previa: QR por defecto */ }
+  let media = null;
+  if (campaign.media_url && campaign.media_type) {
+    const file = readWaAttachmentFile(campaign.media_url);
+    if (file.error) {
+      logger.warn(`Campaña ${campaign.id} a ${phone}: medio ${campaign.media_url} no se pudo leer (${file.error}); se envía solo el texto.`);
+    } else {
+      media = { type: campaign.media_type, mimetype: file.mimetype, data: file.data, filename: file.filename, attachmentUrl: campaign.media_url };
+    }
+  }
+  const company = await getCompanySettings().catch(() => ({}));
+  const companyName = company.branding_company_name || 'Purifica Tu Ambiente';
+  const text = renderCampaignMessage(campaign.message, recipient.client_name, companyName);
+  const result = await sendWhatsAppMessage({ phone, content: text, channel, media });
+  if (!result.ok) return { ok: false, error: result.error };
+  try {
+    await handleIncomingWhatsApp({ phone, content: text, sourceName: 'campaña', channel, externalId: result.messageId || null, senderName: recipient.client_name, sender: 'agent', incrementUnread: false, type: media ? media.type : 'text', attachmentUrl: media ? media.attachmentUrl : null });
+  } catch (e) {
+    logger.error('Campaña enviada pero no se pudo guardar en la conversación', e.message);
+  }
+  return { ok: true, messageId: result.messageId || null, text, attachmentUrl: media ? media.attachmentUrl : null };
+}
+
+// Trabajo de envío en segundo plano: recorre los 'pending' en orden, con
+// pausa entre envíos. Al terminar marca la campaña 'done' (todos enviados)
+// o 'partial' (alguno fallido). Si el servidor se reinicia a mitad, los
+// que quedan en 'pending' se pueden reenviar con Enviar/Reintentar.
+async function runCampaignSend(campaignId) {
+  if (campaignSending.has(campaignId)) return;
+  campaignSending.add(campaignId);
+  try {
+    const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
+    if (!cur.rows[0]) return;
+    const campaign = cur.rows[0];
+    const r = await pool.query("SELECT * FROM campaign_recipients WHERE campaign_id = $1 AND status = 'pending' ORDER BY created_at ASC", [campaignId]);
+    let sent = 0, failed = 0;
+    for (let i = 0; i < r.rows.length; i++) {
+      if (i > 0) await sleep(CAMPAIGN_SEND_PAUSE_MS);
+      const rec = r.rows[i];
+      try {
+        const res2 = await sendCampaignMessage(campaign, rec);
+        if (res2.ok) {
+          await pool.query("UPDATE campaign_recipients SET status = 'sent', sent_at = NOW(), message = $1, attachment_url = $2 WHERE id = $3", [res2.text, res2.attachmentUrl, rec.id]);
+          sent++;
+        } else {
+          await pool.query("UPDATE campaign_recipients SET status = 'failed', error = $1 WHERE id = $2", [String(res2.error || 'No se pudo enviar'), rec.id]);
+          failed++;
+          logger.error(`Campaña ${campaignId} no se pudo enviar a ${rec.client_phone}: ${res2.error}`);
+        }
+      } catch (e) {
+        await pool.query("UPDATE campaign_recipients SET status = 'failed', error = $1 WHERE id = $2", [String(e.message || 'Error desconocido'), rec.id]);
+        failed++;
+      }
+      notifyUpdate('campaign');
+    }
+    const finalStatus = failed === 0 ? 'done' : 'partial';
+    await pool.query('UPDATE campaigns SET status = $1 WHERE id = $2', [finalStatus, campaignId]);
+    await recordEvent('info', 'campaigns', `Campaña ${campaign.name} terminada: ${sent} enviados, ${failed} fallidos`, { campaign: campaignId });
+    notifyUpdate('campaign');
+  } catch (e) {
+    logger.error(`Campaña ${campaignId}: error en el envío en segundo plano`, e.message);
+    try { await pool.query("UPDATE campaigns SET status = 'partial' WHERE id = $1 AND status = 'sending'", [campaignId]); } catch { /* noop */ }
+  } finally {
+    campaignSending.delete(campaignId);
+  }
+}
+
+app.get('/api/campaigns', requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT c.*,
+        (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.id) AS total,
+        (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.id AND r.status = 'sent') AS sent,
+        (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.id AND r.status = 'failed') AS failed,
+        (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.id AND r.status = 'pending') AS pending
+       FROM campaigns c ORDER BY c.created_at DESC LIMIT 50`
+    );
+    res.json(r.rows.map((c) => ({ ...c, total: Number(c.total), sent: Number(c.sent), failed: Number(c.failed), pending: Number(c.pending) })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/campaigns', requireAdmin, async (req, res) => {
+  try {
+    const { name, message, media_url, media_type, recipients } = req.body || {};
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'La campaña necesita un nombre' });
+    if (!String(message || '').trim()) return res.status(400).json({ error: 'La campaña necesita un mensaje' });
+    if (!Array.isArray(recipients) || recipients.length === 0) return res.status(400).json({ error: 'Escoge al menos un cliente' });
+    if (recipients.length > CAMPAIGN_MAX_RECIPIENTS) return res.status(400).json({ error: `Máximo ${CAMPAIGN_MAX_RECIPIENTS} clientes por campaña` });
+    const mediaUrl = String(media_url || '').trim();
+    const mediaType = String(media_type || '').trim();
+    if (mediaUrl && mediaType !== 'image' && mediaType !== 'video') return res.status(400).json({ error: 'El medio debe ser imagen o video' });
+    if (mediaUrl && !mediaUrl.startsWith('/uploads/wa-media/')) return res.status(400).json({ error: 'La ruta del medio no es válida' });
+    // Normaliza los teléfonos y quita duplicados (por teléfono normalizado)
+    // y vacíos: lo que se guarda es lo que se va a enviar.
+    const seen = new Set();
+    const clean = [];
+    let skipped = 0;
+    for (const rec of recipients) {
+      const rawPhone = String(rec?.phone || '').trim();
+      if (!rawPhone) { skipped++; continue; }
+      const { phone } = normalizePhoneCO(rawPhone);
+      if (!phone || seen.has(phone)) { skipped++; continue; }
+      seen.add(phone);
+      clean.push({ phone, name: String(rec?.name || '').trim() || 'Cliente' });
+    }
+    if (clean.length === 0) return res.status(400).json({ error: 'Ningún destinatario tiene un teléfono válido' });
+    const campaignId = `camp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    await pool.query(
+      "INSERT INTO campaigns (id, name, message, media_url, media_type, status, created_by) VALUES ($1, $2, $3, $4, $5, 'draft', $6)",
+      [campaignId, String(name).trim(), String(message).trim(), mediaUrl, mediaUrl ? mediaType : '', req.user?.email || req.user?.name || 'admin']
+    );
+    for (const rec of clean) {
+      const recId = `cr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      await pool.query(
+        'INSERT INTO campaign_recipients (id, campaign_id, client_phone, client_name) VALUES ($1, $2, $3, $4) ON CONFLICT (campaign_id, client_phone) DO NOTHING',
+        [recId, campaignId, rec.phone, rec.name]
+      );
+    }
+    notifyUpdate('campaign');
+    res.json({ success: true, id: campaignId, total: clean.length, skipped });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/campaigns/:id', requireAdmin, async (req, res) => {
+  try {
+    const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Campaña no encontrada' });
+    const r = await pool.query('SELECT * FROM campaign_recipients WHERE campaign_id = $1 ORDER BY created_at ASC LIMIT 200', [req.params.id]);
+    res.json({ ...cur.rows[0], recipients: r.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// v5.3.20 — Subida de imagen o video para una campaña (mismo multer del
+// chat, tope 25 MB, solo imagen o video). El endpoint solo sube y devuelve
+// la URL; el frontend la manda en el body al crear la campaña.
+app.post('/api/campaigns/media', requireAdmin, async (req, res) => {
+  waMediaUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) return res.status(400).json({ error: 'Sube una imagen o un video' });
+    const mimetype = req.file.mimetype || '';
+    if (!mimetype.startsWith('image/') && !mimetype.startsWith('video/')) {
+      try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
+      return res.status(400).json({ error: 'Solo se admite imagen o video' });
+    }
+    const type = waMediaTypeFromMime(mimetype);
+    res.json({ success: true, url: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
+  });
+});
+
+app.post('/api/campaigns/:id/send', requireAdmin, async (req, res) => {
+  try {
+    const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Campaña no encontrada' });
+    if (campaignSending.has(req.params.id) || cur.rows[0].status === 'sending') {
+      return res.status(409).json({ error: 'Esta campaña ya se está enviando' });
+    }
+    const pend = await pool.query("SELECT COUNT(*) AS n FROM campaign_recipients WHERE campaign_id = $1 AND status = 'pending'", [req.params.id]);
+    if (Number(pend.rows[0].n) === 0) return res.status(400).json({ error: 'No hay destinatarios pendientes en esta campaña' });
+    await pool.query("UPDATE campaigns SET status = 'sending' WHERE id = $1", [req.params.id]);
+    notifyUpdate('campaign');
+    // En segundo plano: con la pausa de 8 s, la respuesta no espera.
+    runCampaignSend(req.params.id).catch((e) => logger.error(`Campaña ${req.params.id}: envío en segundo plano falló`, e.message));
+    res.json({ success: true, started: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/campaigns/:id/retry-failed', requireAdmin, async (req, res) => {
+  try {
+    const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Campaña no encontrada' });
+    if (campaignSending.has(req.params.id) || cur.rows[0].status === 'sending') {
+      return res.status(409).json({ error: 'Esta campaña ya se está enviando' });
+    }
+    const upd = await pool.query("UPDATE campaign_recipients SET status = 'pending', error = NULL WHERE campaign_id = $1 AND status = 'failed' RETURNING id", [req.params.id]);
+    if (upd.rows.length === 0) return res.status(400).json({ error: 'No hay destinatarios fallidos para reintentar' });
+    await pool.query("UPDATE campaigns SET status = 'sending' WHERE id = $1", [req.params.id]);
+    notifyUpdate('campaign');
+    runCampaignSend(req.params.id).catch((e) => logger.error(`Campaña ${req.params.id}: reintento en segundo plano falló`, e.message));
+    res.json({ success: true, started: true, retried: upd.rows.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/campaigns/:id', requireAdmin, async (req, res) => {
+  try {
+    const cur = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ error: 'Campaña no encontrada' });
+    if (campaignSending.has(req.params.id) || cur.rows[0].status === 'sending') {
+      return res.status(409).json({ error: 'No se puede eliminar una campaña que se está enviando' });
+    }
+    await pool.query('DELETE FROM campaign_recipients WHERE campaign_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM campaigns WHERE id = $1', [req.params.id]);
+    notifyUpdate('campaign');
+    res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5401,7 +5662,7 @@ app.post('/api/invoices/:id/payments', requireBilling, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const inv = await client.query('SELECT i.*, s.advisor, s.operators FROM invoices i LEFT JOIN services s ON s.id = i.service_id WHERE i.id = $1 FOR UPDATE', [req.params.id]);
+    const inv = await client.query('SELECT i.*, s.advisor, s.operators FROM invoices i LEFT JOIN services s ON s.id = i.service_id WHERE i.id = $1 FOR UPDATE OF i', [req.params.id]);
     if (!inv.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Factura no encontrada' }); }
     const row = inv.rows[0];
     // v5.3 Alcance por rol: un asesor solo cobra sus facturas.

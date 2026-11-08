@@ -127,6 +127,40 @@ export interface ClientSummary {
   source: string;
 }
 
+// v5.3.20 Campañas personalizadas (dentro de Seguimiento): el admin escoge
+// clientes y les manda un mensaje con su nombre ({{nombre}}) y el nombre de
+// la empresa ({{empresa}}), más una imagen o un video opcional. A diferencia
+// del seguimiento automático (por servicio vencido), la campaña es manual.
+export type CampaignStatus = 'draft' | 'sending' | 'done' | 'partial';
+
+export interface CampaignRow {
+  id: string;
+  name: string;
+  message: string;
+  media_url: string | null;
+  media_type: 'image' | 'video' | '' | null;
+  status: CampaignStatus;
+  created_by: string | null;
+  created_at: string;
+  total: number;
+  sent: number;
+  failed: number;
+  pending: number;
+}
+
+export interface CampaignRecipientRow {
+  id: string;
+  campaign_id: string;
+  client_phone: string;
+  client_name: string;
+  message: string | null;
+  attachment_url: string | null;
+  status: 'pending' | 'sent' | 'failed';
+  sent_at: string | null;
+  error: string | null;
+  created_at: string;
+}
+
 export type ViewState = 'dashboard' | 'leads' | 'services' | 'team' | 'inbox' | 'deals' | 'clients' | 'followups' | 'wa-channels' | 'branding' | 'system-status' | 'invoices';
 
 // v5 Parte 2A Facturación: factura interna (NO es factura electrónica DIAN).

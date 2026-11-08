@@ -11,9 +11,10 @@
 // por ejemplo para una promoción). El medio se lee al enviar, no al crear el
 // pendiente.
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Clock, Send, X, RefreshCw, Play, Loader2, CheckCircle2, XCircle, Save, BellRing, Upload, Trash2 } from 'lucide-react';
+import { Clock, Send, X, RefreshCw, Play, Loader2, CheckCircle2, XCircle, Save, BellRing, Upload, Trash2, Megaphone } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type { FollowupRow, FollowupStatus } from '../types';
+import { Campaigns } from './Campaigns';
 
 const DEFAULT_MESSAGE = 'Hola {{nombre}}, soy de Purifica Tu Ambiente. Hace {{meses}} meses hicimos la limpieza de {{servicio}} en tu hogar y ya es hora de otra limpieza. ¿Te agendo una visita esta semana?';
 
@@ -56,6 +57,9 @@ export const FollowUps: React.FC = () => {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [edits, setEdits] = useState<Record<string, string>>({});
+
+  // v5.3.20 Pestañas: seguimiento automático | campañas personalizadas.
+  const [tab, setTab] = useState<'auto' | 'campaigns'>('auto');
 
   const load = useCallback(async (first = false) => {
     if (first) setLoading(true);
@@ -225,6 +229,26 @@ export const FollowUps: React.FC = () => {
         </p>
       </div>
 
+      {/* v5.3.20 Pestañas: automático | campañas */}
+      <div className="flex gap-2">
+        <button
+          onClick={() => setTab('auto')}
+          className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${tab === 'auto' ? 'bg-brand-600 text-white' : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'}`}
+        >
+          <BellRing className="w-4 h-4" /> Seguimiento automático
+        </button>
+        <button
+          onClick={() => setTab('campaigns')}
+          className={`px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 ${tab === 'campaigns' ? 'bg-brand-600 text-white' : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'}`}
+        >
+          <Megaphone className="w-4 h-4" /> Campañas
+        </button>
+      </div>
+
+      {tab === 'campaigns' ? (
+        <Campaigns />
+      ) : (
+      <>
       {/* Ajustes */}
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
         <h2 className="font-bold text-slate-800 mb-3">Ajustes</h2>
@@ -440,6 +464,8 @@ export const FollowUps: React.FC = () => {
           ))}
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 };

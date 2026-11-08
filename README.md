@@ -1,4 +1,36 @@
-# Purifica Tu Ambiente CRM — v5.3.18 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento)
+# Purifica Tu Ambiente CRM — v5.3.20 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento)
+
+## Campañas personalizadas en Seguimiento (v5.3.20, 2026-11-08)
+
+**Qué es:** dentro de Seguimiento hay ahora dos pestañas: **Seguimiento automático** (lo de antes) y **Campañas**. La diferencia: el seguimiento automático avisa por un servicio vencido; la campaña la crea el admin cuando quiere, escogiendo los clientes de la lista, para mandarles una promoción o un aviso personalizado.
+
+**Cómo funciona:**
+
+1. En la pestaña Campañas, se crea la campaña: nombre, mensaje con variables `{{nombre}}` (nombre del cliente) y `{{empresa}}` (nombre de la empresa desde Personalización), y una imagen o un video opcional (máximo 25 MB, mismo tope que el chat).
+2. Se escogen los clientes con buscador (por nombre o teléfono) y casillas, o “Seleccionar todos los visibles”. Máximo **100 clientes por campaña** (v1): es un tope anti-bloqueo, porque enviar cientos de mensajes seguidos por QR es lo que hace que WhatsApp marque el número como spam.
+3. Crear la campaña NO la envía: queda en borrador y se manda con el botón **Enviar** cuando el admin quiera.
+4. El envío va **en segundo plano** con pausa de **8 s entre clientes** (100 clientes son ~13 min): la respuesta no espera, y la lista se actualiza sola cada 5 s mientras la campaña está enviando. Cada mensaje queda en la conversación de Mensajes como uno propio más, con el nombre del cliente y la imagen o el video si tenía.
+5. El historial muestra cada campaña con enviados/total y fallidos, con botones para ver los destinatarios (y su estado), reintentar los fallidos y eliminar. Si el servidor se reinicia a mitad de un envío, los que quedan en “pendiente” se pueden reenviar con Enviar/Reintentar (no se reanuda solo).
+6. Eliminar una campaña no borra el archivo de la imagen o el video: los mensajes ya enviados apuntan a esa URL y borrarlo rompería sus vistas previas.
+
+**Plan de pruebas tras desplegar v5.3.20:**
+
+1. Crear una campaña con 2 clientes (Virtual Zone + otro), mensaje con `{{nombre}}` e imagen, y enviarla: deben llegar los 2 mensajes con su nombre y la imagen, y verse en Mensajes.
+2. El historial debe mostrar 2/2 enviados.
+3. Crear una campaña sin medio y enviarla: debe llegar solo texto.
+
+## Pago manual de factura: error “FOR UPDATE cannot be applied to the nullable side of an outer join” (v5.3.19, 2026-11-08)
+
+**Qué pasaba:** al pulsar “Registrar pago” en una factura (por ejemplo FAC-0001, $120.000) salía el error de Postgres `FOR UPDATE cannot be applied to the nullable side of an outer join` y el pago NO se guardaba: la factura seguía en pendiente con saldo $120.000. Le pasaba a CUALQUIER factura, no solo a FAC-0001: era un bug latente desde que se hizo la facturación, nunca se había probado un pago manual contra Postgres real.
+
+**Por qué:** el endpoint `POST /api/invoices/:id/payments` bloqueaba la fila con `SELECT i.*, s.advisor, s.operators FROM invoices i LEFT JOIN services s ON s.id = i.service_id WHERE i.id = $1 FOR UPDATE`. Un `FOR UPDATE` sin lista `OF` intenta bloquear TODAS las tablas de la consulta, incluido el lado anulable del `LEFT JOIN` (services, que puede no tener fila), y Postgres lo prohíbe. El catch hacía ROLLBACK, así que no se guardaba nada.
+
+**El arreglo (cambio mínimo, server.js línea 5404):** `FOR UPDATE` → `FOR UPDATE OF i`. Solo se bloquea la fila de `invoices`, que es la que necesita el bloqueo; `services` solo se lee para el alcance por rol (advisor/operators) y no necesita bloquearse. El resto del endpoint no se tocó: validaciones de estado, `Math.min` contra el saldo, INSERT en `payments`, recálculo de balance y estado con `invoiceStatusFor`, COMMIT, `recordEvent` y `notifyUpdate` quedan exactamente igual. Los otros tres `FOR UPDATE` del archivo (líneas ~5279, ~5448 y ~5584) son sobre una sola tabla y son correctos; se dejaron como están. No hay ningún otro `LEFT JOIN` + `FOR UPDATE` en `server.js`.
+
+**Plan de pruebas tras desplegar v5.3.19:**
+
+1. Registrar el pago de $120.000 en FAC-0001: debe quedar PAGADO con saldo $0 y cobrado $120.000.
+2. Registrar un abono parcial en otra factura: debe quedar PARCIAL con el saldo restante.
 
 ## Imagen o video en el seguimiento, cambiable cuando se quiera (v5.3.18, 2026-11-08)
 
