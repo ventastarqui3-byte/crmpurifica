@@ -46,7 +46,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.22';
+const APP_VERSION = '5.3.23';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -439,71 +439,180 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         }
         return info.body === args.content;
       };
-      // v5.3.22 — Separar PREPARACIÓN de ENVÍO: el sendMessage inyectado
-      // hace las dos cosas en una sola llamada (processMediaData: crear el
-      // archivo, prepRawMedia, subida MMS; y luego addAndSendMsgToChat /
-      // construcción del mensaje / Msg.get), así que el error opaco del
-      // getter no decía en cuál de las dos fallaba. La 5.3.21 probó que el
-      // LID de la cuenta SÍ está resuelto (53786529792040@lid) y que el
-      // reintento como documento falla con el mismo error y stack, así que
-      // la vista previa no es el problema. Aquí se llama a
-      // processMediaData POR SEPARADO, con las mismas opciones del envío
-      // normal. Si la preparación FALLA, no se intenta el sendMessage ni
-      // el reintento como documento (fallarían igual) y se devuelve el
-      // error de la preparación. Si sale BIEN, se sigue con el sendMessage
-      // normal (que sube el medio una segunda vez: costo del diagnóstico).
-      // El camino de texto (sin media) no pasa por aquí.
-      if (args.media) {
+      // v5.3.23 — Envío MANUAL de media (solo image/video/document): el
+      // log de la 5.3.22 probó que processMediaData sale OK (preparación
+      // OK, filehash sí) y que el fallo está en la CONSTRUCCIÓN del
+      // mensaje: el stack muestra `new Msg` -> initialize ->
+      // getValidatedSender -> getSender -> el getter memoizado recibe un
+      // id undefined. Hipótesis: en el sendMessage inyectado el mensaje
+      // se construye con id/from/to ANTES de esparcir `...mediaOptions` y
+      // `...mediaOptions.toJSON()`, así que si el resultado de
+      // processMediaData trae un campo id/from/sender/author/participant,
+      // SOBRESCRIBE los correctos y el remitente sale undefined. Por eso
+      // el texto (sin esparcido) funciona y la foto/video fallan, y el
+      // reintento como documento también (mismo sendMessage). Aquí se
+      // replica el sendMessage inyectado pero con el orden corregido:
+      // esparcidos del medio PRIMERO y los campos id/from/to AL FINAL,
+      // para que nada los sobrescriba. La preparación por separado de la
+      // 5.3.22 queda DENTRO del envío manual (su processMediaData es la
+      // preparación): no se duplica la llamada. El camino de texto y
+      // sticker/audio siguen por el sendMessage original, sin tocar.
+      const isManualMedia = !!(args.media && (args.mediaType === 'image' || args.mediaType === 'video' || args.mediaType === 'document'));
+      const stack10 = (e) => (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null);
+      // Envío manual: preparación + construcción + addAndSendMsgToChat.
+      // Devuelve { sentMsg } si salió, { prepFailed: true, error, stack }
+      // si falló la preparación (sin intentar el envío), o LANZA si falló
+      // el envío. El mensaje crudo devuelto es la confirmación (igual que
+      // con el texto: no se usa Msg.get, que lanza para este LID).
+      const manualSend = async (forceDoc) => {
+        let md = null;
         try {
-          const prepData = await window.WWebJS.processMediaData(args.media, {
+          md = await window.WWebJS.processMediaData(args.media, {
             forceSticker: false,
             forceGif: false,
             forceVoice: false,
-            forceDocument: !!args.sendMediaAsDocument,
+            forceDocument: !!forceDoc,
             forceMediaHd: false,
             sendToChannel: false,
             sendToStatus: false,
           });
-          let prepInfo = {};
-          try {
-            prepInfo = {
-              type: prepData ? prepData.type : null,
-              mimetype: prepData ? prepData.mimetype : null,
-              hasFilehash: !!(prepData && prepData.filehash),
-              size: prepData ? prepData.size : null,
-            };
-          } catch (e) { prepInfo = {}; }
-          out.prep = { ok: true, ...prepInfo };
         } catch (e) {
-          out.prep = {
-            ok: false,
-            error: (e && e.message) || String(e),
-            stack: (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null),
-          };
-          out.prepFailed = true;
-          out.error = 'processMediaData falló: ' + out.prep.error;
-          return out;
+          const prepFail = { ok: false, error: (e && e.message) || String(e), stack: stack10(e) };
+          if (!out.prep) out.prep = prepFail; else out.retryPrep = prepFail;
+          return { prepFailed: true, error: prepFail.error, stack: prepFail.stack };
         }
-      }
+        if (!md) {
+          const prepFail = { ok: false, error: 'processMediaData devolvió vacío', stack: null };
+          if (!out.prep) out.prep = prepFail; else out.retryPrep = prepFail;
+          return { prepFailed: true, error: prepFail.error, stack: null };
+        }
+        let prepInfo = {};
+        try {
+          prepInfo = {
+            type: md ? md.type : null,
+            mimetype: md ? md.mimetype : null,
+            hasFilehash: !!(md && md.filehash),
+            size: md ? md.size : null,
+          };
+        } catch (e) { prepInfo = {}; }
+        const prepRecord = { ok: true, ...prepInfo };
+        if (!out.prep) out.prep = prepRecord; else out.retryPrep = prepRecord;
+        // Claves del medio (solo los NOMBRES de campo, no los valores):
+        // confirman en el log si el resultado de processMediaData trae
+        // id/from/sender/author/participant y por tanto sobrescribía los
+        // del mensaje en el sendMessage inyectado.
+        let mediaKeys = [];
+        let mediaToJsonKeys = [];
+        let mdJson = null;
+        try { mediaKeys = Object.keys(md || {}); } catch (e) { mediaKeys = []; }
+        try { mdJson = (md && typeof md.toJSON === 'function') ? md.toJSON() : null; } catch (e) { mdJson = null; }
+        try { mediaToJsonKeys = mdJson ? Object.keys(mdJson) : []; } catch (e) { mediaToJsonKeys = []; }
+        out.mediaKeys = mediaKeys;
+        out.mediaToJsonKeys = mediaToJsonKeys;
+        out.mediaHasId = mediaKeys.indexOf('id') !== -1 || mediaToJsonKeys.indexOf('id') !== -1;
+        out.mediaHasFrom = mediaKeys.indexOf('from') !== -1 || mediaToJsonKeys.indexOf('from') !== -1;
+        out.mediaHasSender = mediaKeys.indexOf('sender') !== -1 || mediaToJsonKeys.indexOf('sender') !== -1;
+        out.mediaHasAuthor = mediaKeys.indexOf('author') !== -1 || mediaToJsonKeys.indexOf('author') !== -1;
+        out.mediaHasParticipant = mediaKeys.indexOf('participant') !== -1 || mediaToJsonKeys.indexOf('participant') !== -1;
+        // from / newMsgKey: réplica exacta del sendMessage inyectado
+        // (Utils.js: WAWebUserPrefsMeUser, WAWebMsgKey.newId, MsgKey).
+        const mePrefs2 = window.require('WAWebUserPrefsMeUser');
+        const lidUser2 = mePrefs2.getMaybeMeLidUser();
+        const meUser2 = mePrefs2.getMaybeMePnUser();
+        const newId = await window.require('WAWebMsgKey').newId();
+        let from = (typeof chat.id?.isLid === 'function' && chat.id.isLid()) ? lidUser2 : meUser2;
+        let participant;
+        try {
+          if (typeof chat.id?.isGroup === 'function' && chat.id.isGroup()) {
+            from = chat.groupMetadata && chat.groupMetadata.isLidAddressingMode ? lidUser2 : meUser2;
+            participant = window.require('WAWebWidFactory').asUserWidOrThrow(from);
+          }
+          if (typeof chat.id?.isStatus === 'function' && chat.id.isStatus()) {
+            participant = window.require('WAWebWidFactory').asUserWidOrThrow(from);
+          }
+        } catch (e) { participant = undefined; }
+        const newMsgKey = new (window.require('WAWebMsgKey'))({
+          from: from,
+          to: chat.id,
+          id: newId,
+          participant: participant,
+          selfDir: 'out',
+        });
+        let ephemeralFields = {};
+        try {
+          ephemeralFields = window.require('WAWebGetEphemeralFieldsMsgActionsUtils').getEphemeralFields(chat) || {};
+        } catch (e) { ephemeralFields = {}; }
+        // El mensaje: esparcidos del medio PRIMERO, campos correctos AL
+        // FINAL, para que nada los sobrescriba.
+        const message = {
+          ...(md || {}),
+          ...(mdJson || {}),
+          ...ephemeralFields,
+          id: newMsgKey,
+          ack: 0,
+          body: (md && md.preview) || '',
+          from: from,
+          to: chat.id,
+          local: true,
+          self: 'out',
+          t: parseInt(new Date().getTime() / 1000),
+          isNewMsg: true,
+          type: (md && md.type) || 'chat',
+          caption: args.caption,
+        };
+        const [msgPromise] = window.require('WAWebSendMsgChatAction').addAndSendMsgToChat(chat, message);
+        const sentMsg = await msgPromise;
+        return { sentMsg };
+      };
       let sentMsg = null;
       let sendError = null;
       let sendStack = null;
-      try {
-        const options = {};
-        if (args.media) {
-          options.media = args.media;
-          options.caption = args.caption;
-          if (args.sendMediaAsDocument) options.sendMediaAsDocument = true;
+      if (isManualMedia) {
+        out.manualSend = true;
+        let r1 = null;
+        try {
+          r1 = await manualSend(!!args.sendMediaAsDocument);
+        } catch (e) {
+          r1 = { thrown: true, error: (e && e.message) || String(e), stack: stack10(e) };
         }
-        sentMsg = await window.WWebJS.sendMessage(chat, args.content || '', options);
-      } catch (e) {
-        sendError = (e && e.message) || String(e);
-        // v5.3.21 — El mensaje del error es opaco ("Data passed to
-        // getter..."); el stack dice en qué paso dentro de la página
-        // falló (processMediaData, addAndSendMsgToChat o el Msg.get final).
-        // v5.3.22 — el stack se recorta a 10 líneas, no a 3: el log de la
-        // 5.3.21 solo mostró 2 frames (s e I) y no se veía nada debajo.
-        sendStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null);
+        if (r1 && r1.prepFailed) {
+          out.prepFailed = true;
+          out.error = 'processMediaData falló: ' + r1.error;
+          return out;
+        }
+        if (r1 && r1.sentMsg) {
+          sentMsg = r1.sentMsg;
+        } else if (r1 && r1.thrown) {
+          // El envío manual lanzó: puede haber transmitido igual (como
+          // pasaba con el texto en la 5.3.12/13), así que no se da por
+          // perdido todavía: la comprobación de mensajes recientes de
+          // abajo decide.
+          sendError = r1.error;
+          sendStack = r1.stack;
+          out.manualError = r1.error;
+          out.manualStack = r1.stack;
+        } else {
+          sendError = 'el envío manual devolvió vacío';
+          out.manualError = sendError;
+        }
+      } else {
+        try {
+          const options = {};
+          if (args.media) {
+            options.media = args.media;
+            options.caption = args.caption;
+            if (args.sendMediaAsDocument) options.sendMediaAsDocument = true;
+          }
+          sentMsg = await window.WWebJS.sendMessage(chat, args.content || '', options);
+        } catch (e) {
+          sendError = (e && e.message) || String(e);
+          // v5.3.21 — El mensaje del error es opaco ("Data passed to
+          // getter..."); el stack dice en qué paso dentro de la página
+          // falló (processMediaData, addAndSendMsgToChat o el Msg.get final).
+          // v5.3.22 — el stack se recorta a 10 líneas, no a 3: el log de la
+          // 5.3.21 solo mostró 2 frames (s e I) y no se veía nada debajo.
+          sendStack = stack10(e);
+        }
       }
       const recent = recentMsgsInfo(chat);
       const hit = [...recent].reverse().find(lastMatches);
@@ -523,43 +632,72 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         out.verifiedBy = 'mensaje-crudo';
         return out;
       }
-      // v5.3.21 — Reintento como documento (solo media image/video; el
-      // document ya se manda así en el primer intento y sticker/audio
-      // quedan fuera): si el envío normal lanzó el error del getter y la
-      // comprobación no encontró nuestro mensaje, el fallo puede estar en
-      // la generación de vista previa/miniatura del medio
-      // (processMediaData). Como documento ese paso se salta. UNA sola vez.
-      if (args.media && (args.mediaType === 'image' || args.mediaType === 'video') && !args.sendMediaAsDocument && sendError && /must include an id property/i.test(sendError)) {
-        let retryMsg = null;
-        let retryError = null;
-        let retryStack = null;
+      // Reintentos (solo media manual, solo si nada se confirmó):
+      // 1) error del getter + image/video (no document, que ya va así):
+      //    UNA vez el envío MANUAL como documento (forceDocument=true).
+      // 2) error DISTINTO del getter: UNA vez el sendMessage original
+      //    como último recurso (el camino viejo).
+      if (isManualMedia && sendError && /must include an id property/i.test(sendError) && (args.mediaType === 'image' || args.mediaType === 'video') && !args.sendMediaAsDocument) {
+        let r2 = null;
         try {
-          retryMsg = await window.WWebJS.sendMessage(chat, args.content || '', { media: args.media, caption: args.caption, sendMediaAsDocument: true });
+          r2 = await manualSend(true);
         } catch (e) {
-          retryError = (e && e.message) || String(e);
-          retryStack = (e && e.stack ? String(e.stack).split('\n').slice(0, 10).join(' | ') : null);
-        }
-        const recent2 = recentMsgsInfo(chat);
-        const hit2 = [...recent2].reverse().find(lastMatches);
-        if (hit2) {
-          out.sent = true;
-          out.messageId = hit2.id || (retryMsg && retryMsg.id && (retryMsg.id._serialized || retryMsg.id.$1)) || null;
-          out.verifiedBy = 'ultimo-mensaje-documento';
-          out.checked = recent2.length;
-          out.retriedAsDocument = true;
-          return out;
-        }
-        if (retryMsg) {
-          out.sent = true;
-          const mid = retryMsg.id;
-          out.messageId = (mid && (mid._serialized || mid.$1)) || null;
-          out.verifiedBy = 'mensaje-crudo-documento';
-          out.retriedAsDocument = true;
-          return out;
+          r2 = { thrown: true, error: (e && e.message) || String(e), stack: stack10(e) };
         }
         out.retriedAsDocument = true;
-        out.retryError = retryError || 'el reintento como documento devolvió vacío';
-        out.retryStack = retryStack;
+        if (r2 && r2.prepFailed) {
+          out.retryError = 'processMediaData falló en el reintento: ' + r2.error;
+          out.retryStack = r2.stack;
+        } else if (r2 && r2.sentMsg) {
+          const recent2 = recentMsgsInfo(chat);
+          const hit2 = [...recent2].reverse().find(lastMatches);
+          if (hit2) {
+            out.sent = true;
+            out.messageId = hit2.id || (r2.sentMsg && r2.sentMsg.id && (r2.sentMsg.id._serialized || r2.sentMsg.id.$1)) || null;
+            out.verifiedBy = 'ultimo-mensaje-documento';
+            out.checked = recent2.length;
+            return out;
+          }
+          out.sent = true;
+          const mid = r2.sentMsg.id;
+          out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+          out.verifiedBy = 'mensaje-crudo-documento';
+          return out;
+        } else if (r2 && r2.thrown) {
+          out.retryError = r2.error;
+          out.retryStack = r2.stack;
+        } else {
+          out.retryError = 'el reintento manual devolvió vacío';
+        }
+      } else if (isManualMedia && sendError && !/must include an id property/i.test(sendError)) {
+        let fbMsg = null;
+        try {
+          const fbOptions = { media: args.media, caption: args.caption };
+          if (args.sendMediaAsDocument) fbOptions.sendMediaAsDocument = true;
+          fbMsg = await window.WWebJS.sendMessage(chat, args.content || '', fbOptions);
+        } catch (e) {
+          out.fallbackError = (e && e.message) || String(e);
+          out.fallbackStack = stack10(e);
+          sendError = out.fallbackError;
+          sendStack = out.fallbackStack;
+        }
+        if (fbMsg) {
+          const recent3 = recentMsgsInfo(chat);
+          const hit3 = [...recent3].reverse().find(lastMatches);
+          out.fallbackUsed = true;
+          if (hit3) {
+            out.sent = true;
+            out.messageId = hit3.id || (fbMsg && fbMsg.id && (fbMsg.id._serialized || fbMsg.id.$1)) || null;
+            out.verifiedBy = 'ultimo-mensaje';
+            out.checked = recent3.length;
+            return out;
+          }
+          out.sent = true;
+          const mid = fbMsg.id;
+          out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+          out.verifiedBy = 'mensaje-crudo';
+          return out;
+        }
       }
       out.sendStack = sendStack;
       out.error = sendError || ('WWebJS.sendMessage devolvió vacío y ninguno de los últimos ' + recent.length + ' mensajes coincide');
@@ -580,14 +718,23 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
   logger.info(`WhatsApp (${target}): escaneo de chats: ${scan?.totalChats ?? '?'} chats en lista, ${scan?.matchedIds?.length || 0} coincidencias${scan?.matchedIds?.length ? ` (${scan.matchedIds.join(', ')})` : ''}`);
   if (!scan?.found) return { found: false, ok: false };
   if (scan.sent) {
-    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'}${scan.retriedAsDocument ? ', tras reintento como documento' : ''})`);
+    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'}${scan.manualSend ? ', envío manual' : ''}${scan.retriedAsDocument ? ', tras reintento como documento' : ''}${scan.fallbackUsed ? ', último recurso (sendMessage original)' : ''})`);
     return { found: true, ok: true, messageId: scan.messageId || null };
   }
   // v5.3.22 — La línea de fallo incluye el resultado de la preparación
   // por separado: OK (type/mimetype/filehash) o FALLÓ (error + stack).
   // Sin media (texto) no hay preparación y no se añade nada.
   const prepTxt = scan.prep ? (scan.prep.ok ? `; preparación: OK (type=${scan.prep.type || '?'}; mimetype=${scan.prep.mimetype || '?'}; filehash=${scan.prep.hasFilehash ? 'sí' : 'no'})` : `; preparación: FALLÓ (${scan.prep.error || 'sin error'}${scan.prep.stack ? `; stack: ${scan.prep.stack}` : ''})`) : '';
-  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'} (LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}${prepTxt}${scan.sendStack ? `; stack: ${scan.sendStack}` : ''}${scan.retriedAsDocument ? `; reintento como documento: ${scan.retryError || 'sin error'}${scan.retryStack ? `; stack: ${scan.retryStack}` : ''}` : ''})`);
+  // v5.3.23 — La línea de fallo incluye las claves del medio (solo los
+  // nombres de campo): si entre ellas están id/from/sender/author/
+  // participant, se confirma que el resultado de processMediaData
+  // sobrescribía los campos correctos del mensaje en el sendMessage
+  // inyectado. También se incluye el error del envío manual y, si se
+  // usó, el del último recurso (sendMessage original).
+  const keysTxt = (scan.mediaKeys || scan.mediaToJsonKeys) ? `; claves del medio: [${(scan.mediaKeys || []).join(', ')}]; claves toJSON: [${(scan.mediaToJsonKeys || []).join(', ')}]; sobrescribe: ${[scan.mediaHasId && 'id', scan.mediaHasFrom && 'from', scan.mediaHasSender && 'sender', scan.mediaHasAuthor && 'author', scan.mediaHasParticipant && 'participant'].filter(Boolean).join(', ') || 'ninguno'}` : '';
+  const manualTxt = scan.manualError ? `; envío manual: ${scan.manualError}${scan.manualStack ? `; stack manual: ${scan.manualStack}` : ''}` : '';
+  const fallbackTxt = scan.fallbackError ? `; último recurso (sendMessage original): ${scan.fallbackError}${scan.fallbackStack ? `; stack: ${scan.fallbackStack}` : ''}` : '';
+  logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} falló: ${scan.error || 'sin error'} (LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}${prepTxt}${keysTxt}${manualTxt}${scan.sendStack ? `; stack: ${scan.sendStack}` : ''}${scan.retriedAsDocument ? `; reintento como documento: ${scan.retryError || 'sin error'}${scan.retryStack ? `; stack: ${scan.retryStack}` : ''}` : ''}${fallbackTxt})`);
   return { found: true, ok: false, error: scan.error || 'El envío por escaneo no devolvió mensaje' };
 }
 
