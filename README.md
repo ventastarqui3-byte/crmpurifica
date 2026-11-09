@@ -1,4 +1,22 @@
-# Purifica Tu Ambiente CRM — v5.3.26 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens)
+# Purifica Tu Ambiente CRM — v5.3.27 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node)
+
+## v5.3.27 — Corrección urgente: WhatsApp caído por Chrome no encontrado (2026-11-08)
+
+**Qué pasó:** al desplegar la v5.3.26 en Railway, WhatsApp quedó en ERROR ("Could not find Chrome (ver. 145.0.7632.77)"). La sesión estaba intacta en el volumen (36.1 MB), pero el navegador no arrancaba, así que ni enviaba ni recibía nada.
+
+**Causa:** el cambio B8 de la v5.3.26 (Docker multi-etapa + app como usuario `node`). Puppeteer descarga Chrome al instalarse en `$PUPPETEER_CACHE_DIR`, o en `~/.cache/puppeteer` si no está definido. El `npm ci` de ejecución corría como root y Chrome quedaba en `/root/.cache/puppeteer`, pero la app corre como `node` y lo buscaba en `/home/node/.cache/puppeteer`. El servidor no tiene `executablePath` fijo: depende de esa resolución.
+
+**Corrección (solo Dockerfile):**
+- Etapa de ejecución: `ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer` antes del `npm ci --omit=dev`, así Chrome se descarga dentro de `/app`, que ya es de `node` por el `chown -R node:node /app`. La variable queda en la imagen, así que en ejecución Puppeteer lo encuentra ahí.
+- Etapa de build: `ENV PUPPETEER_SKIP_DOWNLOAD=true` (el build de Vite no necesita Chrome).
+
+**Plan de pruebas tras desplegar v5.3.27:**
+1. En Estado del Sistema, WhatsApp debe pasar de "Roto" a conectado (1 de 1 instancias) sin escanear QR (la sesión está guardada en el volumen).
+2. En Canales WhatsApp, la instancia "alejo ochoa" debe salir sin ERROR.
+3. Enviar un texto de prueba a Virtual Zone y confirmar que llega.
+4. Si vuelve a salir "Could not find Chrome" en el log, el problema no es este: revisar que la imagen se reconstruyó (el cambio de `package.json` a 5.3.27 invalida la caché de Docker desde el `COPY package*.json`).
+
+**Pendiente honesto:** la imagen Docker no se pudo construir en este entorno (sin Docker aquí), así que el `npm ci` de ejecución con el caché nuevo solo se probará en el despliegue de Railway. El arranque sin DB y el build se verificaron igual que en las versiones anteriores.
 
 ## Seguridad endurecida — FASE 1 (v5.3.24, 2026-11-08)
 

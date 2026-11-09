@@ -22,6 +22,11 @@ WORKDIR /app
 # Copiar archivos de dependencias
 COPY package*.json ./
 
+# El build (Vite) no necesita Chrome: no descargarlo aquí ahorra
+# tiempo y evita confusión. Chrome se descarga solo en la etapa de
+# ejecución, donde sí hace falta (WhatsApp por QR).
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
 # Instalar dependencias (todas: el build necesita vite y typescript)
 RUN npm ci
 
@@ -84,6 +89,18 @@ RUN apt-get update && apt-get install -y \
 
 # Crear directorio de la aplicación
 WORKDIR /app
+
+# v5.3.27 (corrección urgente de B8): dónde vive Chrome.
+# Puppeteer descarga Chrome al instalarse (`npm ci`) en
+# $PUPPETEER_CACHE_DIR, o en ~/.cache/puppeteer si no está definido.
+# En la v5.3.26 no estaba definido: el `npm ci` de ejecución corría
+# como root y Chrome quedaba en /root/.cache/puppeteer, pero la app
+# corre como usuario `node` y lo buscaba en /home/node/.cache/puppeteer
+# -> "Could not find Chrome" y WhatsApp caído en producción.
+# Ahora el caché vive dentro de /app (con dueño node por el chown de
+# abajo) y la variable queda en la imagen, así que en ejecución
+# Puppeteer lo encuentra ahí.
+ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
 
 # Solo dependencias de producción (sin vite/typescript/terser).
 COPY package*.json ./
