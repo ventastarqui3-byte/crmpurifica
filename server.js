@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.32';
+const APP_VERSION = '5.3.33';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -1183,6 +1183,15 @@ function waDataDir() {
   return p || path.resolve('.wwebjs_auth');
 }
 function waMediaDir() { return path.join(uploadsDir(), 'wa-media'); }
+
+// v5.3.33: los respaldos van al volumen persistente cuando existe
+// (PERSIST_DIR=/app/data en Railway): /app/backups del contenedor se
+// borra en cada redespliegue. Sin PERSIST_DIR (VPS/docker-compose) sigue
+// en <app>/backups, que ahí sí es un bind mount local (./backups).
+function backupsDir() {
+  const p = persistDir();
+  return p ? path.join(p, 'backups') : path.join(__dirname, 'backups');
+}
 
 // ---------- TAMAÑO DE ALMACENAMIENTO Y LIMPIEZA DE CACHÉ (v5.3.16) ----------
 // El volumen de Railway (PERSIST_DIR=/app/data) guarda dos cosas: la sesión
@@ -3094,6 +3103,19 @@ app.post('/api/system/backup', requireAdmin, async (req, res) => {
   }
 });
 
+// v5.3.33: descargar el último respaldo (solo admin). El nombre se
+// valida contra el patrón de respaldo y solo se sirve desde backupsDir():
+// nunca se entrega un archivo fuera de esa carpeta.
+app.get('/api/system/backup/download', requireAdmin, (req, res) => {
+  const file = String(req.query.file || '');
+  if (!BACKUP_FILE_RE.test(file)) return res.status(400).json({ ok: false, error: 'Nombre de respaldo no válido' });
+  const filePath = path.join(backupsDir(), file);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ ok: false, error: 'Respaldo no encontrado' });
+  res.download(filePath, file, (err) => {
+    if (err && !res.headersSent) res.status(500).json({ ok: false, error: err.message });
+  });
+});
+
 // ---------- GOOGLE CALENDAR v5.3 (pedido del cliente) ----------
 // Al agendar un servicio (crear o reprogramar) se crea/actualiza el evento
 // en Google Calendar; al cancelar o eliminar, se borra. API oficial con
@@ -3356,10 +3378,31 @@ async function encryptBackupFile(filePath) {
   return encPath;
 }
 
+// Nombre de archivo de respaldo válido: <marca>-AAAAMMDD-HHMM.sql.gz
+// (con o sin .enc). Se usa en la retención, en la migración y en la
+// descarga: nunca se sirve un archivo fuera de este patrón.
+const BACKUP_FILE_RE = /^[a-z0-9-]+\-\d{8}\-\d{4}\.sql\.gz(\.enc)?$/i;
+
 async function runBackup(trigger = 'manual') {
   if (!dbUrl) return { ok: false, code: 503, error: 'Base de datos no configurada' };
-  const backupsDir = path.join(__dirname, 'backups');
-  fs.mkdirSync(backupsDir, { recursive: true });
+  const dir = backupsDir();
+  fs.mkdirSync(dir, { recursive: true });
+  // v5.3.33: migración de respaldos viejos: en Railway los respaldos
+  // quedaban en <app>/backups (efímero); al pasar al volumen, mover los
+  // que ya existen al nuevo directorio, sin pisar nada. Copia+borrado
+  // (no rename: el volumen y el contenedor son filesystems distintos).
+  try {
+    const legacy = path.join(__dirname, 'backups');
+    if (legacy !== dir && fs.existsSync(legacy)) {
+      for (const f of fs.readdirSync(legacy)) {
+        if (!BACKUP_FILE_RE.test(f)) continue;
+        const from = path.join(legacy, f);
+        const to = path.join(dir, f);
+        if (fs.existsSync(to)) continue;
+        try { fs.copyFileSync(from, to); fs.unlinkSync(from); } catch { /* un archivo no bloquea los demás */ }
+      }
+    }
+  } catch { /* migración opcional: nunca rompe el respaldo */ }
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 13);
   // v5.3.25 (M8): nombre neutro derivado de la marca de la instalación
   // (antes 'purifica-' fijo, que delataba la empresa en instalaciones
@@ -3367,7 +3410,7 @@ async function runBackup(trigger = 'manual') {
   const company = await getCompanySettings().catch(() => ({}));
   const slug = String(company['branding_company_name'] || 'CRM').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'crm';
   let file = `${slug}-${stamp}.sql.gz`;
-  const filePath = path.join(backupsDir, file);
+  const filePath = path.join(dir, file);
   return new Promise((resolve) => {
     let settled = false;
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
@@ -3429,7 +3472,7 @@ async function runBackup(trigger = 'manual') {
         logger.warn(warn);
         recordEvent('warn', 'backup', warn, { file });
       }
-      const finalPath = path.join(backupsDir, file);
+      const finalPath = path.join(dir, file);
       const finalSize = fs.existsSync(finalPath) ? fs.statSync(finalPath).size : sizeBytes;
       lastBackup = { at: new Date().toISOString(), ok: true, file, sizeBytes: finalSize, encrypted, error: null };
       try {
@@ -3440,10 +3483,9 @@ async function runBackup(trigger = 'manual') {
       // o sin .enc): antes borraba CUALQUIER archivo viejo de backups/.
       try {
         const cutoff = Date.now() - BACKUP_KEEP_DAYS * 24 * 3600 * 1000;
-        const BACKUP_FILE_RE = /^[a-z0-9-]+\-\d{8}\-\d{4}\.sql\.gz(\.enc)?$/i;
-        for (const f of fs.readdirSync(backupsDir)) {
+        for (const f of fs.readdirSync(dir)) {
           if (!BACKUP_FILE_RE.test(f)) continue;
-          const p = path.join(backupsDir, f);
+          const p = path.join(dir, f);
           if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
         }
       } catch { /* limpieza opcional */ }

@@ -361,8 +361,12 @@ export const SystemStatus: React.FC = () => {
                 </p>
               )}
               {c.key === 'backup' && c.backup?.file && (
-                <p className="text-xs text-slate-400 mt-1">
-                  Archivo: {c.backup.file} · {Math.round((c.backup.sizeBytes || 0) / 1024)} KB
+                <p className="text-xs text-slate-400 mt-1 flex items-center gap-2 flex-wrap">
+                  <span>Archivo: {c.backup.file} · {Math.round((c.backup.sizeBytes || 0) / 1024)} KB</span>
+                  <a href={`/api/system/backup/download?file=${encodeURIComponent(c.backup.file)}`} download
+                    className="text-xs font-bold text-brand-600 hover:underline flex items-center gap-1">
+                    <Download className="w-3 h-3" /> Descargar
+                  </a>
                 </p>
               )}
             </div>
