@@ -6,6 +6,7 @@ import {
   Activity, CheckCircle2, AlertTriangle, XCircle, RefreshCw, Play,
   Database, Smartphone, Server, MessagesSquare, HardDrive, Bell,
   Loader2, RotateCcw, Download, Send, CalendarDays, Eraser,
+  Link2, Unlink, Copy,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type { SystemComponentStatus, SystemEvent, SelfTestResult } from '../types';
@@ -248,6 +249,29 @@ export const SystemStatus: React.FC = () => {
       return { message: json.detail || 'Google Calendar conectado: evento de prueba creado y borrado.' };
     });
 
+  // v5.3.35 Conectar con Google (OAuth con un clic): navegación normal al
+  // endpoint, que redirige a Google; el callback guarda el refresh token
+  // y muestra una página de éxito. La cookie httpOnly viaja sola.
+  // La URI de redirección es la que hay que registrar en Google Cloud
+  // (credencial tipo "Aplicación web"); se calcula con el origen actual.
+  const gcalRedirectUri = `${window.location.origin}/api/system/google-calendar/callback`;
+  const connectGoogle = () => { window.location.href = '/api/system/google-calendar/connect'; };
+  const disconnectGoogle = async () =>
+    runAction('gcal-disconnect', async () => {
+      const res = await apiFetch('/api/system/google-calendar/disconnect', { method: 'POST' });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'No se pudo desconectar Google Calendar');
+      return { message: json.detail || 'Google Calendar desconectado.' };
+    });
+  const copyGcalRedirectUri = async () => {
+    try {
+      await navigator.clipboard.writeText(gcalRedirectUri);
+      setMessage('URI de redirección copiada. Pégala en Google Cloud → Credenciales → tu cliente OAuth (Aplicación web).');
+    } catch {
+      setMessage(`Copia esta URI en Google Cloud: ${gcalRedirectUri}`);
+    }
+  };
+
   // v5.3.15 Telegram: los campos vacíos NO se envían (lo guardado se
   // conserva). Si no hay nada que guardar, se avisa en vez de llamar.
   const saveTelegram = async () =>
@@ -452,7 +476,17 @@ export const SystemStatus: React.FC = () => {
                 Habilitado (crear eventos al agendar servicios)
               </label>
               <p className="text-xs text-slate-400">
-                El refresh token se obtiene con <code className="font-mono">node scripts/get-google-refresh-token.js</code> (ver README, sección “Google Calendar”).
+                Para conectar con un clic, registra esta URI de redirección en Google Cloud → Credenciales → tu cliente OAuth (tipo <b>Aplicación web</b>):
+              </p>
+              <div className="flex items-center gap-2">
+                <code className="font-mono text-xs break-all bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 flex-1">{gcalRedirectUri}</code>
+                <button onClick={copyGcalRedirectUri} title="Copiar URI de redirección"
+                  className="bg-white border border-slate-300 text-slate-700 px-2 py-1 rounded-lg text-xs font-bold hover:bg-slate-50 flex items-center gap-1 shrink-0">
+                  <Copy className="w-3 h-3" /> Copiar
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                O con el script local: el refresh token se obtiene con <code className="font-mono">node scripts/get-google-refresh-token.js</code> (ver README, sección “Google Calendar”).
               </p>
               <div className="flex flex-wrap gap-2 pt-1">
                 <button onClick={saveGoogle} disabled={busy === 'gcal-save'}
@@ -463,6 +497,16 @@ export const SystemStatus: React.FC = () => {
                   className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-900 disabled:opacity-60 flex items-center gap-2">
                   {busy === 'gcal-test' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />} Probar conexión
                 </button>
+                <button onClick={connectGoogle}
+                  className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 flex items-center gap-2">
+                  <Link2 className="w-4 h-4" /> Conectar con Google
+                </button>
+                {gcalComp?.configured && (
+                  <button onClick={disconnectGoogle} disabled={busy === 'gcal-disconnect'}
+                    className="bg-white border border-slate-300 text-slate-700 px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-50 disabled:opacity-60 flex items-center gap-2">
+                    {busy === 'gcal-disconnect' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Unlink className="w-4 h-4" />} Desconectar
+                  </button>
+                )}
               </div>
             </div>
           </div>

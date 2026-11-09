@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.34';
+const APP_VERSION = '5.3.35';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -2604,6 +2604,10 @@ const PUBLIC_API = [
   // X-Hub-Signature-256 (META_WA_APP_SECRET). Ver sección v5 Parte 2B.
   { method: 'GET', path: '/api/webhooks/meta' },
   { method: 'POST', path: '/api/webhooks/meta' },
+  // Callback de Google Calendar (v5.3.35): público por diseño. Google
+  // redirige desde accounts.google.com sin la cookie del CRM; lo protege
+  // el `state` de un solo uso (10 min), no el JWT.
+  { method: 'GET', path: '/api/system/google-calendar/callback' },
 ];
 const isPublicApi = (req) => PUBLIC_API.some(r => r.method === req.method && r.path === req.path);
 // Rutas que NO necesitan base de datos (estado en memoria de WhatsApp / health
@@ -6778,6 +6782,100 @@ app.post('/api/system/google-calendar/test', requireAdmin, async (req, res) => {
   }
 });
 
+// ---------- GOOGLE CALENDAR: CONECTAR CON UN CLIC (v5.3.35) ----------
+// El flujo viejo con el script local (credencial de escritorio,
+// redirect http://localhost:8089) sigue funcionando; esto es aditivo.
+// Aquí la credencial tiene que ser de tipo "Aplicación web" (la de
+// escritorio no admite una URI pública de redirección; el tipo no se
+// puede cambiar en una credencial existente, hay que crear una nueva) y
+// hay que registrar la URI de redirección que muestra el panel.
+// El callback NO usa la cookie httpOnly (Google redirige desde
+// accounts.google.com): se protege con `state` de un solo uso.
+const GOOGLE_OAUTH_STATES = new Map(); // state -> { redirectUri, createdAt }
+const GOOGLE_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+function googleOAuthHtmlPage(title, bodyHtml) {
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title><style>body{font-family:system-ui,Arial,sans-serif;max-width:560px;margin:60px auto;padding:0 20px;color:#1e293b}h1{font-size:20px}a{color:#2563eb}</style></head><body><h1>${title}</h1>${bodyHtml}</body></html>`;
+}
+
+function escapeHtmlAttr(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Inicia la conexión: redirige a Google para autorizar con la cuenta
+// de la empresa. prompt=consent fuerza un refresh token nuevo aunque
+// ya hubiera uno (así se puede cambiar de cuenta).
+app.get('/api/system/google-calendar/connect', requireAdmin, async (req, res) => {
+  try {
+    const clientId = (await getSettingValue('google_client_id', ''))?.trim() || GOOGLE_CLIENT_ID;
+    const clientSecret = (await getSettingValue('google_client_secret', ''))?.trim() || GOOGLE_CLIENT_SECRET;
+    if (!clientId || !clientSecret) return res.status(400).json({ ok: false, error: 'Faltan el Client ID y/o el Client Secret de Google: pégalos primero en Estado del Sistema → Google Calendar y guarda.' });
+    // Limpieza de states abandonados (p. ej. el admin cerró la ventana).
+    for (const [k, v] of GOOGLE_OAUTH_STATES) if (Date.now() - v.createdAt > GOOGLE_OAUTH_STATE_TTL_MS) GOOGLE_OAUTH_STATES.delete(k);
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const redirectUri = `${origin}/api/system/google-calendar/callback`;
+    const state = crypto.randomBytes(32).toString('hex');
+    GOOGLE_OAUTH_STATES.set(state, { redirectUri, createdAt: Date.now() });
+    const { google } = await loadGoogleApis();
+    const oauth2 = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+    const url = oauth2.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: ['https://www.googleapis.com/auth/calendar'],
+      state,
+    });
+    res.redirect(url);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Callback de Google (sin auth por cookie: Google redirige desde
+// accounts.google.com). Protegido por `state` de un solo uso.
+app.get('/api/system/google-calendar/callback', async (req, res) => {
+  const fail = (status, title, detail) => res.status(status).type('html').send(googleOAuthHtmlPage(title, `<p>${detail}</p><p><a href="/">Volver al CRM</a></p>`));
+  const state = String(req.query.state || '');
+  const stored = GOOGLE_OAUTH_STATES.get(state);
+  if (state) GOOGLE_OAUTH_STATES.delete(state); // uso único
+  if (!state || !stored) return fail(403, 'Enlace no válido', 'Este enlace de conexión con Google no es válido o ya se usó. Vuelve al CRM y pulsa de nuevo “Conectar con Google”.');
+  if (Date.now() - stored.createdAt > GOOGLE_OAUTH_STATE_TTL_MS) return fail(403, 'Enlace caducado', 'El enlace de conexión caducó (10 minutos). Vuelve al CRM y pulsa de nuevo “Conectar con Google”.');
+  if (req.query.error) return fail(400, 'Google no autorizó la conexión', `Google devolvió un error: ${escapeHtmlAttr(req.query.error)}. Vuelve al CRM e inténtalo de nuevo.`);
+  const code = String(req.query.code || '');
+  if (!code) return fail(400, 'Falta el código de Google', 'Google no devolvió el código de autorización. Vuelve al CRM e inténtalo de nuevo.');
+  try {
+    const clientId = (await getSettingValue('google_client_id', ''))?.trim() || GOOGLE_CLIENT_ID;
+    const clientSecret = (await getSettingValue('google_client_secret', ''))?.trim() || GOOGLE_CLIENT_SECRET;
+    if (!clientId || !clientSecret) return fail(400, 'Faltan las credenciales de Google', 'El Client ID o el Client Secret ya no están guardados en el CRM. Vuelve al CRM, pégalos en Estado del Sistema y repite la conexión.');
+    const { google } = await loadGoogleApis();
+    const oauth2 = new google.auth.OAuth2(clientId, clientSecret, stored.redirectUri);
+    const { tokens } = await oauth2.getToken(code);
+    if (!tokens.refresh_token) return fail(400, 'Google no devolvió el refresh token', 'Google no devolvió un refresh token. Vuelve al CRM y repite la conexión (el botón usa prompt=consent para forzar uno nuevo).');
+    // Solo se guarda el refresh token; el access token nunca se guarda
+    // y ningún token se escribe en logs.
+    await saveSettingValue('google_refresh_token', tokens.refresh_token);
+    notifyUpdate('settings');
+    await recordEvent('info', 'google-calendar', 'Google Calendar conectado con la cuenta de Google (botón Conectar).', {});
+    return res.type('html').send(googleOAuthHtmlPage('Google Calendar conectado', '<p>La cuenta quedó vinculada. Puedes cerrar esta ventana y volver al CRM.</p><p><a href="/">Volver al CRM</a></p>'));
+  } catch (err) {
+    await recordEvent('error', 'google-calendar', `La conexión con Google falló: ${err.message}`, {});
+    return fail(400, 'No se pudo conectar con Google', 'Google rechazó el código de autorización (puede haber caducado o ya haberse usado). Vuelve al CRM y pulsa de nuevo “Conectar con Google”.');
+  }
+});
+
+// Desconectar: borra solo el refresh token guardado en settings (el
+// Client ID y el Secret se conservan, así reconectar es un clic).
+// Si el token venía de .env (GOOGLE_REFRESH_TOKEN), sigue configurado
+// por ese respaldo: el detalle de la respuesta lo dice.
+app.post('/api/system/google-calendar/disconnect', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM settings WHERE key = 'google_refresh_token'");
+    notifyUpdate('settings');
+    await recordEvent('info', 'google-calendar', 'Google Calendar desconectado (refresh token borrado; Client ID y Secret se conservan para reconectar).', {});
+    const status = await googleCalendarStatus();
+    res.json({ ok: true, configured: status.configured, detail: status.configured ? 'Se borró el refresh token guardado, pero sigue configurado por .env (GOOGLE_REFRESH_TOKEN). Quítalo de las variables para desconectar del todo.' : 'Google Calendar desconectado. Para volver a conectar, pulsa “Conectar con Google”.' });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
 // Reintenta la sincronización de un servicio (p. ej. si Google no estaba
 // configurado cuando se creó, o si falló la primera vez).
 app.post('/api/services/:id/sync-calendar', requireBilling, async (req, res) => {
@@ -6809,6 +6907,13 @@ async function getSettingValue(key, fallback = null) {
     const r = await pool.query('SELECT value FROM settings WHERE key = $1', [key]);
     return r.rows[0]?.value ?? fallback;
   } catch { return fallback; }
+}
+
+// v5.3.35 Guarda una clave en settings (uso interno del servidor, p. ej.
+// el refresh token que devuelve el callback de Google). Misma sentencia
+// que POST /api/settings.
+async function saveSettingValue(key, value) {
+  await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, value]);
 }
 
 async function getCompanySettings() {

@@ -2100,27 +2100,41 @@ opcional.
 1. En [Google Cloud Console](https://console.cloud.google.com/) crea un
    proyecto (o usa uno existente) y habilita la **Google Calendar API**
    (APIs y servicios > Biblioteca > Google Calendar API > Habilitar).
+
+**Conectar con un clic (recomendado, v5.3.35):**
+
 2. APIs y servicios > Credenciales > Crear credenciales > **ID de cliente
-   de OAuth** > tipo **Aplicación de escritorio**. Anota el Client ID y
-   el Client Secret. En "URIs de redireccionamiento autorizados" añade
-   `http://localhost:8089` (lo usa el script del paso 3).
-3. En el servidor (o en tu computador, con el código del CRM) corre:
-   `node scripts/get-google-refresh-token.js <CLIENT_ID> <CLIENT_SECRET>`
-   Abre la URL que imprime con la cuenta de Google de la empresa, acepta
-   el acceso al calendario y el script imprime el refresh token.
-4. Pégalo en el CRM (solo admin): Estado del Sistema → Configuración de
-   integraciones → Google Calendar: Client ID, Client Secret y Refresh
-   Token, Calendar ID `primary` (o el ID de un calendario compartido) y
-   duración 120. También se puede poner en el `.env` (y reinicia):
-   `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`,
-   `GOOGLE_CALENDAR_ID` y `GOOGLE_CALENDAR_DURATION_MINUTES`; lo de
-   settings tiene prioridad si está puesto.
-5. Prueba: Estado del Sistema → Configuración de integraciones → Google
-   Calendar → “Probar conexión” (o
+   de OAuth** > tipo **Aplicación web** (la de escritorio NO sirve aquí:
+   no admite una URI pública de redirección y el tipo no se puede cambiar
+   en una credencial existente, hay que crear una nueva). En "URIs de
+   redireccionamiento autorizados" añade la URI que muestra el CRM:
+   `<URL pública del CRM>/api/system/google-calendar/callback` (en Estado
+   del Sistema → Google Calendar, con botón Copiar). Anota el Client ID y
+   el Client Secret.
+3. En el CRM (solo admin): Estado del Sistema → Google Calendar: pega el
+   Client ID y el Client Secret y guarda. Luego pulsa **“Conectar con
+   Google”**, acepta con la cuenta de Google de la empresa y listo: el
+   refresh token se guarda solo. Para cambiar de cuenta, pulsa
+   “Desconectar” y conecta de nuevo.
+4. Prueba: “Probar conexión” (o
    `POST /api/system/google-calendar/test`, solo admin): crea un evento
    de prueba de 15 min "Prueba CRM — borrar" y lo borra de inmediato.
    `GET /api/system/google-calendar/status` (solo admin) dice si está
    configurado, sin mostrar secretos.
+
+**Alternativa con el script local (sin botón):** con credencial de tipo
+**Aplicación de escritorio** y `http://localhost:8089` en "URIs de
+redireccionamiento autorizados", corre en el servidor (o en tu
+computador, con el código del CRM):
+`node scripts/get-google-refresh-token.js <CLIENT_ID> <CLIENT_SECRET>`
+Abre la URL que imprime con la cuenta de Google de la empresa, acepta
+el acceso al calendario y el script imprime el refresh token. Pégalo en
+el CRM junto con el Client ID y el Client Secret (Calendar ID `primary`
+o el ID de un calendario compartido, duración 120). También se puede
+poner todo en el `.env` (y reinicia): `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `GOOGLE_CALENDAR_ID` y
+`GOOGLE_CALENDAR_DURATION_MINUTES`; lo de settings tiene prioridad si
+está puesto.
 
 **Con honestidad:** sin las credenciales de Google de la empresa no se
 puede probar un evento real: el flujo de crear/actualizar/borrar está
