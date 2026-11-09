@@ -102,6 +102,12 @@ WORKDIR /app
 # Puppeteer lo encuentra ahí.
 ENV PUPPETEER_CACHE_DIR=/app/.cache/puppeteer
 
+# v5.3.29 (H-A4): Railway usa esta imagen y su edge ES un proxy real, así
+# que aquí TRUST_PROXY=1. En docker-compose el `environment:` lo
+# sobreescribe a 0 (VPS directo, seguro por defecto); solo se pone a 1
+# en compose si hay un reverse proxy real delante.
+ENV TRUST_PROXY=1
+
 # Solo dependencias de producción (sin vite/typescript/terser).
 COPY package*.json ./
 RUN npm ci --omit=dev

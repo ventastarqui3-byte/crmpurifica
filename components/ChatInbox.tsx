@@ -49,6 +49,16 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
   const [templates, setTemplates] = useState<ChatTemplate[]>([]);
   const [sidebarTab, setSidebarTab] = useState<'info' | 'intel'>('info');
   const [showMobileSidebar, setShowMobileSidebar] = useState(false);
+
+  // v5.3.30: historial completo del chat abierto. La lista (GET /api/chats)
+  // solo trae los últimos 50 mensajes por conversación; al abrir un chat se
+  // pide aquí el historial (200) y se puede cargar más hacia atrás.
+  // detailChatId evita mostrar el historial del chat anterior mientras
+  // carga el nuevo; detailMessages null = usar los mensajes de la lista.
+  const [detailMessages, setDetailMessages] = useState<ChatMessage[] | null>(null);
+  const [detailChatId, setDetailChatId] = useState<string | null>(null);
+  const [detailHasMore, setDetailHasMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   
   const [clientName, setClientName] = useState('');
   const [techImages, setTechImages] = useState<string[]>([]);
@@ -77,6 +87,10 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const activeChat = useMemo(() => conversations.find(c => c.id === selectedChatId), [conversations, selectedChatId]);
+
+  // v5.3.30: la vista del chat abierto usa el historial completo si ya
+  // cargó para ESTE chat; si no, los mensajes de la lista (últimos 50).
+  const openMessages = (detailChatId === selectedChatId && detailMessages !== null) ? detailMessages : (activeChat?.messages || []);
   
   // FILTRADO Y ORDENAMIENTO (Mantiene lo nuevo arriba)
   const filteredConversations = useMemo(() => {
@@ -143,6 +157,60 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
       // no existe endpoint de "marcar leído" (onMarkAsRead era un no-op).
     }
   }, [selectedChatId, activeChat?.messages?.length]);
+
+  // v5.3.30: cargar el historial completo al abrir un chat, y refrescarlo
+  // cuando llegan mensajes nuevos a ese chat (la lista se actualiza por
+  // socket y su contador cambia). No se refetchea si el historial ya está
+  // al día (su último mensaje es el mismo que el de la lista): así, si el
+  // usuario cargó mensajes viejos con "Cargar anteriores", no se pierden
+  // al llegar un mensaje nuevo... salvo que haya uno nuevo, en cuyo caso
+  // se vuelve a los 200 más recientes y se baja al final, como siempre.
+  // Al cambiar de chat se limpia el historial para no mostrar el anterior.
+  const detailRef = useRef<ChatMessage[] | null>(null);
+  useEffect(() => { detailRef.current = detailMessages; }, [detailMessages]);
+  const prevChatIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeChat) { setDetailMessages(null); setDetailChatId(null); setDetailHasMore(false); prevChatIdRef.current = null; return; }
+    const chatChanged = prevChatIdRef.current !== activeChat.id;
+    if (chatChanged) { setDetailMessages(null); setDetailChatId(null); setDetailHasMore(false); prevChatIdRef.current = activeChat.id; }
+    const listMsgs = activeChat.messages || [];
+    const newestListId = listMsgs.length ? listMsgs[listMsgs.length - 1].id : null;
+    const current = detailRef.current;
+    if (!chatChanged && current !== null && newestListId !== null && current.length > 0 && current[current.length - 1].id === newestListId) return;
+    let cancelled = false;
+    apiFetch(`/api/chats/${activeChat.id}/messages?limit=200`)
+      .then(res => { if (!res.ok) throw new Error('messages'); return res.json(); })
+      .then(data => {
+        if (cancelled) return;
+        if (Array.isArray(data?.data)) {
+          setDetailMessages(data.data);
+          setDetailChatId(activeChat.id);
+          setDetailHasMore(!!data.hasMore);
+          setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 150);
+        }
+      })
+      .catch(() => { /* sin historial: la vista sigue con los mensajes de la lista */ });
+    return () => { cancelled = true; };
+  }, [selectedChatId, activeChat?.messages?.length]);
+
+  // v5.3.30: cargar una página más hacia atrás (200 mensajes más viejos
+  // que el primero que se ve). No baja al final: el usuario sigue donde
+  // estaba leyendo.
+  const loadOlderMessages = async () => {
+    if (!activeChat || !detailMessages || detailMessages.length === 0 || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const res = await apiFetch(`/api/chats/${activeChat.id}/messages?limit=200&before=${encodeURIComponent(detailMessages[0].id)}`);
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (Array.isArray(data?.data)) {
+          setDetailMessages([...data.data, ...detailMessages]);
+          setDetailHasMore(!!data.hasMore);
+        }
+      }
+    } catch { /* se queda como está */ }
+    setLoadingOlder(false);
+  };
 
   // Textos que el servidor usa como contenido cuando un mensaje de media
   // no trae caption: no se muestran como texto debajo del adjunto.
@@ -378,7 +446,15 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
-               {(activeChat.messages || []).map((msg) => (
+               {/* v5.3.30: cargar el historial hacia atrás (la lista solo trae los últimos 50 por conversación). */}
+               {detailHasMore && (
+                 <div className="flex justify-center">
+                   <button onClick={loadOlderMessages} disabled={loadingOlder} className="text-[10px] font-black uppercase tracking-wide text-brand-600 bg-brand-50 hover:bg-brand-100 border border-brand-100 rounded-full px-4 py-1.5 disabled:opacity-50">
+                     {loadingOlder ? 'Cargando…' : 'Cargar mensajes anteriores'}
+                   </button>
+                 </div>
+               )}
+               {openMessages.map((msg) => (
                  <div key={msg.id} className={`flex ${msg.sender === 'client' ? 'justify-start' : 'justify-end'}`}>
                     <div className={`max-w-[75%] rounded-2xl p-3 shadow-sm text-sm relative group ${msg.sender === 'client' ? 'bg-white rounded-tl-none' : 'bg-[#dcf8c6] rounded-tr-none'}`}>
                         {msg.attachmentUrl ? (

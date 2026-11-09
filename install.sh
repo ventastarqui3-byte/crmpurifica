@@ -25,18 +25,49 @@ if grep -q '^JWT_SECRET=$' .env; then
   echo "JWT_SECRET generado."
 fi
 
-# Pedir clave de Postgres si sigue la de ejemplo
-if grep -q '^POSTGRES_PASSWORD=cambia-esta-clave$' .env; then
-  read -rsp "Clave de la base de datos (se usará para Postgres): " PGPASS; echo
-  [ -n "$PGPASS" ] && sed "${SED_I[@]}" "s|^POSTGRES_PASSWORD=cambia-esta-clave$|POSTGRES_PASSWORD=$(esc "$PGPASS")|" .env
+# Generar una contraseña aleatoria larga (48 caracteres hex).
+gen_pass() { openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# Clave de Postgres: si está vacía o sigue el placeholder viejo, pedirla.
+# Enter genera una aleatoria segura; si se escribe una, mínimo 12 caracteres.
+# v5.3.29 (H-A5): antes, pulsar Enter dejaba la clave pública 'cambia-esta-clave'.
+GEN_PGPASS=""
+if grep -qE '^POSTGRES_PASSWORD=(cambia-esta-clave)?$' .env; then
+  read -rsp "Clave de la base de datos (Enter = generar una aleatoria segura): " PGPASS; echo
+  if [ -z "$PGPASS" ]; then
+    PGPASS=$(gen_pass); GEN_PGPASS="$PGPASS"
+    echo "Clave de la base de datos generada: $PGPASS  (guárdala)"
+  fi
+  while [ ${#PGPASS} -lt 12 ]; do
+    echo "La clave debe tener al menos 12 caracteres."
+    read -rsp "Clave de la base de datos (Enter = generar una): " PGPASS; echo
+    if [ -z "$PGPASS" ]; then
+      PGPASS=$(gen_pass); GEN_PGPASS="$PGPASS"
+      echo "Clave de la base de datos generada: $PGPASS  (guárdala)"
+    fi
+  done
+  sed "${SED_I[@]}" "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(esc "$PGPASS")|" .env
 fi
 
-# Pedir admin inicial si sigue la clave de ejemplo
-if grep -q '^ADMIN_PASSWORD=cambia-esta-clave$' .env; then
+# Admin inicial: si la clave está vacía o sigue el placeholder viejo.
+GEN_APASS=""
+if grep -qE '^ADMIN_PASSWORD=(cambia-esta-clave)?$' .env; then
   read -rp "Correo del administrador inicial [admin@purifica.com]: " AEMAIL
-  read -rsp "Contraseña del administrador inicial: " APASS; echo
+  read -rsp "Contraseña del administrador inicial (Enter = generar una aleatoria segura): " APASS; echo
+  if [ -z "$APASS" ]; then
+    APASS=$(gen_pass); GEN_APASS="$APASS"
+    echo "Contraseña del administrador generada: $APASS  (guárdala)"
+  fi
+  while [ ${#APASS} -lt 12 ]; do
+    echo "La contraseña debe tener al menos 12 caracteres."
+    read -rsp "Contraseña del administrador inicial (Enter = generar una): " APASS; echo
+    if [ -z "$APASS" ]; then
+      APASS=$(gen_pass); GEN_APASS="$APASS"
+      echo "Contraseña del administrador generada: $APASS  (guárdala)"
+    fi
+  done
   [ -n "$AEMAIL" ] && sed "${SED_I[@]}" "s|^ADMIN_EMAIL=.*|ADMIN_EMAIL=$(esc "$AEMAIL")|" .env
-  [ -n "$APASS" ] && sed "${SED_I[@]}" "s|^ADMIN_PASSWORD=cambia-esta-clave$|ADMIN_PASSWORD=$(esc "$APASS")|" .env
+  sed "${SED_I[@]}" "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=$(esc "$APASS")|" .env
 fi
 
 echo "Levantando app + base de datos..."
@@ -47,4 +78,11 @@ PORT=${PORT:-8080}
 echo ""
 echo "Listo. Abre http://localhost:$PORT"
 echo "Entra con el correo y la contraseña de administrador que definiste en .env."
+# v5.3.29 (H-A5): las claves generadas se imprimen al final para guardarlas.
+if [ -n "$GEN_PGPASS" ] || [ -n "$GEN_APASS" ]; then
+  echo ""
+  echo "Claves generadas automáticamente (guárdalas, no se vuelven a mostrar):"
+  [ -n "$GEN_PGPASS" ] && echo "  Base de datos: $GEN_PGPASS"
+  [ -n "$GEN_APASS" ] && echo "  Administrador: $GEN_APASS"
+fi
 echo "Después de entrar, cambia la contraseña desde Equipo y conecta WhatsApp en Canales WhatsApp (escanea el QR)."

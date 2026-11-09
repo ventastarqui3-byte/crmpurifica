@@ -11,7 +11,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import helmet from 'helmet';
 import crypto from 'crypto';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { spawn } from 'child_process';
 import zlib from 'zlib';
 import { Server } from 'socket.io';
@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.28';
+const APP_VERSION = '5.3.30';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -1686,7 +1686,9 @@ async function processWaMessage(msg, opts) {
   if (!content) return false;
   waClients[id].lastSeen = new Date().toISOString();
   waClients[id].lastMessageAt = new Date().toISOString();
-  logger.info(`Mensaje recibido en ${name} de ${phone}: ${content}`);
+  // v5.3.29 (H-A3): el contenido del mensaje NUNCA va a los logs (PII de
+  // clientes). Solo metadatos, como en la línea de :2083.
+  logger.info(`Mensaje recibido en ${name} de ${phone} (type=${type})`);
   try {
     await handleIncomingWhatsApp({ phone, content, type, attachmentUrl, sender, incrementUnread, sourceName, channel, externalId: waMsgSerializedId(msg), senderName });
   } catch (err) {
@@ -2186,12 +2188,14 @@ const initWhatsApp = async (id, name = 'Sin Nombre', channel = 'qr', isAutoRetry
 // --- FIN CONFIGURACIÓN WHATSAPP ---
 
 const app = express();
-// v5.3.25 (M6): confiar SOLO en el primer proxy (el router de Railway o
-// el proxy inverso del VPS). Sin esto, req.ip sería la IP del proxy y el
-// rate limiting y el bloqueo de login verían a todos los usuarios como
-// una sola IP. Con '1', Express toma la IP que el proxy añade al final
-// de X-Forwarded-For, que es la del cliente real.
-app.set('trust proxy', 1);
+// v5.3.25 (M6) + v5.3.29 (H-A4): confiar SOLO en el primer proxy cuando
+// de verdad hay uno delante (el edge de Railway o un reverse proxy del
+// VPS). Si el puerto está expuesto directo, confiar en X-Forwarded-For
+// permite a cualquiera falsificar su IP y anular el rate limiting y el
+// bloqueo de login. Por eso es configurable: TRUST_PROXY=1 en Railway
+// (ENV del Dockerfile) y 0 por defecto en docker-compose (VPS directo);
+// solo se pone a 1 en compose si hay un proxy real delante.
+app.set('trust proxy', process.env.TRUST_PROXY === '1' ? 1 : 0);
 const server = http.createServer(app);
 // CORS del socket: mismo origen salvo CORS_ORIGIN. La autenticación real del
 // socket se hace con JWT en el handshake (io.use más abajo).
@@ -2220,7 +2224,13 @@ if (!dbUrl && process.env.POSTGRES_USER) {
 }
 const pool = new Pool({
   connectionString: dbUrl || undefined,
-  ssl: dbUrl?.includes('sslmode=disable') ? false : { rejectUnauthorized: false }
+  ssl: dbUrl?.includes('sslmode=disable') ? false : { rejectUnauthorized: false },
+  // v5.3.30: tope de conexiones del pool. Sin `max`, pg usa 10 por
+  // defecto y con 30 usuarios pidiendo a la vez las peticiones hacían
+  // cola (p95 de Mensajes 3,3 s en la prueba de estrés 2026-11-09).
+  // 25 conexiones caben sin problema en el Postgres de Railway (su
+  // máximo por defecto es 100) y en un VPS bueno.
+  max: 25
 });
 // Sin este handler, un error del pool (p. ej. DB caída) tumba todo el proceso.
 pool.on('error', (err) => {
@@ -2290,17 +2300,36 @@ app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { if (req.url.
 // endpoints sensibles. El login NO lleva limiter (mantiene su bloqueo
 // por correo+IP de 5 fallos/10 min -> 429 por 15 min).
 const rateLimitMessage = (msg) => (req, res) => res.status(429).json({ error: msg });
+// v5.3.30: limitadores POR USUARIO, no por IP. Antes, los 30 usuarios de
+// una misma oficina compartían el presupuesto por IP y el sistema los
+// dejaba fuera con 429 tras ~570 peticiones en 15 min (prueba de estrés
+// 2026-11-09). Cada usuario autenticado tiene ahora su propio presupuesto;
+// las rutas públicas (login, branding, health, webhooks) no traen req.user
+// y siguen limitadas por IP. La clave `user:<id>` distingue al usuario de
+// la IP; para la IP se usa ipKeyGenerator, exigido por express-rate-limit
+// v8 para no romper con IPv6 (la validación rechaza un keyGenerator que
+// use req.ip sin ese helper).
+const rateLimitKey = (req) => (req.user?.id != null ? `user:${req.user.id}` : ipKeyGenerator(req.ip));
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, limit: 600,
+  keyGenerator: rateLimitKey,
   standardHeaders: 'draft-7', legacyHeaders: false,
   handler: rateLimitMessage('Demasiadas peticiones. Inténtalo de nuevo en unos minutos.'),
 });
-app.use('/api', apiLimiter);
+// v5.3.30: app.use('/api', apiLimiter) YA NO VA AQUÍ. Estaba antes de la
+// autenticación, así que req.user siempre era undefined y el key por
+// usuario no se habría aplicado nunca. Ahora va DESPUÉS de
+// authMiddleware (ver abajo): las rutas públicas pasan por auth sin
+// req.user y siguen limitadas por IP, y las autenticadas se limitan por
+// usuario. Ninguna ruta /api se define entre medias, así que ninguna
+// pierde cobertura.
 // Envíos de WhatsApp (chat, campañas, seguimiento): 30 peticiones/15 min
-// por IP. Un humano no manda más; un script que inunde queda frenado.
-// El envío masivo de una campaña es UNA petición (el bucle es del servidor).
+// por usuario autenticado. Un humano no manda más; un script que inunde
+// queda frenado. El envío masivo de una campaña es UNA petición (el bucle
+// es del servidor).
 const waSendLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, limit: 30,
+  keyGenerator: rateLimitKey,
   standardHeaders: 'draft-7', legacyHeaders: false,
   handler: rateLimitMessage('Demasiados envíos de WhatsApp en poco tiempo. Espera unos minutos.'),
 });
@@ -2471,6 +2500,16 @@ async function authMiddleware(req, res, next) {
   next();
 }
 app.use(authMiddleware);
+
+// v5.3.30: el limitador global DESPUÉS de la autenticación, para que
+// keyGenerator vea req.user en las peticiones autenticadas (cada usuario
+// su propio presupuesto de 600/15 min). Las rutas públicas (login,
+// branding, health, webhooks) no traen req.user y se limitan por IP como
+// antes. Las peticiones sin token válido reciben 401 en authMiddleware
+// antes de consumir presupuesto del limitador. El bloqueo de login por
+// fuerza bruta (5 fallos/10 min por correo+IP) no cambia: sigue usando
+// req.ip directamente.
+app.use('/api', apiLimiter);
 
 function requireAdmin(req, res, next) {
   if ((req.user?.role || '').toLowerCase() !== 'admin') {
@@ -3788,6 +3827,13 @@ const initDB = async () => {
       const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
       const adminPassword = process.env.ADMIN_PASSWORD || '';
       if (adminEmail && adminPassword) {
+        // v5.3.29 (H-A5): no crear el admin con la clave placeholder
+        // pública ni con una clave corta. Si el admin ya existe, este
+        // bloque no se ejecuta y la variable no se usa.
+        if (adminPassword === 'cambia-esta-clave' || adminPassword.length < 12) {
+          logger.error('FATAL: ADMIN_PASSWORD es "cambia-esta-clave" o tiene menos de 12 caracteres. Pon una clave larga en .env (o déjala vacía para que el instalador genere una) y vuelve a arrancar. El servidor NO arranca con una clave de admin débil.');
+          process.exit(1);
+        }
         const hashedPw = await bcrypt.hash(adminPassword, 10);
         await client.query(
           'INSERT INTO employees (name, email, password, role, phone, active) VALUES ($1, $2, $3, $4, $5, $6)',
@@ -3826,6 +3872,35 @@ const initDB = async () => {
     // sesión o cambio de contraseña sube token_version y los tokens
     // viejos dejan de valer (el middleware compara req.user.tv).
     await client.query('ALTER TABLE employees ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0');
+
+    // v5.3.29 (H-A2): el alcance por rol es por NOMBRE, así que dos
+    // empleados con el mismo nombre fusionan sus datos. Deduplicar
+    // nombres repetidos (al 2º y siguientes se les añade " (2)", " (3)"…)
+    // y crear un índice único insensible a mayúsculas/espacios.
+    // Idempotente: IF NOT EXISTS y solo renombra duplicados. El conjunto
+    // `taken` se construye con TODOS los nombres antes de renombrar, para
+    // no chocar con un sufijo que ya usa otro empleado (p. ej. si ya
+    // existe un "Carlos (2)", el duplicado de "Carlos" pasa a "Carlos (3)").
+    try {
+      const allNames = await client.query('SELECT id, name FROM employees ORDER BY id');
+      const taken = new Set(allNames.rows.map((r) => (r.name || '').trim().toLowerCase()));
+      const seenNames = new Map();
+      for (const row of allNames.rows) {
+        let base = (row.name || '').trim();
+        if (!base) { base = `Empleado ${row.id}`; await client.query('UPDATE employees SET name = $1 WHERE id = $2', [base, row.id]); }
+        const key = base.toLowerCase();
+        const n = (seenNames.get(key) || 0) + 1;
+        seenNames.set(key, n);
+        if (n > 1) {
+          let suffix = n;
+          let candidate = `${base} (${suffix})`;
+          while (taken.has(candidate.toLowerCase())) { suffix += 1; candidate = `${base} (${suffix})`; }
+          taken.add(candidate.toLowerCase());
+          await client.query('UPDATE employees SET name = $1 WHERE id = $2', [candidate, row.id]);
+        }
+      }
+      await client.query('CREATE UNIQUE INDEX IF NOT EXISTS employees_name_unique ON employees (lower(trim(name)))');
+    } catch (e) { logger.warn('No se pudo deduplicar nombres de empleados (H-A2)', e); }
 
     // --- OPTIMIZACIÓN: ÍNDICES PARA VELOCIDAD ---
     await client.query(`
@@ -4450,7 +4525,7 @@ async function runFollowupScan() {
             await pool.query("UPDATE followups SET status = 'failed' WHERE id = $1", [f.id]);
             failed++;
             logger.error(`Seguimiento ${f.id} no se pudo enviar a ${f.client_phone}: ${res.error}`);
-            await recordEvent('error', 'followups', `Seguimiento a ${f.client_name} (${f.client_phone}) falló: ${res.error}`, { followup: f.id });
+            await recordEvent('error', 'followups', `Seguimiento ${f.id} falló: ${res.error}`, { followup: f.id });
           }
         }
       } finally { followupSending = false; }
@@ -4509,7 +4584,7 @@ app.post('/api/followups/:id/send', requireAdmin, waSendLimiter, async (req, res
     const res2 = await sendFollowupMessage({ ...f, message: edited || f.message });
     if (!res2.ok) {
       await pool.query("UPDATE followups SET status = 'failed' WHERE id = $1", [f.id]);
-      await recordEvent('error', 'followups', `Seguimiento a ${f.client_name} (${f.client_phone}) falló: ${res2.error}`, { followup: f.id });
+      await recordEvent('error', 'followups', `Seguimiento ${f.id} falló: ${res2.error}`, { followup: f.id });
       notifyUpdate('followup');
       return res.json({ success: false, sent: false, error: res2.error });
     }
@@ -4815,6 +4890,42 @@ app.get('/api/availability', async (req, res) => {
       ORDER BY date ASC
     `);
     res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// v5.3.30: historial de UNA conversación, con paginación. Existe porque
+// GET /api/chats (la lista) solo trae los últimos 50 mensajes por
+// conversación; al abrir un chat, el frontend pide aquí el historial
+// completo por páginas (?limit=200 por defecto, máx 500; ?before=<id>
+// trae los mensajes más viejos que ese id). Sin este endpoint, los
+// mensajes viejos serían inalcanzables en la vista. El alcance es el
+// mismo que el envío (conversationInScope): un asesor no lee los chats
+// de otro asesor.
+app.get('/api/chats/:id/messages', async (req, res) => {
+  const { id } = req.params;
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+  const before = req.query.before ? parseInt(req.query.before, 10) : null;
+  try {
+    const scopeCheck = await conversationInScope(req, id);
+    if (!scopeCheck.ok) return res.status(scopeCheck.reason === 'Conversación no encontrada' ? 404 : 403).json({ error: scopeCheck.reason });
+    const params = [id];
+    let where = 'conversation_id = $1';
+    if (before != null && !Number.isNaN(before)) { params.push(before); where += ` AND id < $${params.length}`; }
+    params.push(limit + 1);
+    const r = await pool.query(`SELECT * FROM messages WHERE ${where} ORDER BY timestamp DESC, id DESC LIMIT $${params.length}`, params);
+    const hasMore = r.rows.length > limit;
+    const rows = (hasMore ? r.rows.slice(0, limit) : r.rows).reverse();
+    res.json({
+      data: rows.map(m => ({
+        id: m.id.toString(),
+        sender: m.sender,
+        content: m.content,
+        type: m.type,
+        attachmentUrl: m.attachment_url,
+        timestamp: new Date(m.timestamp).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
+      })),
+      hasMore
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -5552,7 +5663,15 @@ app.get('/api/chats', async (req, res) => {
     const msgsByConv = new Map();
     const tasksByConv = new Map();
     if (ids.length > 0) {
-      const msgs = await pool.query('SELECT * FROM messages WHERE conversation_id = ANY($1) ORDER BY conversation_id, timestamp ASC', [ids]);
+      // v5.3.30: tope de 50 mensajes por conversación (los más recientes).
+      // Antes se traían TODOS los mensajes de cada conversación y la
+      // respuesta crecía sin freno (216 KB con 1000 mensajes en la prueba
+      // de estrés; en meses, varios MB por carga). La ventana numera por
+      // conversación y el ORDER BY exterior devuelve el orden cronológico
+      // que espera el frontend. El historial completo se pide al abrir el
+      // chat con GET /api/chats/:id/messages (con paginación); la vista
+      // previa de la lista usa solo el último mensaje.
+      const msgs = await pool.query(`SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY conversation_id ORDER BY timestamp DESC, id DESC) AS rn FROM messages WHERE conversation_id = ANY($1)) t WHERE rn <= 50 ORDER BY conversation_id, timestamp ASC, id ASC`, [ids]);
       for (const m of msgs.rows) {
         if (!msgsByConv.has(m.conversation_id)) msgsByConv.set(m.conversation_id, []);
         msgsByConv.get(m.conversation_id).push(m);
@@ -5830,6 +5949,14 @@ app.post('/api/staff', requireAdminOrLeader, accountLimiter, async (req, res) =>
       const pwError = validatePassword(password);
       if (pwError) return res.status(400).json({ error: pwError });
     }
+    // v5.3.29 (H-A2): el alcance por rol es por nombre; dos empleados con
+    // el mismo nombre fusionan sus datos. Rechazar el nombre si otro
+    // empleado ya lo usa (insensible a mayúsculas/espacios). En el upsert
+    // por email, el propio empleado puede conservar su nombre.
+    const byName = await pool.query('SELECT id FROM employees WHERE lower(trim(name)) = lower(trim($1))', [name]);
+    if (byName.rows.some((r) => String(r.id) !== String(existing.rows[0]?.id ?? ''))) {
+      return res.status(400).json({ error: 'Ese nombre ya lo usa otro empleado. Usa un nombre distinto (el alcance por rol es por nombre).' });
+    }
     let result;
     if (password) {
       const hashedPw = await bcrypt.hash(password, 10);
@@ -5860,6 +5987,12 @@ app.put('/api/staff/:id', requireAdminOrLeader, async (req, res) => {
   }
   const phone = normalizePhoneString(rawPhone);
   try {
+    // v5.3.29 (H-A2): mismo control que en el POST — el nombre no puede
+    // repetir el de otro empleado (insensible a mayúsculas/espacios).
+    const byName = await pool.query('SELECT id FROM employees WHERE lower(trim(name)) = lower(trim($1))', [name]);
+    if (byName.rows.some((r) => String(r.id) !== String(id))) {
+      return res.status(400).json({ error: 'Ese nombre ya lo usa otro empleado. Usa un nombre distinto (el alcance por rol es por nombre).' });
+    }
     let query = 'UPDATE employees SET name=$1, email=$2, role=$3, phone=$4, active=$5, commission_pct=$6, parent_id=$7';
     let params = [name, email, role, phone, active ?? true, commissionPct || 0, parentId || null];
     // v5.3.26 (B3): si se cambia la contraseña, los tokens viejos del
@@ -6545,10 +6678,15 @@ app.post('/api/invoices', requireBilling, async (req, res) => {
   try {
     await client.query('BEGIN');
     const svc = await client.query(
-      'SELECT id, client_name, client_phone, total_value, advances FROM services WHERE id = $1',
+      'SELECT id, client_name, client_phone, total_value, advances, advisor, operators FROM services WHERE id = $1',
       [service_id]
     );
     if (!svc.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Servicio no encontrado' }); }
+    // v5.3.29 (H-A1): alcance por rol — un asesor solo factura sus
+    // servicios. El control va ANTES de responder already_exists y de
+    // reservar el número FAC-XXXX, igual que en payments/payment-link.
+    const scope = await getRoleScope(req);
+    if (!invoiceInScope(scope, svc.rows[0].advisor, svc.rows[0].operators)) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Servicio no encontrado' }); }
     const existing = await client.query('SELECT id FROM invoices WHERE service_id = $1 ORDER BY id ASC LIMIT 1', [service_id]);
     if (existing.rows[0]) {
       await client.query('ROLLBACK');

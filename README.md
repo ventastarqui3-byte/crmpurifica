@@ -1,4 +1,42 @@
-# Purifica Tu Ambiente CRM — v5.3.28 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen)
+# Purifica Tu Ambiente CRM — v5.3.30 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen + corrección de los 5 hallazgos altos de la auditoría 2026-11-09 + rendimiento para 30 usuarios)
+
+## v5.3.30 — Rendimiento para 30 usuarios (prueba de estrés 2026-11-09)
+
+**Qué se midió:** con 30 usuarios a la vez y 1000 mensajes, el sistema aguantaba, pero los limitadores por IP bloqueaban a toda una oficina con 429 tras ~570 peticiones en 15 min, el pool de 10 conexiones llevaba el p95 de Mensajes a 3,3 s, y la lista de chats traía TODOS los mensajes de cada conversación (216 KB y creciendo).
+
+**Mejoras:**
+- **Limitadores por usuario, no por IP:** `apiLimiter` (600/15 min) y `waSendLimiter` (30/15 min) usan ahora `keyGenerator` con `user:<id>` para las peticiones autenticadas; las rutas públicas (login, branding, health, webhooks) siguen por IP. OJO: `app.use('/api', apiLimiter)` se movió para DESPUÉS de `authMiddleware` — antes estaba antes de la autenticación y `req.user` siempre era undefined, así que el key por usuario no se habría aplicado. El bloqueo de login por fuerza bruta no cambia (sigue por correo+IP).
+- **Pool de Postgres a 25 conexiones** (antes el valor por defecto de `pg`, 10).
+- **Tope de 50 mensajes por conversación en GET /api/chats** (los más recientes, con función ventana, sin N+1: siguen siendo 3 consultas) + **nuevo GET /api/chats/:id/messages** (paginado: `?limit=200`, máx 500, `?before=<id>` para cargar hacia atrás, mismo alcance por rol que el envío). El chat abierto carga el historial completo al abrirse y tiene botón "Cargar mensajes anteriores". Sin este endpoint nuevo, los mensajes viejos habrían quedado inalcanzables en la vista (no existía endpoint de detalle: el historial venía entero de la lista).
+
+**Plan de pruebas tras desplegar v5.3.30:**
+1. Entrar como asesor y como operador: la navegación no debe dar 429 (antes, con varios usuarios en la misma red, sí).
+2. Abrir un chat con muchos mensajes: se ven los últimos, y el botón "Cargar mensajes anteriores" trae los viejos.
+3. Enviar 31 mensajes seguidos desde el inbox: el 31 debe dar 429 (el límite de envíos sigue siendo 30/15 min por usuario).
+4. Intentar 6 logins fallidos seguidos: el bloqueo por fuerza bruta debe seguir funcionando.
+
+**Pendiente honesto:** el tope por conversación y el endpoint nuevo no se probaron contra una base de datos real con miles de mensajes (sin DB real aquí); la consulta de ventana es SQL estándar de Postgres, pero conviene abrir un chat largo en producción y comprobar que el historial carga y el botón trae los anteriores.
+
+## v5.3.29 — Corrección de los 5 hallazgos ALTOS (auditoría de seguridad 2026-11-09)
+
+La auditoría de la v5.3.28 encontró 43 hallazgos (0 críticos, 5 altos, 18 medios, 20 bajos). Esta versión corrige solo los 5 altos; los medios y bajos quedan para la siguiente ronda.
+
+- **H-A1 — Facturas sin alcance:** `POST /api/invoices` ya no crea facturas de servicios ajenos. Ahora carga `advisor, operators` del servicio y aplica `getRoleScope` + `invoiceInScope` (404 si es de otro), igual que ya hacían los pagos y los links de pago, y antes de responder `already_exists` o de reservar el número FAC-XXXX.
+- **H-A2 — Alcance por nombre, no por id:** al arrancar, la base deduplica nombres de empleados repetidos (al 2º y siguientes se les añade ` (2)`, ` (3)`…) y crea un índice único `employees_name_unique` sobre `lower(trim(name))` (idempotente, `IF NOT EXISTS`). `POST /api/staff` y `PUT /api/staff/:id` rechazan con 400 un nombre que ya use otro empleado. La refactorización grande a `advisor_id` queda para medio plazo.
+- **H-A3 — Mensajes en los logs:** el log de mensaje entrante ya no lleva el contenido (solo teléfono y tipo). Los eventos de seguimiento fallido ya no guardan nombre ni teléfono del cliente (solo el id del seguimiento). Los logs nunca llevan el texto de los mensajes.
+- **H-A4 — `trust proxy` configurable:** `server.js` usa `TRUST_PROXY=1` solo si la variable vale `1`; por defecto 0 (seguro para VPS con el puerto expuesto directo). El Dockerfile fija `TRUST_PROXY=1` (el edge de Railway ES un proxy real) y `docker-compose.yml` lo sobreescribe a `TRUST_PROXY: ${TRUST_PROXY:-0}` (las variables de `environment:` en compose ganan al ENV de la imagen). Si el VPS tiene un reverse proxy real delante, se pone `TRUST_PROXY=1` en el `.env`. Documentado también en `.env.example`.
+- **H-A5 — Clave débil por defecto:** `.env.example` deja `POSTGRES_PASSWORD` y `ADMIN_PASSWORD` vacíos (con comentario); `docker-compose.yml` exige `POSTGRES_PASSWORD` con `${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en .env}` (falla rápido con mensaje claro) en el servicio db y en PGPASSWORD del respaldo; `install.sh` e `install.bat` generan una contraseña aleatoria larga si se deja vacío, exigen mínimo 12 caracteres si se escribe una, y la imprimen al final para guardarla; y el servidor NO arranca si se intenta crear el admin inicial con `cambia-esta-clave` o con menos de 12 caracteres (error fatal + `process.exit(1)`; si el admin ya existe, la variable no se usa).
+
+**Plan de pruebas tras desplegar v5.3.29:**
+1. Login normal como admin (la cookie y la revocación no cambiaron).
+2. Como asesor, intentar crear una factura del servicio de otro asesor → 404 y el consecutivo FAC-XXXX no se consume.
+3. Crear dos empleados con el mismo nombre (con distinta mayúscula) → el segundo da 400.
+4. Recibir un mensaje de WhatsApp y revisar el log: no debe aparecer el texto del mensaje.
+5. En VPS con compose, mandar un login con `X-Forwarded-For` falso → el bloqueo por fuerza bruta debe seguir contando la IP real (no una nueva por cada cabecera).
+6. Instalación nueva con Enter en las claves → el instalador genera claves largas y las imprime al final; `docker compose up` sin `POSTGRES_PASSWORD` en `.env` falla con el mensaje claro.
+7. WhatsApp: enviar un texto y una foto a Virtual Zone (el envío manual de multimedia no se tocó).
+
+**Pendiente honesto:** la imagen Docker no se pudo construir en este entorno (sin Docker aquí), así que el `ENV TRUST_PROXY=1` del Dockerfile y el override de compose solo se probarán en el despliegue. El arranque sin DB y el build se verificaron igual que en las versiones anteriores.
 
 ## v5.3.28 — Corrección urgente: permiso denegado en el volumen (2026-11-08)
 

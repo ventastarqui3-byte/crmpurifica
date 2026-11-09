@@ -10,7 +10,10 @@ services:
     environment:
       TZ: ${TZ:-America/Bogota}
       POSTGRES_USER: ${POSTGRES_USER:-purifica}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cambia-esta-clave}
+      # v5.3.29 (H-A5): sin valor por defecto. Sin POSTGRES_PASSWORD en
+      # .env, compose falla rápido con este mensaje en vez de arrancar
+      # con la clave pública 'cambia-esta-clave'.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en .env}
       POSTGRES_DB: ${POSTGRES_DB:-purifica}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -33,6 +36,11 @@ services:
       # URL-escapada). Si prefieres ponerla a mano, defínela en .env.
       TZ: ${TZ:-America/Bogota}
       PORT: 3000
+      # v5.3.29 (H-A4): 0 por defecto = el puerto está expuesto directo y
+      # NO se confía en X-Forwarded-For (si no, cualquiera falsifica su IP
+      # y anula el rate limiting y el bloqueo de login). Pon 1 en .env solo
+      # si hay un reverse proxy real (Caddy/nginx) delante de la app.
+      TRUST_PROXY: ${TRUST_PROXY:-0}
     ports:
       - "${APP_PORT:-8080}:3000"
     volumes:
@@ -60,7 +68,8 @@ services:
       TZ: ${TZ:-America/Bogota}
       PGHOST: db
       PGUSER: ${POSTGRES_USER:-purifica}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-cambia-esta-clave}
+      # v5.3.29 (H-A5): igual que en el servicio db, sin clave conocida.
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en .env}
       PGDATABASE: ${POSTGRES_DB:-purifica}
       BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY:-}
       BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
