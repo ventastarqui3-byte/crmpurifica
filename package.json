@@ -1,6 +1,6 @@
 {
   "name": "purifica-crm",
-  "version": "5.3.31",
+  "version": "5.3.32",
   "type": "module",
   "scripts": {
     "dev": "vite",

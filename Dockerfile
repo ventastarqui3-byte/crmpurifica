@@ -39,10 +39,24 @@ RUN npm run build
 # ---------- Etapa 2: ejecución ----------
 FROM node:22-slim
 
+# v5.3.32: el servidor Postgres de Railway es 18.6 y pg_dump 15 (el
+# postgresql-client de Debian 12) se niega a respaldarlo
+# ("server version mismatch") -> el respaldo siempre fallaba y por eso
+# "Último respaldo" siempre decía Roto. El cliente 18 viene del repo
+# oficial de PostgreSQL (PGDG), que sí lo tiene para bookworm
+# (18.6-1.pgdg12+2, igual que el servidor); pg_dump 18 respalda
+# servidores 18 y también más viejos.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg \
+    && mkdir -p /usr/share/keyrings \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && rm -rf /var/lib/apt/lists/*
+
 # Instalar dependencias necesarias para Chrome/Puppeteer
 # (gconf-service, libgconf-2-4 y libappindicator1 se quitaron: no existen
 # en Debian 12/Bookworm y rompían el build de la imagen.)
-# postgresql-client: el trabajo de respaldo de docker-compose usa
+# postgresql-client-18: el trabajo de respaldo de docker-compose usa
 # pg_dump desde esta misma imagen. wget: lo usa el HEALTHCHECK.
 RUN apt-get update && apt-get install -y \
     libasound2 \
@@ -84,7 +98,7 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     wget \
     libgbm-dev \
-    postgresql-client \
+    postgresql-client-18 \
     && rm -rf /var/lib/apt/lists/*
 
 # Crear directorio de la aplicación

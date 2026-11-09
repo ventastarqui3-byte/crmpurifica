@@ -16,6 +16,9 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 if ! command -v pg_dump >/dev/null 2>&1; then
   echo "pg_dump no está instalado. En Debian/Ubuntu: sudo apt install postgresql-client"
+  echo "OJO: si el servidor es Postgres 18 (como el de Railway), el cliente 15 de"
+  echo "Debian 12 NO sirve (server version mismatch). Instala el 18 desde PGDG:"
+  echo "  https://www.postgresql.org/download/linux/debian/ (postgresql-client-18)"
   exit 1
 fi
 mkdir -p backups
