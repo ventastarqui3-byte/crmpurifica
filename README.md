@@ -1,4 +1,20 @@
-# Purifica Tu Ambiente CRM — v5.3.30 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen + corrección de los 5 hallazgos altos de la auditoría 2026-11-09 + rendimiento para 30 usuarios)
+# Purifica Tu Ambiente CRM — v5.3.31 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen + corrección de los 5 hallazgos altos de la auditoría 2026-11-09 + rendimiento para 30 usuarios + refresco en tiempo real del chat)
+
+## v5.3.31 — Corrección: las imágenes (y cualquier mensaje) no aparecían hasta refrescar (2026-11-09)
+
+**Qué pasaba:** en producción, al enviar o recibir una imagen (o cualquier mensaje) en un chat con muchos mensajes, no aparecía hasta refrescar la página a mano. El mensaje sí se enviaba y se guardaba.
+
+**Causa:** el refresco del historial del chat abierto dependía del CONTEO de mensajes de la lista. La v5.3.30 puso un tope de 50 mensajes por conversación en la lista, así que en chats con 50+ mensajes el conteo deja de cambiar al llegar uno nuevo (entra uno, sale el más viejo) y el refresco no se disparaba nunca. No era un problema de la imagen en sí: era el tope de 50 combinado con el disparador por conteo.
+
+**Corrección (solo `components/ChatInbox.tsx`):** el refresco ahora depende del id del último mensaje de la lista, que cambia con cada mensaje nuevo esté o no el chat en el tope. La guarda que evita refetcheos de más (si el último mensaje ya es el mismo, no se refetchea) sigue igual.
+
+**Plan de pruebas tras desplegar v5.3.31:**
+1. Abrir el chat con Virtual Zone (que tiene más de 50 mensajes) y enviar una imagen: debe aparecer sola en unos segundos, sin refrescar.
+2. Recibir una imagen en ese mismo chat: debe aparecer sola (la descarga tarda unos segundos según el tamaño, eso es normal).
+3. Enviar un texto en ese chat: también debe aparecer solo.
+4. El botón "Cargar mensajes anteriores" sigue funcionando igual.
+
+**Pendiente honesto:** el refresco en tiempo real no se puede probar en este entorno (sin WhatsApp real); la corrección está verificada por lectura del código + compilación + arranque, y la prueba real es en producción con el chat de Virtual Zone.
 
 ## v5.3.30 — Rendimiento para 30 usuarios (prueba de estrés 2026-11-09)
 

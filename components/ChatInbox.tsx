@@ -169,6 +169,15 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
   const detailRef = useRef<ChatMessage[] | null>(null);
   useEffect(() => { detailRef.current = detailMessages; }, [detailMessages]);
   const prevChatIdRef = useRef<string | null>(null);
+  // v5.3.31: el id del último mensaje de la lista como disparador del
+  // refresco. Antes el efecto solo dependía del CONTEO de mensajes, y con
+  // el tope de 50 de la v5.3.30 el conteo deja de cambiar en chats con 50+
+  // mensajes: el efecto no se re-ejecutaba y los mensajes nuevos (de texto
+  // o de media, enviados o recibidos) no aparecían hasta refrescar la
+  // página a mano. El id sí cambia con cada mensaje nuevo, esté o no el
+  // chat en el tope. La guarda de dentro (mismo último id → no refetchear)
+  // sigue evitando refetcheos de más.
+  const newestListMsgId = activeChat?.messages?.length ? activeChat.messages[activeChat.messages.length - 1].id : null;
   useEffect(() => {
     if (!activeChat) { setDetailMessages(null); setDetailChatId(null); setDetailHasMore(false); prevChatIdRef.current = null; return; }
     const chatChanged = prevChatIdRef.current !== activeChat.id;
@@ -191,7 +200,7 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
       })
       .catch(() => { /* sin historial: la vista sigue con los mensajes de la lista */ });
     return () => { cancelled = true; };
-  }, [selectedChatId, activeChat?.messages?.length]);
+  }, [selectedChatId, activeChat?.messages?.length, newestListMsgId]);
 
   // v5.3.30: cargar una página más hacia atrás (200 mensajes más viejos
   // que el primero que se ve). No baja al final: el usuario sigue donde
