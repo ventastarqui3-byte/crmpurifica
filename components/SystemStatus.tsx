@@ -43,7 +43,7 @@ interface StatusData {
   // v5.3.16 Desglose de almacenamiento del volumen (sesión WhatsApp vs
   // fotos subidas vs total del volumen). volumeMB puede ser null si no se
   // pudo medir.
-  storage?: { sessionMB: number; uploadsMB: number; volumeMB: { freeMB: number; totalMB: number } | null };
+  storage?: { sessionMB: number; uploadsMB: number; volumeMB: { freeMB: number; totalMB: number; usedPercent?: number | null } | null };
   components: SystemComponentStatus[];
   criticalEvents: SystemEvent[];
 }
@@ -83,6 +83,11 @@ export const SystemStatus: React.FC = () => {
   const [tgBotToken, setTgBotToken] = useState('');
   const [tgChatId, setTgChatId] = useState('');
   const gcalFormInit = useRef(false);
+  // v5.3.34 Respaldo sin cifrar: opt-in explícito del admin (ver tarjeta
+  // Respaldo abajo). Sin esto y sin BACKUP_ENCRYPTION_KEY, el respaldo
+  // falla cerrado.
+  const [backupAllowUnencrypted, setBackupAllowUnencrypted] = useState(false);
+  const backupFormInit = useRef(false);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -106,6 +111,10 @@ export const SystemStatus: React.FC = () => {
           if (typeof stJson.google_calendar_duration_minutes === 'string' && stJson.google_calendar_duration_minutes) setGcalDuration(stJson.google_calendar_duration_minutes);
           if (typeof stJson.google_calendar_enabled === 'string') setGcalEnabled(stJson.google_calendar_enabled.toLowerCase() !== 'false');
           gcalFormInit.current = true;
+        }
+        if (stRes.ok && !backupFormInit.current) {
+          if (typeof stJson.backup_allow_unencrypted === 'string') setBackupAllowUnencrypted(stJson.backup_allow_unencrypted.toLowerCase() === 'true');
+          backupFormInit.current = true;
         }
       } catch { /* sin settings: los campos quedan con su valor por defecto */ }
     } catch (e: any) {
@@ -253,6 +262,16 @@ export const SystemStatus: React.FC = () => {
       return { message: 'Telegram guardado. Pulsa “Probar alerta de Telegram” para verificar que llega el mensaje.' };
     });
 
+  // v5.3.34 Respaldo sin cifrar: opt-in explícito del admin. Sin esto (y sin
+  // clave BACKUP_ENCRYPTION_KEY), el respaldo falla cerrado.
+  const saveBackup = async () =>
+    runAction('backup-save', async () => {
+      await saveSetting('backup_allow_unencrypted', backupAllowUnencrypted ? 'true' : 'false');
+      return { message: backupAllowUnencrypted
+        ? 'Guardado: los respaldos se guardarán SIN cifrar. Cada uno avisará por Telegram.'
+        : 'Guardado: los respaldos exigirán clave de cifrado (BACKUP_ENCRYPTION_KEY).' };
+    });
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64 text-slate-500 gap-2">
@@ -357,7 +376,7 @@ export const SystemStatus: React.FC = () => {
               {c.key === 'whatsapp' && data?.storage && (
                 <p className="text-xs text-slate-400 mt-1">
                   Almacenamiento: sesión {data.storage.sessionMB} MB · Fotos {data.storage.uploadsMB} MB
-                  {data.storage.volumeMB ? ` · Volumen libre: ${data.storage.volumeMB.freeMB} MB de ${data.storage.volumeMB.totalMB} MB` : ''}
+                  {data.storage.volumeMB ? ` · Volumen libre: ${data.storage.volumeMB.freeMB} MB de ${data.storage.volumeMB.totalMB} MB${data.storage.volumeMB.usedPercent != null ? ` · Disco al ${data.storage.volumeMB.usedPercent}%` : ''}` : ''}
                 </p>
               )}
               {c.key === 'backup' && c.backup?.file && (
@@ -482,6 +501,33 @@ export const SystemStatus: React.FC = () => {
               <p className="text-xs text-slate-400">
                 Después de guardar, usa el botón “Probar alerta de Telegram” de Acciones para verificar que llega el mensaje.
               </p>
+            </div>
+          </div>
+          <div className="border border-slate-200 rounded-2xl p-4">
+            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+              <HardDrive className="w-5 h-5 text-slate-500" /> Respaldo
+            </h3>
+            <p className="text-xs text-slate-500 mt-1 mb-3">
+              El respaldo contiene toda la base de datos. Sin clave de cifrado
+              (BACKUP_ENCRYPTION_KEY en Railway/.env), el respaldo falla por defecto.
+            </p>
+            <div className="space-y-2">
+              <label className="flex items-start gap-2 text-sm text-slate-700">
+                <input type="checkbox" checked={backupAllowUnencrypted} onChange={(e) => setBackupAllowUnencrypted(e.target.checked)} className="mt-0.5" />
+                <span>
+                  Permitir respaldos SIN cifrar
+                  <span className="block text-xs text-amber-600 font-normal mt-0.5">
+                    Peligro: el archivo queda en texto plano con hashes de contraseñas y tokens.
+                    Cada respaldo sin cifrar avisa por Telegram y queda en Últimos eventos.
+                  </span>
+                </span>
+              </label>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button onClick={saveBackup} disabled={busy === 'backup-save'}
+                  className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'backup-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar respaldo
+                </button>
+              </div>
             </div>
           </div>
         </div>

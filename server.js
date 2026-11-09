@@ -47,20 +47,32 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.33';
+const APP_VERSION = '5.3.34';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
 const BACKUP_ENABLED = (process.env.BACKUP_ENABLED || 'true').toLowerCase() !== 'false';
 const BACKUP_KEEP_DAYS = parseInt(process.env.BACKUP_KEEP_DAYS || '7', 10) || 7;
 // v5.3.25 (M12): clave para cifrar los respaldos (AES-256-GCM). Debe ser
-// 64 caracteres hex (32 bytes), p. ej. `openssl rand -hex 32`. Sin ella
-// el respaldo se guarda SIN cifrar y queda registrado el aviso.
+// 64 caracteres hex (32 bytes), p. ej. `openssl rand -hex 32`.
+// v5.3.34 (H-M8, fail-closed): SIN clave válida el respaldo FALLA (no se
+// guarda en plano). Solo se permite en plano con opt-in explícito (ver
+// isUnencryptedBackupAllowed): env BACKUP_ALLOW_UNENCRYPTED=true o ajuste
+// backup_allow_unencrypted='true' en Estado del Sistema.
 const BACKUP_ENCRYPTION_KEY_HEX = (process.env.BACKUP_ENCRYPTION_KEY || '').trim();
 const BACKUP_ENCRYPTION_KEY = /^[0-9a-fA-F]{64}$/.test(BACKUP_ENCRYPTION_KEY_HEX)
   ? Buffer.from(BACKUP_ENCRYPTION_KEY_HEX, 'hex') : null;
 if (BACKUP_ENCRYPTION_KEY_HEX && !BACKUP_ENCRYPTION_KEY) {
-  logger.warn('BACKUP_ENCRYPTION_KEY inválida (debe ser 64 caracteres hex): los respaldos quedarán SIN cifrar');
+  logger.warn('BACKUP_ENCRYPTION_KEY inválida (debe ser 64 caracteres hex): los respaldos FALLARÁN hasta poner una clave válida o permitir respaldos sin cifrar en Estado del Sistema');
+}
+
+// v5.3.34 (H-M8): ¿está permitido guardar el respaldo SIN cifrar? Solo con
+// opt-in explícito del admin: variable de entorno o ajuste en settings.
+// Por defecto (sin clave y sin opt-in) el respaldo falla cerrado.
+async function isUnencryptedBackupAllowed() {
+  if ((process.env.BACKUP_ALLOW_UNENCRYPTED || '').trim().toLowerCase() === 'true') return true;
+  const v = await getSettingValue('backup_allow_unencrypted', '');
+  return String(v || '').trim().toLowerCase() === 'true';
 }
 
 // ---------- GOOGLE CALENDAR v5.3 ----------
@@ -84,6 +96,8 @@ let eventsTableReady = false;
 let lastBackup = { at: null, ok: null, file: null, sizeBytes: null, error: null };
 // Anti-spam de alertas: última vez que se avisó de cada clave (clave -> ms).
 const lastAlertAt = {};
+// v5.3.34 (H-M11): última alerta de disco lleno (throttle propio de 1 h).
+let lastDiskAlertAt = 0;
 // Último estado conocido por el vigilante (para avisar solo al cambiar).
 const watchdogState = { db: null, whatsapp: null };
 // Intentos fallidos de login por correo (timestamps, últimos 10 min).
@@ -1261,14 +1275,74 @@ async function getStorageInfo(force = false) {
   let volumeMB = null;
   try {
     const s = await fs.promises.statfs(waDataDir());
-    volumeMB = {
-      freeMB: Math.round(s.bfree * s.bsize / MB),
-      totalMB: Math.round(s.blocks * s.bsize / MB),
-    };
+    const totalMB = Math.round(s.blocks * s.bsize / MB);
+    const freeMB = Math.round(s.bfree * s.bsize / MB);
+    volumeMB = { freeMB, totalMB, usedPercent: totalMB > 0 ? Math.round((totalMB - freeMB) / totalMB * 100) : null };
   } catch { volumeMB = null; }
   const data = { sessionMB, uploadsMB, volumeMB };
   storageInfoCache = { at: now, data };
   return data;
+}
+
+// ---------- LIMPIEZA DE HUÉRFANOS EN uploads/ (v5.3.34, H-M11) ----------
+// Archivos que quedan en uploads/: wa-media/<archivo> (adjuntos de chat,
+// media de campañas y seguimiento) y logo.png/jpg en la raíz. Referencias
+// en la BD: messages.attachment_url, campaigns.media_url,
+// campaign_recipients.attachment_url, followups.attachment_url y los
+// ajustes followup_media_url y branding_logo_url. (leads.technical_images
+// son data URLs base64 guardadas EN la base de datos, no archivos.)
+// Regla conservadora: se borra SOLO lo que (a) no está referenciado en
+// ninguna de esas fuentes Y (b) tiene más de 30 días. El logo nunca se
+// borra. Si la BD no responde o alguna consulta falla, NO se borra nada:
+// mejor un huérfano que un archivo en uso.
+async function cleanupOrphanUploads() {
+  if (!dbOk) return { deleted: 0, freedBytes: 0, skipped: 'sin base de datos' };
+  const refs = new Set();
+  const addUrl = (u) => {
+    if (typeof u === 'string' && u.startsWith('/uploads/')) refs.add(u.slice('/uploads/'.length));
+  };
+  try {
+    const [m, c, cr, f, s] = await Promise.all([
+      pool.query("SELECT attachment_url FROM messages WHERE attachment_url IS NOT NULL AND attachment_url <> ''"),
+      pool.query("SELECT media_url FROM campaigns WHERE media_url IS NOT NULL AND media_url <> ''"),
+      pool.query("SELECT attachment_url FROM campaign_recipients WHERE attachment_url IS NOT NULL AND attachment_url <> ''"),
+      pool.query("SELECT attachment_url FROM followups WHERE attachment_url IS NOT NULL AND attachment_url <> ''"),
+      pool.query("SELECT value FROM settings WHERE key IN ('followup_media_url', 'branding_logo_url')"),
+    ]);
+    for (const r of m.rows) addUrl(r.attachment_url);
+    for (const r of c.rows) addUrl(r.media_url);
+    for (const r of cr.rows) addUrl(r.attachment_url);
+    for (const r of f.rows) addUrl(r.attachment_url);
+    for (const r of s.rows) addUrl(r.value);
+  } catch (e) {
+    recordEvent('warn', 'storage', `Limpieza de huérfanos cancelada (no se borró nada): ${e.message}`, {});
+    return { deleted: 0, freedBytes: 0, skipped: e.message };
+  }
+  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+  let deleted = 0;
+  let freedBytes = 0;
+  const stack = [uploadsDir()];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { stack.push(full); continue; }
+      if (!e.isFile()) continue;
+      const rel = path.relative(uploadsDir(), full).split(path.sep).join('/');
+      if (rel === 'logo.png' || rel === 'logo.jpg') continue; // nunca el logo
+      if (refs.has(rel)) continue;
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (st.mtimeMs >= cutoff) continue;
+      try { fs.unlinkSync(full); deleted++; freedBytes += st.size; } catch { /* un archivo no bloquea los demás */ }
+    }
+  }
+  if (deleted > 0) {
+    recordEvent('info', 'storage', `Limpieza de huérfanos: ${deleted} archivo(s) borrados, ${Math.round(freedBytes / 1024 / 1024)} MB liberados`, { deleted, freedBytes });
+  }
+  return { deleted, freedBytes };
 }
 const WA_MEDIA_LABELS = { image: '📷 Imagen', audio: '🎤 Nota de voz', video: '🎬 Video', document: '📎 Documento', sticker: '😀 Sticker' };
 // Tipos de whatsapp-web.js que son media real (además de 'chat' = texto).
@@ -2342,12 +2416,105 @@ const waSendLimiter = rateLimit({
   standardHeaders: 'draft-7', legacyHeaders: false,
   handler: rateLimitMessage('Demasiados envíos de WhatsApp en poco tiempo. Espera unos minutos.'),
 });
-// Subida de archivos: 60/15 min por IP.
+// Subida de archivos: 10/15 min por USUARIO autenticado (v5.3.34, H-M11:
+// antes 60/15 min por IP: un usuario autenticado podía llenar el volumen
+// con subidas de 25 MB — 60 × 25 MB = 1,5 GB contra un volumen de 0,5 GB).
+// Sin sesión (nunca debería pasar: las rutas de subida exigen login) se
+// limita por IP, igual que el resto de limitadores por usuario.
 const uploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, limit: 60,
+  windowMs: 15 * 60 * 1000, limit: 10,
+  keyGenerator: rateLimitKey,
   standardHeaders: 'draft-7', legacyHeaders: false,
   handler: rateLimitMessage('Demasiadas subidas en poco tiempo. Espera unos minutos.'),
 });
+
+// ---------- CUOTA DE DISCO PARA SUBIDAS (v5.3.34, H-M11) ----------
+// El limitador frena la velocidad, pero no el total: sin cuota, subir
+// archivos grandes (o muchos) llena el volumen y caen WhatsApp, la base de
+// datos y los respaldos. Dos topes: total de uploads/ y por usuario/día.
+// Prioridad: ajuste en settings > variable de entorno > valor por defecto.
+// Los contadores por usuario viven en memoria: un reinicio los pone a cero
+// (el tope total, que se mide en disco, no se ve afectado).
+const UPLOADS_MAX_MB_DEFAULT = 300;
+const UPLOADS_USER_DAY_MAX_MB_DEFAULT = 100;
+async function getUploadsMaxBytes() {
+  const fromSettings = parseInt((await getSettingValue('uploads_max_mb', '')) || '', 10);
+  if (Number.isFinite(fromSettings) && fromSettings > 0) return fromSettings * 1024 * 1024;
+  const fromEnv = parseInt(process.env.UPLOADS_MAX_MB || '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv * 1024 * 1024;
+  return UPLOADS_MAX_MB_DEFAULT * 1024 * 1024;
+}
+async function getUploadsUserDayMaxBytes() {
+  const fromSettings = parseInt((await getSettingValue('uploads_user_day_max_mb', '')) || '', 10);
+  if (Number.isFinite(fromSettings) && fromSettings > 0) return fromSettings * 1024 * 1024;
+  const fromEnv = parseInt(process.env.UPLOADS_USER_DAY_MAX_MB || '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv * 1024 * 1024;
+  return UPLOADS_USER_DAY_MAX_MB_DEFAULT * 1024 * 1024;
+}
+const uploadUsageByUser = new Map(); // userId -> { date: 'YYYY-MM-DD', bytes }
+function todayCO() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Bogota' }); }
+function getUserDayUsage(userId) {
+  const e = uploadUsageByUser.get(userId);
+  if (!e || e.date !== todayCO()) return 0;
+  return e.bytes || 0;
+}
+function addUserDayUsage(userId, bytes) {
+  const today = todayCO();
+  const e = uploadUsageByUser.get(userId);
+  if (!e || e.date !== today) uploadUsageByUser.set(userId, { date: today, bytes });
+  else e.bytes += bytes;
+}
+const fmtMB = (bytes) => `${Math.round(bytes / 1024 / 1024)} MB`;
+// Pre-chequeo ANTES de que multer escriba a disco: con Content-Length se
+// sabe el tamaño antes de recibir el cuerpo. Sin Content-Length (chunked)
+// no se puede saber: el post-chequeo de abajo cubre ese caso.
+async function uploadQuotaGuard(req, res, next) {
+  try {
+    const maxTotal = await getUploadsMaxBytes();
+    const current = dirSizeBytes(uploadsDir());
+    const len = parseInt(req.headers['content-length'] || '', 10);
+    if (Number.isFinite(len) && len > 0 && current + len > maxTotal) {
+      return res.status(413).json({ error: `Cuota de almacenamiento llena (${fmtMB(current)} de ${fmtMB(maxTotal)} usados). Borra archivos o amplía UPLOADS_MAX_MB.` });
+    }
+    const uid = req.user?.id;
+    if (uid != null && Number.isFinite(len) && len > 0) {
+      const maxDay = await getUploadsUserDayMaxBytes();
+      const used = getUserDayUsage(uid);
+      if (used + len > maxDay) {
+        return res.status(413).json({ error: `Cuota diaria de subidas superada (${fmtMB(used)} de ${fmtMB(maxDay)} hoy). Inténtalo mañana.` });
+      }
+    }
+    return next();
+  } catch (e) {
+    // Si la comprobación falla, no bloquear la subida (la cuota es un
+    // resguardo, no el núcleo): el post-chequeo tras escribir sigue activo.
+    logger.warn(`Cuota de subidas no verificada: ${e.message}`);
+    return next();
+  }
+}
+// Post-chequeo DESPUÉS de que multer escribió: si la cuota total o la
+// diaria se superó (p. ej. subida sin Content-Length), borra lo recién
+// subido y devuelve el mensaje para 413. Si todo está bien, registra el
+// uso diario del usuario y devuelve null.
+async function enforceUploadQuotaAfterWrite(req) {
+  if (!req.file) return null;
+  const size = req.file.size || 0;
+  const maxTotal = await getUploadsMaxBytes();
+  if (dirSizeBytes(uploadsDir()) > maxTotal) {
+    try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
+    return `Cuota de almacenamiento llena (${fmtMB(maxTotal)}). El archivo se borró sin guardarse.`;
+  }
+  const uid = req.user?.id;
+  if (uid != null) {
+    const maxDay = await getUploadsUserDayMaxBytes();
+    if (getUserDayUsage(uid) + size > maxDay) {
+      try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
+      return 'Cuota diaria de subidas superada. Inténtalo mañana.';
+    }
+    addUserDayUsage(uid, size);
+  }
+  return null;
+}
 // Cambios de contraseña y creación de usuarios: 20/15 min por IP.
 const accountLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, limit: 20,
@@ -2809,7 +2976,9 @@ async function getSystemStatus() {
   let disk = null;
   try {
     const s = await fs.promises.statfs(uploadsDir());
-    disk = { freeMB: Math.round(s.bfree * s.bsize / 1024 / 1024), totalMB: Math.round(s.blocks * s.bsize / 1024 / 1024) };
+    const totalMB = Math.round(s.blocks * s.bsize / 1024 / 1024);
+    const freeMB = Math.round(s.bfree * s.bsize / 1024 / 1024);
+    disk = { freeMB, totalMB, usedPercent: totalMB > 0 ? Math.round((totalMB - freeMB) / totalMB * 100) : null };
   } catch { disk = null; }
   // Cola de mensajes: la tabla messages de crm6 NO tiene columna status
   // (no hay "en cola" persistente), así que se informa lo que sí se sabe:
@@ -3116,6 +3285,18 @@ app.get('/api/system/backup/download', requireAdmin, (req, res) => {
   });
 });
 
+// v5.3.34 (H-M11): limpieza manual de huérfanos (la automática corre a
+// diario tras el respaldo de las 02:00). Devuelve cuántos archivos se
+// borraron y cuántos MB se liberaron.
+app.post('/api/system/cleanup-uploads', requireAdmin, async (req, res) => {
+  try {
+    const r = await cleanupOrphanUploads();
+    res.json({ ok: true, ...r });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ---------- GOOGLE CALENDAR v5.3 (pedido del cliente) ----------
 // Al agendar un servicio (crear o reprogramar) se crea/actualiza el evento
 // en Google Calendar; al cancelar o eliminar, se borra. API oficial con
@@ -3378,10 +3559,14 @@ async function encryptBackupFile(filePath) {
   return encPath;
 }
 
-// Nombre de archivo de respaldo válido: <marca>-AAAAMMDD-HHMM.sql.gz
+// Nombre de archivo de respaldo válido: <marca>-AAAAMMDD-HHMMSS.sql.gz
 // (con o sin .enc). Se usa en la retención, en la migración y en la
 // descarga: nunca se sirve un archivo fuera de este patrón.
-const BACKUP_FILE_RE = /^[a-z0-9-]+\-\d{8}\-\d{4}\.sql\.gz(\.enc)?$/i;
+// v5.3.34: con segundos (antes solo HHMM, dos respaldos en el mismo
+// minuto compartían nombre y un intento fallido borraba el bueno).
+// El patrón acepta también el formato viejo HHMM para no dejar fuera
+// los respaldos ya guardados.
+const BACKUP_FILE_RE = /^[a-z0-9-]+\-\d{8}\-\d{4}(\d{2})?\.sql\.gz(\.enc)?$/i;
 
 async function runBackup(trigger = 'manual') {
   if (!dbUrl) return { ok: false, code: 503, error: 'Base de datos no configurada' };
@@ -3403,7 +3588,7 @@ async function runBackup(trigger = 'manual') {
       }
     }
   } catch { /* migración opcional: nunca rompe el respaldo */ }
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 13);
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   // v5.3.25 (M8): nombre neutro derivado de la marca de la instalación
   // (antes 'purifica-' fijo, que delataba la empresa en instalaciones
   // revendidas). Sin marca configurada, 'crm'.
@@ -3413,7 +3598,23 @@ async function runBackup(trigger = 'manual') {
   const filePath = path.join(dir, file);
   return new Promise((resolve) => {
     let settled = false;
-    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    // v5.3.34 (H-M8): ningún fallo de respaldo es silencioso. Al fallar se
+    // persiste el lastBackup ok:false (getLastBackupInfo lee settings
+    // primero: sin esto, tras un reinicio se seguiría viendo el último OK)
+    // y se avisa por Telegram (best-effort: si no está configurado no pasa
+    // nada y el flujo no se rompe).
+    const done = (r) => {
+      if (!settled) {
+        settled = true;
+        if (!r.ok) {
+          try {
+            pool.query("INSERT INTO settings (key, value) VALUES ('last_backup', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify(lastBackup)]).catch(() => { /* sin settings aún */ });
+          } catch { /* sin settings aún */ }
+          sendTelegramAlert(`🚨 CRM: respaldo fallido (${trigger}): ${r.error}`).catch(() => {});
+        }
+        resolve(r);
+      }
+    };
     let dump;
     try {
       dump = spawn('pg_dump', [dbUrl], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -3451,10 +3652,11 @@ async function runBackup(trigger = 'manual') {
         recordEvent('error', 'backup', `Respaldo falló (${trigger}): ${r.error}`, {});
         return done(r);
       }
-      // v5.3.25 (M12): cifrar el respaldo con AES-256-GCM y la clave
-      // BACKUP_ENCRYPTION_KEY (scripts/decrypt-backup.js para leerlo).
-      // Sin clave, el respaldo queda SIN cifrar y se registra el aviso:
-      // nunca falla en silencio. El texto plano se borra tras cifrar.
+      // v5.3.34 (H-M8, fail-closed): el respaldo NUNCA queda en plano por
+      // accidente. Si el cifrado falla, se borra el .sql.gz (y cualquier
+      // .enc parcial) y el respaldo falla. Sin clave, falla por defecto:
+      // solo se guarda en plano con opt-in explícito del admin, y aun así
+      // se avisa por evento y por Telegram en cada respaldo sin cifrar.
       let encrypted = false;
       if (BACKUP_ENCRYPTION_KEY) {
         try {
@@ -3463,14 +3665,30 @@ async function runBackup(trigger = 'manual') {
           file = `${file}.enc`;
           encrypted = true;
         } catch (e) {
-          const warn = `No se pudo cifrar el respaldo (${e.message}): quedó SIN cifrar`;
-          logger.warn(warn);
-          recordEvent('warn', 'backup', warn, { file });
+          const msg = `No se pudo cifrar el respaldo (${e.message}): se borró el archivo en plano y no se guardó respaldo`;
+          try { fs.unlinkSync(filePath); } catch { /* noop */ }
+          try { fs.unlinkSync(`${filePath}.enc`); } catch { /* noop */ }
+          const r = { ok: false, code: 500, error: msg };
+          lastBackup = { at: new Date().toISOString(), ok: false, file: null, sizeBytes: null, error: msg };
+          recordEvent('error', 'backup', `Respaldo falló (${trigger}): ${msg}`, {});
+          return done(r);
         }
+      } else if (!(await isUnencryptedBackupAllowed())) {
+        const msg = BACKUP_ENCRYPTION_KEY_HEX
+          ? 'BACKUP_ENCRYPTION_KEY inválida (debe ser 64 caracteres hex): pon una clave válida con `openssl rand -hex 32` o activa "Permitir respaldos sin cifrar" en Estado del Sistema'
+          : 'Respaldo SIN cifrar no permitido: define BACKUP_ENCRYPTION_KEY en Railway/.env (genera una con `openssl rand -hex 32`) o activa "Permitir respaldos sin cifrar" en Estado del Sistema';
+        try { fs.unlinkSync(filePath); } catch { /* noop */ }
+        const r = { ok: false, code: 500, error: msg };
+        lastBackup = { at: new Date().toISOString(), ok: false, file: null, sizeBytes: null, error: msg };
+        recordEvent('error', 'backup', `Respaldo falló (${trigger}): ${msg}`, {});
+        return done(r);
       } else {
-        const warn = 'Respaldo SIN cifrar: define BACKUP_ENCRYPTION_KEY en .env para cifrarlo';
+        // Opt-in explícito del admin: se guarda en plano, pero NUNCA en
+        // silencio: evento + alerta de Telegram en cada respaldo así.
+        const warn = `Respaldo SIN cifrar (permitido por el administrador): ${file} contiene toda la base de datos en plano`;
         logger.warn(warn);
         recordEvent('warn', 'backup', warn, { file });
+        sendTelegramAlert(`⚠️ CRM: respaldo SIN cifrar (${trigger}): ${file} — contiene toda la base de datos en plano`).catch(() => {});
       }
       const finalPath = path.join(dir, file);
       const finalSize = fs.existsSync(finalPath) ? fs.statSync(finalPath).size : sizeBytes;
@@ -3479,7 +3697,7 @@ async function runBackup(trigger = 'manual') {
         await pool.query("INSERT INTO settings (key, value) VALUES ('last_backup', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify(lastBackup)]);
       } catch { /* sin settings aún, queda en memoria */ }
       // Retención: borrar respaldos de más de BACKUP_KEEP_DAYS días. Solo
-      // archivos con pinta de respaldo (<marca>-YYYYMMDD-HHMM.sql.gz, con
+      // archivos con pinta de respaldo (<marca>-YYYYMMDD-HHMMSS.sql.gz, con
       // o sin .enc): antes borraba CUALQUIER archivo viejo de backups/.
       try {
         const cutoff = Date.now() - BACKUP_KEEP_DAYS * 24 * 3600 * 1000;
@@ -3551,6 +3769,18 @@ async function watchdogCheck() {
       maybeAlert('whatsapp-down', '✅ WhatsApp volvió a conectarse.', { force: true });
     }
     if (wa.total > 0) watchdogState.whatsapp = waOk ? 'ok' : 'error';
+    // v5.3.34 (H-M11): alerta de disco al 80% (máx. 1 vez por hora para no
+    // spamear; el evento queda siempre en Últimos eventos). Si Telegram no
+    // está configurado, el evento es la única señal: nunca es silencioso.
+    try {
+      const info = await getStorageInfo();
+      const pct = info.volumeMB?.usedPercent ?? null;
+      if (pct != null && pct >= 80 && Date.now() - lastDiskAlertAt > 60 * 60 * 1000) {
+        lastDiskAlertAt = Date.now();
+        recordEvent('warn', 'storage', `Disco al ${pct}% (${info.volumeMB.freeMB} MB libres de ${info.volumeMB.totalMB} MB): libera espacio o WhatsApp, la base de datos y los respaldos dejarán de funcionar`, { usedPercent: pct });
+        sendTelegramAlert(`⚠️ CRM: disco al ${pct}% — solo quedan ${info.volumeMB.freeMB} MB libres de ${info.volumeMB.totalMB} MB. Libera espacio (limpiar caché de WhatsApp o borrar respaldos viejos) antes de que se llene.`).catch(() => {});
+      }
+    } catch { /* la alerta de disco nunca rompe el vigilante */ }
   } catch (e) {
     recordEvent('error', 'server', `El vigilante falló: ${e.message}`, {});
   }
@@ -3568,6 +3798,9 @@ function scheduleDailyBackup() {
   if (next <= now) next.setDate(next.getDate() + 1);
   setTimeout(async () => {
     await runBackup('automático diario 02:00');
+    // v5.3.34 (H-M11): la limpieza de huérfanos corre una vez al día, justo
+    // después del respaldo, cuando el sistema está en calma.
+    try { await cleanupOrphanUploads(); } catch (e) { logger.warn(`Limpieza de huérfanos falló: ${e.message}`); }
     scheduleDailyBackup();
   }, next.getTime() - now.getTime());
 }
@@ -4850,8 +5083,8 @@ app.get('/api/campaigns/:id', requireAdmin, async (req, res) => {
 // v5.3.20 — Subida de imagen o video para una campaña (mismo multer del
 // chat, tope 25 MB, solo imagen o video). El endpoint solo sube y devuelve
 // la URL; el frontend la manda en el body al crear la campaña.
-app.post('/api/campaigns/media', requireAdmin, uploadLimiter, async (req, res) => {
-  waMediaUpload.single('file')(req, res, (err) => {
+app.post('/api/campaigns/media', requireAdmin, uploadLimiter, uploadQuotaGuard, async (req, res) => {
+  waMediaUpload.single('file')(req, res, async (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
       return res.status(400).json({ error: msg });
@@ -4862,6 +5095,8 @@ app.post('/api/campaigns/media', requireAdmin, uploadLimiter, async (req, res) =
       try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
       return res.status(400).json({ error: 'Solo se admite imagen o video' });
     }
+    const quotaErr = await enforceUploadQuotaAfterWrite(req);
+    if (quotaErr) return res.status(413).json({ error: quotaErr });
     const type = waMediaTypeFromMime(mimetype);
     res.json({ success: true, url: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
   });
@@ -5109,11 +5344,11 @@ const waMediaUpload = multer({
   },
   limits: { fileSize: WA_MEDIA_MAX_BYTES },
 });
-app.post('/api/chats/:id/attachments', uploadLimiter, async (req, res) => {
+app.post('/api/chats/:id/attachments', uploadLimiter, uploadQuotaGuard, async (req, res) => {
   if (normalizeRoleValue(req.user?.role) === 'operator') {
     return res.status(403).json({ error: 'Solo lectura: los operadores no pueden enviar mensajes' });
   }
-  waMediaUpload.single('file')(req, res, (err) => {
+  waMediaUpload.single('file')(req, res, async (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
       return res.status(400).json({ error: msg });
@@ -5126,6 +5361,8 @@ app.post('/api/chats/:id/attachments', uploadLimiter, async (req, res) => {
       try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
       return res.status(400).json({ error: 'Tipo de archivo no permitido (imagen, audio, video o documento)' });
     }
+    const quotaErr = await enforceUploadQuotaAfterWrite(req);
+    if (quotaErr) return res.status(413).json({ error: quotaErr });
     const type = waMediaTypeFromMime(mimetype);
     res.json({ success: true, attachmentUrl: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
   });
@@ -5137,8 +5374,8 @@ app.post('/api/chats/:id/attachments', uploadLimiter, async (req, res) => {
 // ni documentos en esta versión. El endpoint solo SUBE el archivo y devuelve
 // su URL; el frontend guarda followup_media_url y followup_media_type con
 // POST /api/settings, como el resto de ajustes de seguimiento.
-app.post('/api/followups/media', requireAdmin, uploadLimiter, async (req, res) => {
-  waMediaUpload.single('file')(req, res, (err) => {
+app.post('/api/followups/media', requireAdmin, uploadLimiter, uploadQuotaGuard, async (req, res) => {
+  waMediaUpload.single('file')(req, res, async (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE' ? 'El archivo supera 25 MB' : (err.message || 'No se pudo subir el archivo');
       return res.status(400).json({ error: msg });
@@ -5149,6 +5386,8 @@ app.post('/api/followups/media', requireAdmin, uploadLimiter, async (req, res) =
       try { fs.unlinkSync(req.file.path); } catch { /* noop */ }
       return res.status(400).json({ error: 'Solo se admite imagen o video' });
     }
+    const quotaErr = await enforceUploadQuotaAfterWrite(req);
+    if (quotaErr) return res.status(413).json({ error: quotaErr });
     const type = waMediaTypeFromMime(mimetype);
     res.json({ success: true, url: `/uploads/wa-media/${req.file.filename}`, type, filename: req.file.originalname, size: req.file.size, mimetype });
   });
@@ -7117,7 +7356,7 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     // resolución de facturación. invoice_next_number NO está aquí a propósito:
     // el consecutivo solo lo mueve la creación de facturas, no un formulario.
     // v5 Parte 2B Meta: token y phone number id de WhatsApp Cloud API.
-    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type'];
+    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb'];
     if (!ALLOWED_SETTINGS_KEYS.includes(key)) return res.status(400).json({ error: `Clave no permitida: ${key}` });
     // Las claves de Meta son credenciales: solo el admin las escribe.
     if (key.startsWith('meta_wa_') && (req.user?.role || '').toLowerCase() !== 'admin') {
@@ -7126,7 +7365,7 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     // v5.2 Facturación (B6): el tipo de factura por defecto y los datos de
     // la empresa para facturar son solo admin, aunque el asesor (vendedor)
     // ya puede crear facturas y cobrar.
-    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type']);
+    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb']);
     if (ADMIN_ONLY_SETTINGS.has(key) && normalizeRoleValue(req.user?.role) !== 'admin') {
       return res.status(403).json({ error: 'Solo el administrador puede cambiar esa configuración' });
     }
@@ -7166,6 +7405,16 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     }
     if (key === 'followup_media_url' && value && !String(value).trim().startsWith('/uploads/wa-media/')) {
       return res.status(400).json({ error: 'followup_media_url debe ser una ruta dentro de /uploads/wa-media/' });
+    }
+    // v5.3.34 (H-M8/H-M11): opt-in de respaldo sin cifrar y cuotas de disco.
+    if (key === 'backup_allow_unencrypted' && value && !['true', 'false'].includes(String(value).trim())) {
+      return res.status(400).json({ error: "backup_allow_unencrypted debe ser 'true' o 'false'" });
+    }
+    if (key === 'uploads_max_mb' && value && (!/^\d+$/.test(String(value).trim()) || +value < 10 || +value > 100000)) {
+      return res.status(400).json({ error: 'uploads_max_mb debe ser un número entre 10 y 100000 MB' });
+    }
+    if (key === 'uploads_user_day_max_mb' && value && (!/^\d+$/.test(String(value).trim()) || +value < 1 || +value > 10000)) {
+      return res.status(400).json({ error: 'uploads_user_day_max_mb debe ser un número entre 1 y 10000 MB' });
     }
     await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, value]);
     notifyUpdate('settings');
@@ -7220,6 +7469,13 @@ app.post('/api/settings/logo', requireAdmin, logoUpload.single('logo'), async (r
   if (!req.file) return res.status(400).json({ error: 'Sube un archivo de imagen' });
   if (!['image/png', 'image/jpeg'].includes(req.file.mimetype)) return res.status(400).json({ error: 'Solo PNG o JPG' });
   const ext = req.file.mimetype === 'image/png' ? 'png' : 'jpg';
+  // v5.3.34 (H-M11): el logo también cuenta para la cuota total de uploads/
+  // (el viejo se borra justo después, así que la comprobación es
+  // conservadora por el tamaño del logo anterior, 2 MB como mucho).
+  const logoMaxTotal = await getUploadsMaxBytes();
+  if (dirSizeBytes(uploadsDir()) + req.file.buffer.length > logoMaxTotal) {
+    return res.status(413).json({ error: `Cuota de almacenamiento llena (${fmtMB(logoMaxTotal)}). Borra archivos o amplía UPLOADS_MAX_MB.` });
+  }
   try {
     for (const old of ['logo.png', 'logo.jpg']) {
       const p = path.join(uploadsDir(), old);
