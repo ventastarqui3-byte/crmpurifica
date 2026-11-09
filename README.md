@@ -1,4 +1,24 @@
-# Purifica Tu Ambiente CRM — v5.3.27 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node)
+# Purifica Tu Ambiente CRM — v5.3.28 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen)
+
+## v5.3.28 — Corrección urgente: permiso denegado en el volumen (2026-11-08)
+
+**Qué pasó:** la v5.3.27 sí arregló lo de Chrome (el error "Could not find Chrome" desapareció del log), pero WhatsApp siguió caído con dos errores nuevos: el arranque de "alejo ochoa" fallaba con Code: 21 (Chrome no podía bloquear su perfil) y la instancia nueva "sdfgh" fallaba con `EACCES: permission denied, mkdir '/app/data/session-wa-session-sdfghj'`.
+
+**Causa:** el volumen de Railway (`/app/data`) fue creado cuando la app corría como root, así que pertenece a root. Al pasar la app a correr como usuario `node` (B8, v5.3.26), `node` no puede escribir en el volumen: ni crear la carpeta de sesión de una instancia nueva (EACCES directo) ni escribir el bloqueo del perfil de Chrome de la sesión existente (Code: 21). El `chown` del Dockerfile solo arregla los directorios de la imagen, no el volumen montado en ejecución.
+
+**Corrección (solo Dockerfile + `entrypoint.sh` nuevo):**
+- El contenedor arranca como root SOLO para arreglar el dueño de los directorios que la app escribe (`/app/data`, `/app/uploads`, `/app/backups`, `/app/.wwebjs_auth`, `/app/.cache/puppeteer`) y luego baja privilegios: la app sigue corriendo como `node` (B8 se mantiene, el proceso de la app nunca corre como root).
+- El `chown` solo se hace si el dueño no es `node`, para no re-recorrer el volumen en cada arranque.
+- Se quitó el `USER node` del Dockerfile (el entrypoint es quien baja los privilegios); el `ENTRYPOINT` es `/app/entrypoint.sh` y el `CMD` sigue siendo `npm start`.
+
+**La instancia "alejo ochoa":** la sesión sigue guardada en el volumen (36.1 MB, carpeta `session-wa-session-alejo`). Para recuperarla sin escanear QR de nuevo: borra la instancia de prueba "sdfgh" y vuelve a agregar una instancia con el ID `alejo` (el mismo de antes). Si al agregarla pide QR, escanea una sola vez; si restaura la sesión, entra directo.
+
+**Plan de pruebas tras desplegar v5.3.28:**
+1. En Estado del Sistema, WhatsApp debe pasar de "Roto" a conectado (1 de 1 instancias) sin escanear QR, si se recupera la sesión de "alejo".
+2. Enviar un texto de prueba a Virtual Zone y confirmar que llega.
+3. Si vuelve a salir EACCES o Code: 21 en el log, mandar el log: el entrypoint deja constancia en el arranque.
+
+**Pendiente honesto:** la imagen Docker no se pudo construir en este entorno (sin Docker aquí); el entrypoint se probó en sintaxis y en simulación (chown + bajar a usuario node), pero la prueba real es el despliegue en Railway.
 
 ## v5.3.27 — Corrección urgente: WhatsApp caído por Chrome no encontrado (2026-11-08)
 

@@ -112,6 +112,15 @@ COPY server.js ./
 COPY scripts ./scripts
 COPY --from=build /app/dist ./dist
 
+# Entrypoint (v5.3.28): el contenedor arranca como root SOLO para
+# arreglar el dueño de los volúmenes (ver entrypoint.sh) y luego baja
+# privilegios. Por eso aquí NO hay `USER node`: el entrypoint es quien
+# ejecuta la app como node. Sin esto, el volumen de Railway (creado
+# cuando la app corría como root) pertenece a root y `node` no puede
+# crear la sesión de WhatsApp (EACCES) ni Chrome su perfil (Code: 21).
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 # Directorios que la app escribe (archivos subidos, sesión de WhatsApp
 # QR y respaldos) con dueño node: los volúmenes nuevos heredan este
 # dueño al crearse.
@@ -127,8 +136,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://localhost:${PORT:-3000}/api/health || exit 1
 
-# La app corre como usuario no-root (v5.3.26, B8).
-USER node
+ENTRYPOINT ["/app/entrypoint.sh"]
 
-# Comando para iniciar la aplicación
+# Comando para iniciar la aplicación (el entrypoint lo ejecuta como node).
 CMD ["npm", "start"]
