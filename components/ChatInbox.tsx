@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {ChatConversation, StaffMember, ChatMessage, LeadStatus, CurrentUser, ChatTemplate} from '../types';
-import {Search, Send, ArrowLeft, MessageCircle, Globe, Plus, ClipboardList, X, Calculator, Save, Camera, Loader2, Zap, Instagram, Facebook, Info, Sparkles, Paperclip, FileText, Download} from 'lucide-react';
+import {Search, Send, ArrowLeft, MessageCircle, Globe, Plus, ClipboardList, X, Calculator, Save, Camera, Loader2, Zap, Instagram, Facebook, Info, Sparkles, Paperclip, FileText, Download, Bot} from 'lucide-react';
 import { ClientIntelligence } from './ClientIntelligence';
 import { apiFetch } from '../lib/api';
 import { isSafeUrl, isSafeImageSrc } from '../lib/safeUrl';
@@ -79,6 +79,8 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
   const [attachError, setAttachError] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // v5.3.36 Bot de WhatsApp: spinner del botón pausar/reactivar.
+  const [botBusy, setBotBusy] = useState(false);
 
   // Grabación de voz y adjuntos: había refs e iconos (Mic, Paperclip...)
   // pero ningún botón ni <input type=file>: no se podía grabar ni adjuntar
@@ -219,6 +221,28 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
       }
     } catch { /* se queda como está */ }
     setLoadingOlder(false);
+  };
+
+  // v5.3.36 Bot de WhatsApp: pausar / reactivar el bot para este chat.
+  // El bot se reanuda SOLO por este botón (no hay temporizadores). Tras
+  // guardar, la lista se actualiza sola por el socket (el endpoint avisa
+  // con notifyUpdate('chat') y App recarga las conversaciones).
+  const toggleBot = async () => {
+    if (!activeChat || botBusy || readOnly) return;
+    const newPaused = !activeChat.botPaused;
+    setBotBusy(true);
+    try {
+      const res = await apiFetch(`/api/chats/${encodeURIComponent(activeChat.id)}/bot-toggle`, {
+        method: 'POST',
+        body: JSON.stringify({ paused: newPaused }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'No se pudo cambiar el estado del bot');
+    } catch (e: any) {
+      setAttachError(e.message || 'No se pudo cambiar el estado del bot');
+    } finally {
+      setBotBusy(false);
+    }
   };
 
   // Textos que el servidor usa como contenido cuando un mensaje de media
@@ -449,9 +473,21 @@ export const ChatInbox: React.FC<ChatInboxProps> = ({ conversations, staff, curr
                    <span className="text-[8px] font-black text-brand-600 uppercase bg-brand-50 px-1.5 rounded">{activeChat.leadStatus || 'NUEVO'}</span>
                  </div>
                </div>
-               <button onClick={() => setShowMobileSidebar(true)} className="xl:hidden p-2 text-brand-600 bg-brand-50 rounded-xl border border-brand-100 flex items-center gap-2 px-3">
-                 <ClipboardList className="w-4 h-4" /> <span className="text-[10px] font-black uppercase">Info</span>
-               </button>
+               <div className="flex items-center gap-2">
+                 {/* v5.3.36 Bot de WhatsApp: indicador por chat + botón para
+                     pausar/reactivar. Solo se muestra si el bot está activo
+                     globalmente; si está pausado, el bot no responde en este
+                     chat hasta que alguien lo reactive aquí. */}
+                 {activeChat.botEnabled && (
+                   <button onClick={toggleBot} disabled={botBusy} title={activeChat.botPaused ? 'El bot está pausado en este chat: pulsa para reactivarlo' : 'El bot está activo en este chat: pulsa para pausarlo'}
+                     className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-[10px] font-black uppercase transition-all disabled:opacity-50 ${activeChat.botPaused ? 'bg-slate-50 text-slate-500 border-slate-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'}`}>
+                     {botBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />} <span>{activeChat.botPaused ? 'Bot pausado' : 'Bot activo'}</span>
+                   </button>
+                 )}
+                 <button onClick={() => setShowMobileSidebar(true)} className="xl:hidden p-2 text-brand-600 bg-brand-50 rounded-xl border border-brand-100 flex items-center gap-2 px-3">
+                   <ClipboardList className="w-4 h-4" /> <span className="text-[10px] font-black uppercase">Info</span>
+                 </button>
+               </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4">

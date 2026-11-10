@@ -89,6 +89,21 @@ export const SystemStatus: React.FC = () => {
   // falla cerrado.
   const [backupAllowUnencrypted, setBackupAllowUnencrypted] = useState(false);
   const backupFormInit = useRef(false);
+  // v5.3.36 Bot de WhatsApp (recepcionista): interruptor + textos. Los
+  // textos se rellenan UNA vez con lo guardado (GET /api/settings); si
+  // no hay nada guardado, el campo queda vacío y se usa el texto por
+  // defecto del servidor (ver README, sección "Bot de WhatsApp").
+  const [botEnabled, setBotEnabled] = useState(false);
+  const [botGreeting, setBotGreeting] = useState('');
+  const [botMenu, setBotMenu] = useState('');
+  const [botHandoff, setBotHandoff] = useState('');
+  const [botQuoteAskType, setBotQuoteAskType] = useState('');
+  const [botQuoteAskPhotos, setBotQuoteAskPhotos] = useState('');
+  const [botQuoteAskDetails, setBotQuoteAskDetails] = useState('');
+  const [botQuoteDone, setBotQuoteDone] = useState('');
+  const [botBookAsk, setBotBookAsk] = useState('');
+  const [botUnknown, setBotUnknown] = useState('');
+  const botFormInit = useRef(false);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -116,6 +131,19 @@ export const SystemStatus: React.FC = () => {
         if (stRes.ok && !backupFormInit.current) {
           if (typeof stJson.backup_allow_unencrypted === 'string') setBackupAllowUnencrypted(stJson.backup_allow_unencrypted.toLowerCase() === 'true');
           backupFormInit.current = true;
+        }
+        // v5.3.36 Bot: rellenar una sola vez interruptor + textos.
+        if (stRes.ok && !botFormInit.current) {
+          if (typeof stJson.bot_enabled === 'string') setBotEnabled(stJson.bot_enabled.toLowerCase() === 'true');
+          const botFields: [string, (v: string) => void][] = [
+            ['bot_greeting', setBotGreeting], ['bot_menu', setBotMenu],
+            ['bot_handoff_message', setBotHandoff], ['bot_quote_ask_type', setBotQuoteAskType],
+            ['bot_quote_ask_photos', setBotQuoteAskPhotos], ['bot_quote_ask_details', setBotQuoteAskDetails],
+            ['bot_quote_done_message', setBotQuoteDone], ['bot_book_ask', setBotBookAsk],
+            ['bot_unknown_message', setBotUnknown],
+          ];
+          for (const [key, set] of botFields) if (typeof stJson[key] === 'string' && stJson[key]) set(stJson[key]);
+          botFormInit.current = true;
         }
       } catch { /* sin settings: los campos quedan con su valor por defecto */ }
     } catch (e: any) {
@@ -294,6 +322,27 @@ export const SystemStatus: React.FC = () => {
       return { message: backupAllowUnencrypted
         ? 'Guardado: los respaldos se guardarán SIN cifrar. Cada uno avisará por Telegram.'
         : 'Guardado: los respaldos exigirán clave de cifrado (BACKUP_ENCRYPTION_KEY).' };
+    });
+
+  // v5.3.36 Bot de WhatsApp: el interruptor siempre se envía; los textos
+  // solo se envían si tienen valor (si el campo queda vacío, lo guardado
+  // se conserva y, si no hay nada guardado, el servidor usa su texto por
+  // defecto). Solo admin (el backend lo exige).
+  const saveBot = async () =>
+    runAction('bot-save', async () => {
+      const pairs: [string, string][] = [['bot_enabled', botEnabled ? 'true' : 'false']];
+      const texts: [string, string][] = [
+        ['bot_greeting', botGreeting], ['bot_menu', botMenu],
+        ['bot_handoff_message', botHandoff], ['bot_quote_ask_type', botQuoteAskType],
+        ['bot_quote_ask_photos', botQuoteAskPhotos], ['bot_quote_ask_details', botQuoteAskDetails],
+        ['bot_quote_done_message', botQuoteDone], ['bot_book_ask', botBookAsk],
+        ['bot_unknown_message', botUnknown],
+      ];
+      for (const [key, value] of texts) if (value.trim()) pairs.push([key, value.trim()]);
+      for (const [key, value] of pairs) await saveSetting(key, value);
+      return { message: botEnabled
+        ? 'Bot de WhatsApp guardado y ACTIVADO: responderá los mensajes nuevos de WhatsApp (solo QR).'
+        : 'Bot de WhatsApp guardado y desactivado: no responderá ningún mensaje.' };
     });
 
   if (loading) {
@@ -570,6 +619,87 @@ export const SystemStatus: React.FC = () => {
                 <button onClick={saveBackup} disabled={busy === 'backup-save'}
                   className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
                   {busy === 'backup-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar respaldo
+                </button>
+              </div>
+            </div>
+          </div>
+          {/* v5.3.36 Bot de WhatsApp (recepcionista, solo QR): saluda, recoge
+              datos y fotos para la cotización y pasa al asesor. El precio lo
+              cotiza el humano al ver las fotos en el inbox. Los campos
+              vacíos usan el texto por defecto del servidor. */}
+          <div className="border border-slate-200 rounded-2xl p-4">
+            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+              <MessagesSquare className="w-5 h-5 text-slate-500" /> Bot de WhatsApp
+            </h3>
+            <p className="text-xs text-slate-500 mt-1 mb-3">
+              {botEnabled ? 'Activado: responde los mensajes nuevos de WhatsApp (solo QR).' : 'Desactivado: el bot no responde ningún mensaje.'}
+            </p>
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" checked={botEnabled} onChange={(e) => setBotEnabled(e.target.checked)} />
+                Bot activado
+              </label>
+              <p className="text-xs text-slate-400">
+                Cuando un asesor escribe en un chat, el bot se pausa solo para ese chat y se reactiva con el botón del inbox. El cliente siempre puede pedir hablar con una persona (opción 3 del menú o escribiendo “humano”, “asesor”, etc.) y el bot le pasa la conversación al equipo.
+              </p>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Saludo</span>
+                <textarea rows={2} value={botGreeting} onChange={(e) => setBotGreeting(e.target.value)}
+                  placeholder="Hola, gracias por escribir a {EMPRESA}…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Menú (opciones 1, 2 y 3)</span>
+                <textarea rows={3} value={botMenu} onChange={(e) => setBotMenu(e.target.value)}
+                  placeholder="¿En qué te puedo ayudar? 1️⃣ Cotizar… 2️⃣ Agendar… 3️⃣ Hablar con una persona…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Pasar a una persona</span>
+                <textarea rows={2} value={botHandoff} onChange={(e) => setBotHandoff(e.target.value)}
+                  placeholder="Claro, en un momento te atiende una persona…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Pregunta “¿qué limpiar?”</span>
+                <textarea rows={2} value={botQuoteAskType} onChange={(e) => setBotQuoteAskType(e.target.value)}
+                  placeholder="Perfecto, te ayudamos con la cotización. ¿Qué necesitas limpiar?"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Pide las fotos</span>
+                <textarea rows={2} value={botQuoteAskPhotos} onChange={(e) => setBotQuoteAskPhotos(e.target.value)}
+                  placeholder="Ahora envíame una o varias fotos de lo que quieres limpiar…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Pide nombre y dirección</span>
+                <textarea rows={2} value={botQuoteAskDetails} onChange={(e) => setBotQuoteAskDetails(e.target.value)}
+                  placeholder="Para terminar, dime tu nombre y el sector o dirección…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Cotización recibida</span>
+                <textarea rows={2} value={botQuoteDone} onChange={(e) => setBotQuoteDone(e.target.value)}
+                  placeholder="Listo, ya tenemos tu solicitud. Un asesor va a revisar tus fotos…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Agendar cita</span>
+                <textarea rows={2} value={botBookAsk} onChange={(e) => setBotBookAsk(e.target.value)}
+                  placeholder="Con gusto te agendamos. Cuéntame qué servicio necesitas y qué día y hora te conviene…"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">No entendí</span>
+                <textarea rows={2} value={botUnknown} onChange={(e) => setBotUnknown(e.target.value)}
+                  placeholder="Disculpa, no entendí tu mensaje. 😅"
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500" />
+              </label>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button onClick={saveBot} disabled={busy === 'bot-save'}
+                  className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'bot-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar bot
                 </button>
               </div>
             </div>

@@ -330,6 +330,10 @@ export interface ChatConversation {
   leadStatus?: LeadStatus;
   // El servidor devuelve el nº de tareas pendientes del cliente.
   pendingTasksCount?: number;
+  // v5.3.36 Bot de WhatsApp: si está activo globalmente (botEnabled) y si
+  // está pausado en este chat (botPaused).
+  botEnabled?: boolean;
+  botPaused?: boolean;
   leadData?: {
     itemsToClean?: string;
     location?: string;

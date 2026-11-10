@@ -1,4 +1,36 @@
-# Purifica Tu Ambiente CRM — v5.3.31 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen + corrección de los 5 hallazgos altos de la auditoría 2026-11-09 + rendimiento para 30 usuarios + refresco en tiempo real del chat)
+# Purifica Tu Ambiente CRM — v5.3.36 (base crm6, limpieza + facturación + roles corregidos + Google Calendar + despliegue Railway/VPS + WhatsApp QR corregido + volumen compartido + reintento de arranque + multimedia por LID + id de mensaje normalizado + envío y descarga por escaneo + envío sin falsa alarma + envío una sola vez + mimetype de media + segundo servicio sin sobrescribir + verificación por remitente + 5 reintentos de arranque + configuración de Google Calendar y Telegram en el CRM + limpieza de caché de WhatsApp + seguimiento automático de clientes + imagen o video en el seguimiento + pago manual de factura corregido + campañas personalizadas en Seguimiento + diagnóstico y reintento de envío de multimedia + separación preparación/envío de multimedia + envío manual de multimedia + seguridad endurecida FASE 1: críticos y altos de la auditoría + seguridad FASE 2: medios de la auditoría + presencia real + seguridad FASE 3: bajos de la auditoría + revocación de tokens + corrección urgente: Chrome para el usuario node + corrección urgente: permiso denegado en el volumen + corrección de los 5 hallazgos altos de la auditoría 2026-11-09 + rendimiento para 30 usuarios + refresco en tiempo real del chat + bot de WhatsApp recepcionista)
+
+## v5.3.36 — Bot de WhatsApp recepcionista (2026-11-09)
+
+**Qué es:** un bot por REGLAS y menú (sin IA externa y sin costo mensual) que atiende los mensajes nuevos de WhatsApp por QR. Es un RECEPCIONISTA, no un vendedor: saluda, recoge datos y FOTOS para la cotización y pasa la conversación al humano. El precio lo cotiza el asesor al ver las fotos en el inbox, porque el precio depende de lo que se ve en la foto (sofá, colchón, etc.) y un bot de reglas no puede verla.
+
+**Regla de oro:** el bot NUNCA le quita al cliente el acceso a una persona. En cualquier momento el cliente puede pedir "hablar con una persona" (opción 3 del menú, o escribiendo "humano", "persona", "asesor", "agente", "hablar con una persona", "hablar con alguien") y el bot se pausa y entrega la conversación al asesor. El bot se reanuda SOLO con el botón del inbox; no hay temporizadores automáticos.
+
+**Cómo funciona (flujo):**
+1. Primer mensaje del cliente → saludo + menú: 1. Cotizar limpieza, 2. Agendar cita, 3. Hablar con una persona.
+2. Opción 1 (cotizar) → pregunta qué limpiar (sofá, colchón, otro) → pide fotos (cada foto se confirma con "Foto recibida ✅" y se guarda) → pide nombre + sector/dirección → crea o actualiza el lead con el tipo de limpieza, las fotos, el nombre y la dirección, y avisa que un asesor enviará la cotización. Las fotos que el cliente mande en cualquier paso del flujo también se guardan para la cotización.
+3. Opción 2 (agendar) → pregunta servicio + día y hora preferidos → pasa al asesor (NO crea el servicio solo en v1; lo agenda el humano).
+4. Si el cliente escribe algo que el bot no entiende → "no entendí" + menú de nuevo; al segundo mensaje sin entender, le ofrece la persona directamente y se pausa.
+5. Si el cliente manda una nota de voz → el bot le pide que lo escriba (no puede escuchar audios).
+6. Las opciones 1, 2 y 3 valen en cualquier paso del flujo (el cliente nunca queda atrapado).
+
+**Toma de control por el humano:** cuando un asesor/operador/admin escribe en un chat desde el inbox, el bot se pausa solo para ese chat. En el encabezado del chat se ve "Bot activo" / "Bot pausado" y un botón para reactivarlo o pausarlo (solo si el bot está activado globalmente).
+
+**Configuración (Estado del Sistema → Bot de WhatsApp, solo admin):** interruptor para activar/desactivar el bot (APAGADO por defecto: al desplegar no responde nada hasta que el admin lo encienda) + los 9 textos del bot (saludo, menú, pasar a persona, pregunta "¿qué limpiar?", pide fotos, pide nombre y dirección, cotización recibida, agendar cita, "no entendí"). Los campos vacíos usan el texto por defecto del servidor; `{EMPRESA}` en los textos se reemplaza por el nombre de la empresa. Claves en settings (todas solo admin): `bot_enabled`, `bot_greeting`, `bot_menu`, `bot_handoff_message`, `bot_quote_ask_type`, `bot_quote_ask_photos`, `bot_quote_ask_details`, `bot_quote_done_message`, `bot_book_ask`, `bot_unknown_message`.
+
+**Datos:** tabla nueva `bot_states` (conversation_id, state, data JSON con lo recogido + URLs de las fotos, paused, updated_at). El lead se crea/actualiza con el esquema que ya existe (sin columnas nuevas): `client_name`, `items_to_clean`, `technical_images` (URLs de las fotos), `address`, `source = 'Bot WhatsApp'`. Cada cotización completada y cada entrega al asesor quedan en Últimos eventos (sin el texto del cliente, por privacidad).
+
+**Alcance v1:** solo canal QR. El webhook de Meta Cloud API NO está conectado al bot todavía (pendiente). No se tocaron campañas, seguimiento ni el envío de multimedia.
+
+**Plan de pruebas tras desplegar v5.3.36:**
+1. En Estado del Sistema → Bot de WhatsApp, activar el bot y guardar.
+2. Escribir desde otro número: debe llegar el saludo + menú.
+3. Responder 1 → pregunta qué limpiar; responder "sofá" → pide fotos; enviar una foto → "Foto recibida ✅"; escribir "listo" → pide nombre y dirección; responder "Juan, Chapinero" → mensaje de cotización recibida. En el CRM debe aparecer el lead con el tipo "Sofá", la foto y la dirección.
+4. Escribir "quiero hablar con una persona" → mensaje de entrega y el bot se pausa (el siguiente mensaje ya no recibe respuesta del bot). En el inbox debe verse "Bot pausado".
+5. Escribir desde el inbox como asesor → el bot se pausa solo para ese chat. Pulsar "Bot activo" en el encabezado → se pausa; pulsar "Bot pausado" → se reactiva.
+6. Desactivar el bot en Estado del Sistema → no responde ningún mensaje nuevo.
+
+**Pendiente honesto:** el flujo completo con WhatsApp real no se puede probar en este entorno (sin WhatsApp real); está verificado con mensajes simulados contra el motor del bot + compilación + arranque, y la prueba real es en producción con un número de prueba.
 
 ## v5.3.31 — Corrección: las imágenes (y cualquier mensaje) no aparecían hasta refrescar (2026-11-09)
 

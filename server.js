@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.35';
+const APP_VERSION = '5.3.36';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -1772,10 +1772,17 @@ async function processWaMessage(msg, opts) {
   // v5.3.29 (H-A3): el contenido del mensaje NUNCA va a los logs (PII de
   // clientes). Solo metadatos, como en la línea de :2083.
   logger.info(`Mensaje recibido en ${name} de ${phone} (type=${type})`);
+  let conversationId = null;
   try {
-    await handleIncomingWhatsApp({ phone, content, type, attachmentUrl, sender, incrementUnread, sourceName, channel, externalId: waMsgSerializedId(msg), senderName });
+    conversationId = await handleIncomingWhatsApp({ phone, content, type, attachmentUrl, sender, incrementUnread, sourceName, channel, externalId: waMsgSerializedId(msg), senderName });
   } catch (err) {
     logger.error('Error procesando mensaje de WhatsApp', err);
+  }
+  // v5.3.36 — Bot recepcionista (solo QR, solo entrantes de cliente): se
+  // llama DESPUÉS de guardar el mensaje, nunca antes. No bloquea el
+  // guardado: un fallo del bot no rompe la recepción del mensaje.
+  if (conversationId && sender === 'client' && channel === 'qr') {
+    handleBotMessage({ instanceId: id, conversationId, phone, text: content, hasMedia: !!mediaType, mediaUrl: attachmentUrl, mediaType, sender, channel }).catch((e) => logger.error('Error del bot de WhatsApp', e?.message || e));
   }
   return true;
 }
@@ -1804,6 +1811,287 @@ function readWaAttachmentFile(attachmentUrl) {
     txt: 'text/plain',
   };
   return { mimetype: mimeByExt[ext] || 'application/octet-stream', data: buf.toString('base64'), filename: path.basename(full), size: buf.length };
+}
+
+// ============================================================
+// BOT DE WHATSAPP — RECEPCIONISTA (v5.3.36)
+// ------------------------------------------------------------
+// Un bot por REGLAS y menú (sin IA externa y sin costo mensual).
+// NO es un vendedor: saluda, recoge datos y FOTOS, y pasa la
+// conversación al humano. El precio lo cotiza el asesor al ver las
+// fotos en el inbox, porque el precio depende de lo que se ve en
+// la foto (sofá, colchón, etc.) y un bot de reglas no puede verla.
+//
+// Regla de oro: el bot NUNCA le quita al cliente el acceso a una
+// persona. En cualquier momento el cliente puede pedir "hablar con
+// una persona" (o tocar la opción 3) y el bot se pausa y entrega la
+// conversación al asesor. Tampoco se reanuda solo: solo vuelve a
+// hablar cuando un asesor lo reactiva desde el inbox.
+// Solo canal QR en v1 (el webhook de Meta Cloud API NO está
+// conectado al bot todavía).
+// ============================================================
+
+// Palabras con las que el cliente pide hablar con una persona, en
+// cualquier paso del flujo (insensible a mayúsculas, en cualquier
+// parte del mensaje). Si coinciden, el bot se pausa de inmediato.
+const BOT_HUMAN_RE = /(hablar con (una )?persona|hablar con alguien|humano|persona|asesor|agente)/i;
+// Saludos y peticiones de volver al menú principal.
+const BOT_MENU_RE = /^(men[uú]|inicio|hola|buenas|buenos d[ií]as|buenas tardes|buenas noches|bot)\b/i;
+// El cliente dice que ya terminó de enviar fotos.
+const BOT_DONE_WORDS = /^(listo|ya|eso es todo|eso es|termin[eé]|termine)\b/i;
+// Elección de menú en cualquier paso (1 cotizar, 2 agendar, 3 persona).
+const BOT_CHOICE_RE = /^(1|2|3)\b/;
+// Respuestas de confirmación para "¿Te cotizo esto?" (ver flow abajo).
+const BOT_YES_RE = /^(s[ií]|si|claro|dale|ok|vale|perfecto)\b/i;
+const BOT_NO_RE = /^(no|nope)\b/i;
+
+// Textos por defecto (en español). El admin los puede cambiar desde
+// Estado del Sistema > Bot de WhatsApp; {EMPRESA} se reemplaza por el
+// nombre de la empresa configurado en Marca.
+const BOT_DEFAULTS = {
+  bot_greeting: 'Hola, gracias por escribir a {EMPRESA}. Te atiende nuestro asistente virtual. 😊',
+  bot_menu: '¿En qué te puedo ayudar?\n1️⃣ Cotizar una limpieza\n2️⃣ Agendar una cita\n3️⃣ Hablar con una persona\n\nResponde con el número de la opción.',
+  bot_handoff_message: 'Claro, en un momento te atiende una persona de nuestro equipo. Si quieres, cuéntanos de una vez qué necesitas limpiar y en qué sector estás, así te ayudamos más rápido. 👍',
+  bot_quote_ask_type: 'Perfecto, te ayudamos con la cotización. ¿Qué necesitas limpiar?\nPor ejemplo: sofá, colchón, tapete, sillas u otro.',
+  bot_quote_ask_photos: 'Gracias. Ahora envíame una o varias fotos de lo que quieres limpiar, así el asesor puede darte el precio exacto.\nCuando termines, escribe "listo".',
+  bot_quote_ask_details: 'Perfecto. Para terminar, dime tu nombre y el sector o dirección donde sería el servicio.\nPor ejemplo: "Juan, Chapinero, Calle 5 # 10-20".',
+  bot_quote_done_message: 'Listo, ya tenemos tu solicitud. Un asesor va a revisar tus fotos y te enviará la cotización por aquí mismo. Gracias por escribirnos. 😊',
+  bot_book_ask: 'Con gusto te agendamos. Cuéntame qué servicio necesitas y qué día y hora te conviene.\nPor ejemplo: "Limpieza de sofá, mañana a las 10 am".',
+  bot_unknown_message: 'Disculpa, no entendí tu mensaje. 😅',
+};
+// Textos que no se configuran (son del comportamiento del bot).
+const BOT_PHOTO_ACK = 'Foto recibida. ✅';
+const BOT_AUDIO_NOTE = 'Recibí tu nota de voz, pero por ahora solo puedo leer mensajes escritos y ver fotos. ¿Me lo puedes escribir?';
+
+// Normaliza la respuesta "¿qué limpiar?" a un valor corto para el lead.
+function botNormalizeType(raw) {
+  const t = String(raw || '').trim();
+  const low = t.toLowerCase();
+  if (/sof[aá]/.test(low)) return 'Sofá';
+  if (/colch[oó]n/.test(low)) return 'Colchón';
+  if (/tapete|alfombra/.test(low)) return 'Tapete/Alfombra';
+  if (/silla/.test(low)) return 'Sillas';
+  return t;
+}
+
+// Lee los textos del bot desde settings (con los valores por defecto
+// de BOT_DEFAULTS si aún no se han guardado). {EMPRESA} se reemplaza
+// por el nombre de la empresa. Sin DB devuelve los defaults.
+async function getBotSettings() {
+  const out = { ...BOT_DEFAULTS, bot_enabled: 'false' };
+  try {
+    const r = await pool.query("SELECT key, value FROM settings WHERE key LIKE 'bot%'");
+    for (const row of r.rows) {
+      if (typeof row.key === 'string' && row.key.startsWith('bot_') && typeof row.value === 'string') out[row.key] = row.value;
+    }
+    const brand = (await getSettingValue('branding_company_name', '') || '').trim() || 'nuestra empresa';
+    for (const k of Object.keys(out)) {
+      if (typeof out[k] === 'string') out[k] = out[k].replaceAll('{EMPRESA}', brand);
+    }
+  } catch { /* sin DB: se usan los valores por defecto */ }
+  return out;
+}
+
+// Estado del bot para una conversación (null si nunca habló el bot).
+async function getBotState(conversationId) {
+  const r = await pool.query('SELECT conversation_id, state, data, paused FROM bot_states WHERE conversation_id = $1', [conversationId]);
+  if (!r.rows[0]) return null;
+  let data = {};
+  try { data = JSON.parse(r.rows[0].data || '{}') || {}; } catch { data = {}; }
+  return { conversationId: r.rows[0].conversation_id, state: r.rows[0].state || 'menu', data, paused: !!r.rows[0].paused };
+}
+
+async function saveBotState(conversationId, state, data, paused) {
+  await pool.query(
+    `INSERT INTO bot_states (conversation_id, state, data, paused, updated_at) VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (conversation_id) DO UPDATE SET state = EXCLUDED.state, data = EXCLUDED.data, paused = EXCLUDED.paused, updated_at = NOW()`,
+    [conversationId, state, JSON.stringify(data || {}), !!paused]
+  );
+}
+
+// Pausa o reanuda el bot para una conversación (sin tocar el estado del flujo).
+async function setBotPaused(conversationId, paused) {
+  const r = await pool.query(
+    `INSERT INTO bot_states (conversation_id, state, data, paused, updated_at) VALUES ($1, 'menu', '{}', $2, NOW())
+     ON CONFLICT (conversation_id) DO UPDATE SET paused = EXCLUDED.paused, updated_at = NOW() RETURNING paused`,
+    [conversationId, !!paused]
+  );
+  return r.rows[0] ? !!r.rows[0].paused : !!paused;
+}
+
+// Envía una respuesta del bot por WhatsApp (QR) y la guarda en el
+// inbox como mensaje del agente, para que el asesor vea qué dijo el
+// bot. Devuelve el resultado de sendWhatsAppMessage.
+async function botSay({ phone, instanceId, conversationId, text }) {
+  const res = await sendWhatsAppMessage({ phone, content: text, channel: 'qr', instanceId: instanceId || null });
+  try {
+    await pool.query(
+      `INSERT INTO messages (conversation_id, sender, type, content, attachment_url, timestamp, external_id) VALUES ($1, 'agent', 'text', $2, NULL, NOW(), $3) ON CONFLICT (external_id) DO NOTHING`,
+      [conversationId, text, res.messageId || null]
+    );
+    await pool.query('UPDATE conversations SET last_message = $1, last_message_time = NOW() WHERE id = $2', [text, conversationId]);
+  } catch (e) { logger.warn(`Bot: no se pudo guardar la respuesta en el inbox: ${e?.message || e}`); }
+  notifyUpdate('chat');
+  if (!res.ok) {
+    // El texto del cliente nunca va a eventos/logs (H-A3).
+    await recordEvent('warn', 'bot', `No se pudo enviar la respuesta del bot (${res.error || 'sin motivo'}).`, { conversation: conversationId });
+  }
+  return res;
+}
+
+// Cuando termina el flujo de cotización: crea o actualiza el lead del
+// cliente con lo recogido (tipo de limpieza, fotos, nombre, sector o
+// dirección). No inventa columnas nuevas: usa el esquema de leads.
+// El nombre que da el cliente también actualiza la conversación.
+async function botCompleteQuote(conversationId, data) {
+  const photos = [...new Set((Array.isArray(data.photos) ? data.photos : []).filter(Boolean))];
+  const conv = await pool.query('SELECT client_name FROM conversations WHERE id = $1', [conversationId]);
+  const convName = (conv.rows[0]?.client_name || '').trim();
+  const parsedName = (data.name || '').trim();
+  const existing = await pool.query('SELECT id, technical_images FROM leads WHERE conversation_id = $1', [conversationId]);
+  const mergedPhotos = [...new Set([...(existing.rows[0]?.technical_images || []), ...photos])];
+  if (existing.rows[0]) {
+    await pool.query(
+      `UPDATE leads SET client_name = CASE WHEN $1 <> '' THEN $1 ELSE client_name END, items_to_clean = COALESCE(NULLIF($2, ''), items_to_clean), technical_images = $3, address = COALESCE(NULLIF($4, ''), address), updated_at = NOW() WHERE conversation_id = $5`,
+      [parsedName, data.cleaningType || '', mergedPhotos, data.address || '', conversationId]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO leads (conversation_id, client_name, status, technical_images, items_to_clean, address, source) VALUES ($1, $2, 'NUEVO', $3, $4, $5, 'Bot WhatsApp')`,
+      [conversationId, parsedName || convName || 'Cliente Nuevo', mergedPhotos, data.cleaningType || '', data.address || '']
+    );
+  }
+  if (parsedName && convName !== parsedName) {
+    await pool.query('UPDATE conversations SET client_name = $1 WHERE id = $2', [parsedName, conversationId]);
+  }
+  await recordEvent('info', 'bot', `Bot: cotización completada (${data.cleaningType || 'sin tipo'}, ${photos.length} foto(s)).`, { conversation: conversationId });
+}
+
+// Motor del bot. Se llama DESPUÉS de guardar el mensaje entrante (ver
+// processWaMessage). Devuelve { replied } y, si respondió, el estado.
+// Reglas: una sola respuesta por mensaje entrante; nunca responde si el
+// bot está apagado, la conversación está pausada, o el mensaje no es de
+// un cliente (grupo/estado/propio/otro bot ya se filtran antes).
+async function handleBotMessage({ instanceId, conversationId, phone, text, hasMedia, mediaUrl, mediaType, sender = 'client', channel = 'qr' }) {
+  // Segunda capa de filtros (la primera está en processWaMessage).
+  if (sender !== 'client' || channel !== 'qr') return { replied: false, reason: 'no-cliente-o-no-qr' };
+  const rawText = String(text || '').trim();
+  const isPhoto = hasMedia && ['image', 'video', 'document'].includes(mediaType) && !!mediaUrl;
+  const isAudio = mediaType === 'audio';
+  const isMediaOnly = hasMedia && (!rawText || rawText === (WA_MEDIA_LABELS[mediaType] || ''));
+  const body = isMediaOnly ? '' : rawText;
+  if (!body && !hasMedia) return { replied: false, reason: 'vacio' };
+
+  const settings = await getBotSettings();
+  if (settings.bot_enabled !== 'true') return { replied: false, reason: 'bot-apagado' };
+
+  let st = await getBotState(conversationId);
+  if (st?.paused) return { replied: false, reason: 'pausado' };
+  const state = st?.state || 'menu';
+  const data = { ...(st?.data || {}) };
+  if (!Array.isArray(data.photos)) data.photos = [];
+  if (typeof data.unknownCount !== 'number') data.unknownCount = 0;
+  // La foto se guarda siempre que llegue (en cualquier paso del flujo),
+  // para que la cotización la tenga aunque el cliente la mande antes de
+  // que el bot se la pida.
+  if (isPhoto && !data.photos.includes(mediaUrl)) data.photos.push(mediaUrl);
+
+  const low = body.toLowerCase();
+  const isFirst = !st;
+  let next = null; // { state, data, paused, reply, event? }
+
+  const unknown = (replyText) => {
+    data.unknownCount = (data.unknownCount || 0) + 1;
+    if (data.unknownCount >= 2) {
+      return { state: 'handoff', data: { ...data, unknownCount: 0 }, paused: true, reply: settings.bot_handoff_message, event: 'Bot: no entendió dos mensajes seguidos; se pasa al asesor.' };
+    }
+    return { state, data, paused: false, reply: `${replyText}\n\n${settings.bot_menu}` };
+  };
+
+  // 1) Pasar a humano: en cualquier paso, con las palabras clave.
+  if (body && BOT_HUMAN_RE.test(low)) {
+    next = { state: 'handoff', data: { ...data, unknownCount: 0 }, paused: true, reply: settings.bot_handoff_message, event: 'Bot: el cliente pidió hablar con una persona; se pasa al asesor.' };
+  // 2) Nota de voz: el bot no puede escucharla.
+  } else if (isAudio && !body) {
+    next = unknown(BOT_AUDIO_NOTE);
+  // 3) Elección de menú (1/2/3): vale en cualquier paso, para que el
+  // cliente nunca quede atrapado en un flujo.
+  } else if (body && BOT_CHOICE_RE.test(body)) {
+    const choice = body[0];
+    if (choice === '1') {
+      next = { state: 'quote_type', data: { photos: data.photos }, paused: false, reply: settings.bot_quote_ask_type };
+    } else if (choice === '2') {
+      next = { state: 'book_details', data: { photos: data.photos }, paused: false, reply: settings.bot_book_ask };
+    } else {
+      next = { state: 'handoff', data: { ...data, unknownCount: 0 }, paused: true, reply: settings.bot_handoff_message, event: 'Bot: el cliente eligió hablar con una persona (menú, opción 3).' };
+    }
+  // 4) Saludos / volver al menú principal.
+  } else if (body && BOT_MENU_RE.test(low)) {
+    next = { state: 'menu', data: { photos: data.photos }, paused: false, reply: isFirst ? `${settings.bot_greeting}\n\n${settings.bot_menu}` : settings.bot_menu };
+  // 5) Flujo según el estado guardado.
+  } else if (state === 'menu' || state === 'done' || isFirst) {
+    if (isPhoto) {
+      next = { state: 'quote_type', data, paused: false, reply: `${BOT_PHOTO_ACK}\n\n${settings.bot_quote_ask_type}` };
+    } else if (/cotiz|precio|cuesta|cu[aá]nto/i.test(low)) {
+      next = { state: 'quote_type', data: {}, paused: false, reply: settings.bot_quote_ask_type };
+    } else if (/agendar|cita|reservar/i.test(low)) {
+      next = { state: 'book_details', data: {}, paused: false, reply: settings.bot_book_ask };
+    } else if (isFirst) {
+      next = { state: 'menu', data: {}, paused: false, reply: `${settings.bot_greeting}\n\n${settings.bot_menu}` };
+    } else {
+      next = unknown(settings.bot_unknown_message);
+    }
+  } else if (state === 'quote_type') {
+    if (body) {
+      data.cleaningType = botNormalizeType(body);
+      data.unknownCount = 0;
+      next = { state: 'quote_photos', data, paused: false, reply: settings.bot_quote_ask_photos };
+    } else {
+      next = { state: 'quote_type', data, paused: false, reply: `${BOT_PHOTO_ACK}\n\n${settings.bot_quote_ask_type}` };
+    }
+  } else if (state === 'quote_photos') {
+    if (body && BOT_DONE_WORDS.test(low)) {
+      data.unknownCount = 0;
+      next = { state: 'quote_details', data, paused: false, reply: isPhoto ? `${BOT_PHOTO_ACK}\n\n${settings.bot_quote_ask_details}` : settings.bot_quote_ask_details };
+    } else if (body) {
+      next = { state: 'quote_photos', data, paused: false, reply: settings.bot_quote_ask_photos };
+    } else {
+      next = { state: 'quote_photos', data, paused: false, reply: BOT_PHOTO_ACK };
+    }
+  } else if (state === 'quote_details') {
+    if (body) {
+      // Nombre y dirección: "Juan, Chapinero Calle 5 # 10-20" -> nombre
+      // antes de la primera coma, resto dirección. Sin coma, todo es
+      // dirección y el nombre queda el del contacto de WhatsApp.
+      const parts = body.split(',').map((s) => s.trim()).filter(Boolean);
+      if (parts.length >= 2) { data.name = parts[0]; data.address = parts.slice(1).join(', '); }
+      else { data.address = body; }
+      data.details = body;
+      data.unknownCount = 0;
+      await botCompleteQuote(conversationId, data);
+      next = { state: 'done', data, paused: false, reply: settings.bot_quote_done_message };
+    } else {
+      next = { state: 'quote_details', data, paused: false, reply: settings.bot_quote_ask_details };
+    }
+  } else if (state === 'book_details') {
+    if (body) {
+      data.bookDetails = body;
+      data.unknownCount = 0;
+      next = { state: 'handoff', data, paused: true, reply: settings.bot_handoff_message, event: 'Bot: cita pedida; se pasa al asesor para agendarla.' };
+    } else {
+      next = { state: 'book_details', data, paused: false, reply: settings.bot_book_ask };
+    }
+  } else {
+    // Estado desconocido (p. ej. 'handoff' sin pausa): volver al menú.
+    next = { state: 'menu', data: {}, paused: false, reply: settings.bot_menu };
+  }
+
+  if (!next) return { replied: false, reason: 'sin-respuesta' };
+  await saveBotState(conversationId, next.state, next.data, !!next.paused);
+  if (next.event) await recordEvent('info', 'bot', next.event, { conversation: conversationId });
+  if (!next.reply) return { replied: false, state: next.state };
+  const res = await botSay({ phone, instanceId, conversationId, text: next.reply });
+  return { replied: true, reply: next.reply, state: next.state, sent: !!res.ok };
 }
 
 // --- CONFIGURACIÓN DE MULTI-WHATSAPP ---
@@ -3957,6 +4245,16 @@ const initDB = async () => {
         external_id VARCHAR(100) UNIQUE,
         timestamp TIMESTAMP DEFAULT NOW()
       );
+      -- v5.3.36 Bot de WhatsApp (recepcionista): estado por conversación
+      -- (en qué paso del flujo va, lo recogido y si está pausado para que
+      -- hable el humano). Sin esta fila el bot saluda con el menú.
+      CREATE TABLE IF NOT EXISTS bot_states (
+        conversation_id VARCHAR(50) PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        state VARCHAR(30) DEFAULT 'menu',
+        data TEXT DEFAULT '{}',
+        paused BOOLEAN DEFAULT FALSE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS services (
         id VARCHAR(50) PRIMARY KEY,
         date DATE,
@@ -5313,6 +5611,10 @@ app.post('/api/chats/:id/messages', waSendLimiter, async (req, res) => {
 
     // 4. Actualizar conversación
     await pool.query(`UPDATE conversations SET last_message = $1, last_message_time = NOW(), unread_count = 0 WHERE id = $2`, [lastMsgPreview, id]);
+    // v5.3.36 — El humano tomó la conversación: el bot se pausa para ese
+    // chat (no responde más hasta que alguien lo reactive con el botón
+    // del inbox). Best-effort: un fallo aquí no rompe el envío.
+    try { await setBotPaused(id, true); } catch (e) { logger.warn('Bot: no se pudo pausar el bot del chat', e?.message || e); }
 
     const advisorRes = await pool.query("SELECT e.id FROM employees e JOIN leads l ON e.name = l.advisor WHERE l.conversation_id = $1", [id]);
     notifyUpdate('chat', advisorRes.rows.map(r => r.id));
@@ -5320,6 +5622,23 @@ app.post('/api/chats/:id/messages', waSendLimiter, async (req, res) => {
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
   }
+});
+
+// v5.3.36 — Bot de WhatsApp: pausar / reactivar el bot para una
+// conversación concreta (botón del inbox). El bot se reanuda SOLO por
+// este botón; no hay temporizadores automáticos en v1. Mismo alcance
+// que enviar mensajes (admin, advisor u operator dentro de su alcance).
+app.post('/api/chats/:id/bot-toggle', async (req, res) => {
+  const { id } = req.params;
+  const { paused } = req.body || {};
+  try {
+    if (typeof paused !== 'boolean') return res.status(400).json({ error: 'Se requiere el campo paused (true/false).' });
+    if (!(await conversationInScope(req, id))) return res.status(404).json({ error: 'Conversación no encontrada' });
+    const newPaused = await setBotPaused(id, paused);
+    const botEnabled = (await getSettingValue('bot_enabled', 'false')) === 'true';
+    notifyUpdate('chat');
+    res.json({ success: true, botEnabled, botPaused: newPaused });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // v5.3.6 — Subida de adjuntos para el chat (imagen/audio/video/documento).
@@ -5947,6 +6266,7 @@ app.get('/api/chats', async (req, res) => {
     const ids = pageRows.map((row) => row.id);
     const msgsByConv = new Map();
     const tasksByConv = new Map();
+    const botStatesByConv = new Map();
     if (ids.length > 0) {
       // v5.3.30: tope de 50 mensajes por conversación (los más recientes).
       // Antes se traían TODOS los mensajes de cada conversación y la
@@ -5963,7 +6283,11 @@ app.get('/api/chats', async (req, res) => {
       }
       const tasks = await pool.query('SELECT conversation_id, COUNT(*) AS c FROM tasks WHERE conversation_id = ANY($1) AND completed = false GROUP BY conversation_id', [ids]);
       for (const t of tasks.rows) tasksByConv.set(t.conversation_id, parseInt(t.c, 10) || 0);
+      // v5.3.36 Bot: pausa por conversación (para el indicador del inbox).
+      const botRes = await pool.query('SELECT conversation_id, paused FROM bot_states WHERE conversation_id = ANY($1)', [ids]);
+      for (const b of botRes.rows) botStatesByConv.set(b.conversation_id, !!b.paused);
     }
+    const botEnabled = (await getSettingValue('bot_enabled', 'false')) === 'true';
     const chats = pageRows.map((row) => {
       const msgs = msgsByConv.get(row.id) || [];
       return {
@@ -5983,7 +6307,10 @@ app.get('/api/chats', async (req, res) => {
           type: m.type,
           attachmentUrl: m.attachment_url,
           timestamp: new Date(m.timestamp).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })
-        }))
+        })),
+        // v5.3.36 Bot: si está activo globalmente y pausado en este chat.
+        botEnabled,
+        botPaused: botStatesByConv.get(row.id) || false
       };
     });
     res.json({ data: chats, total, page, limit, totalUnread });
@@ -7461,7 +7788,7 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     // resolución de facturación. invoice_next_number NO está aquí a propósito:
     // el consecutivo solo lo mueve la creación de facturas, no un formulario.
     // v5 Parte 2B Meta: token y phone number id de WhatsApp Cloud API.
-    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb'];
+    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb', 'bot_enabled', 'bot_greeting', 'bot_menu', 'bot_handoff_message', 'bot_quote_ask_type', 'bot_quote_ask_photos', 'bot_quote_ask_details', 'bot_quote_done_message', 'bot_book_ask', 'bot_unknown_message'];
     if (!ALLOWED_SETTINGS_KEYS.includes(key)) return res.status(400).json({ error: `Clave no permitida: ${key}` });
     // Las claves de Meta son credenciales: solo el admin las escribe.
     if (key.startsWith('meta_wa_') && (req.user?.role || '').toLowerCase() !== 'admin') {
@@ -7470,7 +7797,7 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     // v5.2 Facturación (B6): el tipo de factura por defecto y los datos de
     // la empresa para facturar son solo admin, aunque el asesor (vendedor)
     // ya puede crear facturas y cobrar.
-    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb']);
+    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb', 'bot_enabled', 'bot_greeting', 'bot_menu', 'bot_handoff_message', 'bot_quote_ask_type', 'bot_quote_ask_photos', 'bot_quote_ask_details', 'bot_quote_done_message', 'bot_book_ask', 'bot_unknown_message']);
     if (ADMIN_ONLY_SETTINGS.has(key) && normalizeRoleValue(req.user?.role) !== 'admin') {
       return res.status(403).json({ error: 'Solo el administrador puede cambiar esa configuración' });
     }
@@ -7619,3 +7946,9 @@ server.listen(PORT, () => {
   // (restoreWhatsAppInstances), no aquí: así solo se levantan cuando la
   // DB ya está lista y con su canal guardado.
 });
+
+// v5.3.36 — Exportado para las pruebas del motor del bot: los tests de
+// verificación importan este módulo con su propia DB y llaman a
+// handleBotMessage directamente, sin WhatsApp real. Importar el módulo
+// arranca la app (initDB + listen), como al correr `node server.js`.
+export { handleBotMessage };
