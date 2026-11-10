@@ -6,7 +6,7 @@ import {
   Activity, CheckCircle2, AlertTriangle, XCircle, RefreshCw, Play,
   Database, Smartphone, Server, MessagesSquare, HardDrive, Bell,
   Loader2, RotateCcw, Download, Send, CalendarDays, Eraser,
-  Link2, Unlink, Copy,
+  Link2, Unlink, Copy, Users,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import type { SystemComponentStatus, SystemEvent, SelfTestResult } from '../types';
@@ -104,6 +104,14 @@ export const SystemStatus: React.FC = () => {
   const [botBookAsk, setBotBookAsk] = useState('');
   const [botUnknown, setBotUnknown] = useState('');
   const botFormInit = useRef(false);
+  // v5.3.38 Aviso de venta a grupo de WhatsApp: interruptor + grupo
+  // elegido (de los grupos donde está el número asociado). Se rellena
+  // UNA vez con lo guardado (GET /api/settings), como el bot.
+  const [saleGroupEnabled, setSaleGroupEnabled] = useState(false);
+  const [saleGroupId, setSaleGroupId] = useState('');
+  const [saleGroupName, setSaleGroupName] = useState('');
+  const [saleGroups, setSaleGroups] = useState<{ id: string; name: string; participants: number }[]>([]);
+  const saleGroupFormInit = useRef(false);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -144,6 +152,13 @@ export const SystemStatus: React.FC = () => {
           ];
           for (const [key, set] of botFields) if (typeof stJson[key] === 'string' && stJson[key]) set(stJson[key]);
           botFormInit.current = true;
+        }
+        // v5.3.38 Aviso de venta al grupo: rellenar una sola vez.
+        if (stRes.ok && !saleGroupFormInit.current) {
+          if (typeof stJson.sale_group_enabled === 'string') setSaleGroupEnabled(stJson.sale_group_enabled.toLowerCase() === 'true');
+          if (typeof stJson.sale_group_id === 'string' && stJson.sale_group_id) setSaleGroupId(stJson.sale_group_id);
+          if (typeof stJson.sale_group_name === 'string' && stJson.sale_group_name) setSaleGroupName(stJson.sale_group_name);
+          saleGroupFormInit.current = true;
         }
       } catch { /* sin settings: los campos quedan con su valor por defecto */ }
     } catch (e: any) {
@@ -343,6 +358,42 @@ export const SystemStatus: React.FC = () => {
       return { message: botEnabled
         ? 'Bot de WhatsApp guardado y ACTIVADO: responderá los mensajes nuevos de WhatsApp (solo QR).'
         : 'Bot de WhatsApp guardado y desactivado: no responderá ningún mensaje.' };
+    });
+
+  // v5.3.38 Aviso de venta a grupo de WhatsApp (solo QR, solo admin):
+  // al agendar un servicio, el CRM avisa en el grupo elegido con los
+  // datos del cliente, el servicio y las fotos. Nace apagado.
+  const loadSaleGroups = async () =>
+    runAction('sale-groups-load', async () => {
+      const res = await apiFetch('/api/wa/groups');
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'No se pudieron cargar los grupos');
+      setSaleGroups(json.groups || []);
+      return { message: `Se encontraron ${json.groups?.length || 0} grupos en WhatsApp. Elige uno y guarda.` };
+    });
+
+  const saveSaleGroup = async () =>
+    runAction('sale-group-save', async () => {
+      const selected = saleGroups.find((g) => g.id === saleGroupId);
+      await saveSetting('sale_group_enabled', saleGroupEnabled ? 'true' : 'false');
+      await saveSetting('sale_group_id', saleGroupId.trim());
+      await saveSetting('sale_group_name', selected ? selected.name : saleGroupName);
+      if (selected) setSaleGroupName(selected.name);
+      return { message: saleGroupEnabled && saleGroupId
+        ? `Aviso de ventas guardado y ACTIVADO para el grupo “${selected ? selected.name : saleGroupName || saleGroupId}”. Al agendar un servicio llegará el aviso con los datos y las fotos.`
+        : 'Aviso de ventas guardado y desactivado: al agendar no se avisará a ningún grupo.' };
+    });
+
+  const testSaleGroup = async () =>
+    runAction('sale-group-test', async () => {
+      if (!saleGroupId) throw new Error('Elige primero un grupo y guarda');
+      const res = await apiFetch('/api/wa/groups/test', {
+        method: 'POST',
+        body: JSON.stringify({ groupId: saleGroupId }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || 'La prueba falló');
+      return { message: 'Mensaje de prueba enviado al grupo. Revisa el grupo en WhatsApp.' };
     });
 
   if (loading) {
@@ -700,6 +751,58 @@ export const SystemStatus: React.FC = () => {
                 <button onClick={saveBot} disabled={busy === 'bot-save'}
                   className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
                   {busy === 'bot-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar bot
+                </button>
+              </div>
+            </div>
+          </div>
+          {/* v5.3.38 Aviso de venta a grupo de WhatsApp (solo QR): cuando
+              se agenda un servicio, el CRM avisa en el grupo elegido con
+              los datos del cliente, el servicio, el valor y las fotos
+              técnicas (máx. 4). Nace apagado; sin grupo no avisa nada. */}
+          <div className="border border-slate-200 rounded-2xl p-4">
+            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+              <Users className="w-5 h-5 text-slate-500" /> Aviso de venta a grupo de WhatsApp
+            </h3>
+            <p className="text-xs text-slate-500 mt-1 mb-3">
+              {saleGroupEnabled && saleGroupId
+                ? `Activado: al agendar un servicio se avisará en “${saleGroupName || saleGroupId}”.`
+                : 'Desactivado: al agendar no se avisará a ningún grupo.'}
+            </p>
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 text-sm text-slate-700">
+                <input type="checkbox" checked={saleGroupEnabled} onChange={(e) => setSaleGroupEnabled(e.target.checked)} />
+                Avisar al grupo cuando se agende un servicio
+              </label>
+              <p className="text-xs text-slate-400">
+                El aviso llega cuando el servicio se agenda por primera vez o cuando se reagenda (cambia la fecha o la hora). Editar el valor, el estado o las observaciones no vuelve a avisar. Si el envío falla, queda en “Últimos eventos” y no se reintenta para no duplicarlo en el grupo.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={loadSaleGroups} disabled={busy === 'sale-groups-load'}
+                  className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-900 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'sale-groups-load' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Cargar grupos de WhatsApp
+                </button>
+              </div>
+              <label className="block">
+                <span className="text-xs font-bold text-slate-500 uppercase">Grupo para avisar las ventas</span>
+                <select value={saleGroupId} onChange={(e) => setSaleGroupId(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg text-sm p-2 outline-none focus:border-brand-500 bg-white">
+                  <option value="">— Sin grupo —</option>
+                  {saleGroups.map((g) => (
+                    <option key={g.id} value={g.id}>{g.name}{g.participants ? ` (${g.participants} participantes)` : ''}</option>
+                  ))}
+                  {saleGroupId && !saleGroups.some((g) => g.id === saleGroupId) && (
+                    <option value={saleGroupId}>{saleGroupName || saleGroupId} (guardado)</option>
+                  )}
+                </select>
+              </label>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button onClick={saveSaleGroup} disabled={busy === 'sale-group-save'}
+                  className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-brand-700 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'sale-group-save' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Guardar aviso al grupo
+                </button>
+                <button onClick={testSaleGroup} disabled={busy === 'sale-group-test' || !saleGroupId}
+                  className="bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-900 disabled:opacity-60 flex items-center gap-2">
+                  {busy === 'sale-group-test' ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Enviar prueba al grupo
                 </button>
               </div>
             </div>

@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.37';
+const APP_VERSION = '5.3.38';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -1250,6 +1250,186 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
     return { ok: false, channel: 'qr', error: `No se pudo confirmar el envío a ${phone} (se probaron: ${chatIds.join(', ')}; la verificación por escaneo no encontró el mensaje en el chat)` };
   }
   return { ok: false, channel: 'qr', error: lastError?.message || 'No se pudo enviar el mensaje' };
+}
+
+// ============================================================
+// AVISO DE VENTA A GRUPO DE WHATSAPP (v5.3.38)
+// ------------------------------------------------------------
+// Cuando se agenda un servicio, el CRM avisa en un grupo de
+// WhatsApp elegido por el admin (de los grupos donde está el
+// número asociado): datos del cliente, servicio, fecha/hora,
+// valor y las fotos técnicas, si las hay. Solo canal QR en v1
+// (Meta Cloud API no puede escribir en grupos). Nace APAGADO y
+// sin grupo: sin grupo configurado no se envía nada. El aviso
+// nunca rompe el guardado del servicio: si falla, queda en
+// Últimos eventos. Como en v5.3.37, un envío solo cuenta si
+// WhatsApp lo aceptó (ack>=1); si queda atascado en ack=0 se
+// reporta como fallo y NO se reintenta, para no duplicarlo.
+// ============================================================
+const SALE_GROUP_MAX_PHOTOS = 4;
+
+async function getSaleGroupSettings() {
+  const out = { sale_group_enabled: 'false', sale_group_id: '', sale_group_name: '' };
+  try {
+    const r = await pool.query("SELECT key, value FROM settings WHERE key LIKE 'sale_group%'");
+    for (const row of r.rows) {
+      if (typeof row.key === 'string' && row.key.startsWith('sale_group_') && typeof row.value === 'string') out[row.key] = row.value;
+    }
+  } catch (e) { /* sin DB: apagado */ }
+  return out;
+}
+
+// Texto del aviso. Recibe la fila de services tal como sale de la
+// DB (snake_case) o el cuerpo del formulario (camelCase): acepta
+// las dos formas para no depender del llamador.
+function buildSaleGroupMessage(s) {
+  const name = s.client_name || s.clientName || 'Sin nombre';
+  const phone = s.client_phone || s.clientPhone || '';
+  const date = s.date || '';
+  const time = s.time || '';
+  const city = s.city || '';
+  const neighborhood = s.neighborhood || s.neighbourhood || '';
+  const address = s.address || '';
+  const items = s.items_to_clean || s.itemsToClean || '';
+  const advisor = s.advisor || '';
+  const total = (s.total_value ?? s.totalValue);
+  const advances = (s.advances ?? 0);
+  const payMethod = s.payment_method || s.paymentMethod || '';
+  const status = s.deal_status || s.dealStatus || 'AGENDADO';
+  const lines = ['✅ *Nueva venta agendada*', '', `👤 Cliente: ${name}`];
+  if (phone) lines.push(`📱 Teléfono: ${phone}`);
+  if (date || time) lines.push(`📅 Fecha: ${[date, time].filter(Boolean).join(' ')}`);
+  const place = [address, neighborhood, city].filter(Boolean).join(', ');
+  if (place) lines.push(`📍 Lugar: ${place}`);
+  if (items) lines.push(`🧹 Servicio: ${items}`);
+  if (advisor) lines.push(`🧑‍💼 Asesor: ${advisor}`);
+  if (total !== undefined && total !== null && total !== '') lines.push(`💰 Valor total: $${Number(total).toLocaleString('es-CO')}`);
+  if (Number(advances) > 0) lines.push(`💵 Anticipo: $${Number(advances).toLocaleString('es-CO')}`);
+  if (payMethod) lines.push(`💳 Pago: ${payMethod}`);
+  if (status && status !== 'AGENDADO') lines.push(`📌 Estado: ${status}`);
+  return lines.join('\n');
+}
+
+// ¿Este guardado cuenta como "se agendó"? Sí cuando el servicio
+// es nuevo (no existía) y nace agendado/confirmado, o cuando a uno
+// que ya existía le cambió la fecha o la hora (reagendado). Un
+// cambio de estado, de valor o de observaciones no dispara el
+// aviso: si no, cada edición spamearía el grupo.
+function shouldNotifySaleGroup({ existed, prevDate, prevTime, next }) {
+  const status = next.deal_status || next.dealStatus || 'AGENDADO';
+  const schedulable = ['AGENDADO', 'CONFIRMADO', 'REAGENDADO'].includes(status);
+  if (!schedulable) return false;
+  if (!existed) return true;
+  const nextDate = next.date || '';
+  const nextTime = next.time || '';
+  return (prevDate || '') !== nextDate || (prevTime || '') !== nextTime;
+}
+
+// Una foto técnica puede venir como data URL (lo que guarda el
+// formulario) o como ruta /uploads/wa-media/... Devuelve
+// { mimetype, data, filename } o null si no se puede usar. Una
+// foto que no se puede usar no tumba el aviso: simplemente no se
+// manda esa foto (el texto sí llega).
+function parseSaleGroupPhoto(raw, idx) {
+  if (!raw || typeof raw !== 'string') return null;
+  const m = raw.match(/^data:([^;]+);base64,(.+)$/);
+  if (m) {
+    if (!m[1].startsWith('image/') && !m[1].startsWith('video/')) return null;
+    return { mimetype: m[1], data: m[2], filename: `foto-${idx + 1}` };
+  }
+  if (raw.startsWith('/uploads/wa-media/')) {
+    const f = readWaAttachmentFile(raw);
+    if (f.error) return null;
+    return { mimetype: f.mimetype, data: f.data, filename: f.filename };
+  }
+  return null;
+}
+
+// Envío a un grupo por QR con verificación por ack (mismo criterio
+// que v5.3.37 para los chats 1 a 1): se espera ~2 s y se busca el
+// mensaje entre los últimos 5 del grupo; solo ack>=1 confirma.
+// Si sendMessage devuelve undefined (el fallo de getter ya conocido),
+// se verifica por el mensaje propio más reciente con medio.
+async function sendWhatsAppGroupMessage({ groupId, content, mediaList = [] }) {
+  if (!groupId || !String(groupId).endsWith('@g.us')) return { ok: false, error: 'Grupo inválido: debe ser un id de grupo (@g.us)' };
+  if (!content && (!mediaList || mediaList.length === 0)) return { ok: false, error: 'Contenido vacío' };
+  const target = Object.keys(waClients).find((k) => waClients[k].status === 'ready' && waClients[k].channel !== 'meta' && waClients[k].client);
+  if (!target) return { ok: false, error: 'Ninguna instancia de WhatsApp por QR lista' };
+  const client = waClients[target].client;
+  let chat;
+  try {
+    chat = await client.getChatById(groupId);
+  } catch (e) {
+    return { ok: false, error: `No se pudo abrir el grupo: ${e?.message || e}` };
+  }
+  if (!chat || chat.isGroup === false) return { ok: false, error: 'El chat elegido no es un grupo' };
+  const verifySent = async (sentId, matchText) => {
+    await sleep(2000);
+    try {
+      const msgs = await chat.fetchMessages({ limit: 5 });
+      const list = Array.isArray(msgs) ? msgs : [];
+      const serOf = (m) => { const id = m && m.id; return (id && (id._serialized || id.$1)) || ''; };
+      const ours = list.filter((m) => m && m.fromMe);
+      let found = null;
+      if (sentId) found = ours.find((m) => serOf(m) === sentId);
+      if (!found && matchText) found = ours.find((m) => (m.body || '') === matchText);
+      if (!found && !sentId && !matchText) {
+        // Foto sin id devuelto: el medio propio más reciente (menos de 30 s).
+        const withMedia = ours.filter((m) => m.hasMedia).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        const cand = withMedia[0];
+        if (cand && cand.timestamp && (Date.now() / 1000 - cand.timestamp) <= 30) found = cand;
+      }
+      if (!found) return { ok: false, error: 'No se pudo confirmar el envío en el grupo' };
+      const ack = typeof found.ack === 'number' ? found.ack : 0;
+      if (ack >= 1) return { ok: true, messageId: serOf(found) || null };
+      return { ok: false, stuck: true, messageId: serOf(found) || null, error: 'El mensaje quedó pendiente (ack 0): WhatsApp no lo aceptó; no se reintenta para no duplicarlo' };
+    } catch (e) {
+      return { ok: false, error: `No se pudo verificar el envío en el grupo: ${e?.message || e}` };
+    }
+  };
+  try {
+    if (content) {
+      const sent = await client.sendMessage(groupId, content);
+      const sentId = sent && sent.id ? (sent.id._serialized || sent.id.$1 || null) : null;
+      const v = await verifySent(sentId, content);
+      if (!v.ok) return { ok: false, stuck: !!v.stuck, messageId: v.messageId || null, error: v.error };
+    }
+    for (const media of (mediaList || []).slice(0, SALE_GROUP_MAX_PHOTOS)) {
+      const waMedia = new MessageMedia(media.mimetype, media.data, media.filename || 'foto');
+      const sentPhoto = await client.sendMessage(groupId, waMedia);
+      const sentId = sentPhoto && sentPhoto.id ? (sentPhoto.id._serialized || sentPhoto.id.$1 || null) : null;
+      const v = await verifySent(sentId, null);
+      if (!v.ok) return { ok: false, stuck: !!v.stuck, messageId: v.messageId || null, error: `Foto no confirmada en el grupo: ${v.error}` };
+    }
+    return { ok: true, channel: 'qr', instance: target };
+  } catch (e) {
+    return { ok: false, error: e?.message || 'No se pudo enviar al grupo' };
+  }
+}
+
+// Dispara el aviso (sin bloquear al llamador: el guardado del
+// servicio ya terminó). Si está apagado o no hay grupo, no hace
+// nada. Cualquier fallo queda en Últimos eventos.
+async function notifySaleGroup(serviceRow) {
+  try {
+    const cfg = await getSaleGroupSettings();
+    if (cfg.sale_group_enabled !== 'true') return { ok: false, skipped: 'apagado' };
+    if (!cfg.sale_group_id) return { ok: false, skipped: 'sin-grupo' };
+    const content = buildSaleGroupMessage(serviceRow);
+    const rawPhotos = serviceRow.technical_images ?? serviceRow.technicalImages ?? [];
+    const photos = Array.isArray(rawPhotos) ? rawPhotos : [];
+    const mediaList = photos.map((p, i) => parseSaleGroupPhoto(p, i)).filter(Boolean);
+    const res = await sendWhatsAppGroupMessage({ groupId: cfg.sale_group_id, content, mediaList });
+    if (res.ok) {
+      logger.info(`WhatsApp: aviso de venta enviado al grupo ${cfg.sale_group_name || cfg.sale_group_id}`);
+      return { ok: true };
+    }
+    await recordEvent(res.stuck ? 'warn' : 'error', 'whatsapp', `No se pudo avisar la venta al grupo ${cfg.sale_group_name || cfg.sale_group_id}: ${res.error}`, { groupId: cfg.sale_group_id });
+    return { ok: false, error: res.error };
+  } catch (e) {
+    await recordEvent('error', 'whatsapp', `Aviso de venta al grupo falló: ${e?.message || e}`, {}).catch(() => {});
+    return { ok: false, error: e?.message || String(e) };
+  }
 }
 
 // Entrada de mensajes: la MISMA lógica para el QR (whatsapp-web.js) y para
@@ -4701,6 +4881,45 @@ app.get('/api/wa/instances', requireAdmin, (req, res) => {
   res.json(instances);
 });
 
+// v5.3.38 Grupos de WhatsApp (QR): lista los grupos donde está el
+// número asociado, para elegir a cuál avisar cada venta agendada.
+// Solo admin. Sin instancia QR lista, error claro (no lista vacía
+// engañosa: una lista vacía con WhatsApp caído parecería que no
+// hay grupos).
+app.get('/api/wa/groups', requireAdmin, async (req, res) => {
+  try {
+    const target = Object.keys(waClients).find((k) => waClients[k].status === 'ready' && waClients[k].channel !== 'meta' && waClients[k].client);
+    if (!target) return res.status(503).json({ error: 'Ninguna instancia de WhatsApp por QR lista: conecta WhatsApp primero' });
+    const chats = await waClients[target].client.getChats();
+    const groups = (chats || [])
+      .filter((c) => c && c.isGroup)
+      .map((c) => ({
+        id: (c.id && (c.id._serialized || c.id.$1)) || '',
+        name: c.name || 'Grupo sin nombre',
+        participants: Array.isArray(c.participants) ? c.participants.length : 0,
+      }))
+      .filter((g) => g.id.endsWith('@g.us'))
+      .sort((a, b) => a.name.localeCompare(b.name, 'es'));
+    res.json({ groups, instance: target });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// v5.3.38 Prueba del aviso: envía el mensaje de prueba al grupo
+// configurado (o al groupId del cuerpo) sin agendar nada.
+app.post('/api/wa/groups/test', requireAdmin, async (req, res) => {
+  try {
+    const cfg = await getSaleGroupSettings();
+    const groupId = (req.body && req.body.groupId) || cfg.sale_group_id;
+    if (!groupId) return res.status(400).json({ error: 'Elige primero un grupo para avisar las ventas' });
+    const result = await sendWhatsAppGroupMessage({
+      groupId,
+      content: `🔔 Prueba de aviso de ventas del CRM (v${APP_VERSION}): si lees esto en el grupo, el aviso funciona. Cuando se agende un servicio, aquí llegarán los datos del cliente, el servicio y las fotos.`,
+    });
+    if (!result.ok) return res.status(502).json({ ok: false, error: result.error, stuck: !!result.stuck });
+    res.json({ ok: true, groupId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Estado de Meta Cloud API (JWT; el token NUNCA sale del servidor, solo
 // booleanos: configurado o no, y el phone number id, que no es secreto).
 app.get('/api/wa/meta/status', requireAdmin, async (req, res) => {
@@ -7091,9 +7310,14 @@ app.post('/api/services', async (req, res) => {
       }
       if (!advisor) advisor = scope.userName;
     }
+    // v5.3.38 Aviso de venta al grupo: se guarda el servicio previo
+    // (fecha/hora/estado) para decidir si este guardado es un
+    // agendamiento nuevo o una reagendación.
+    let prevService = null;
     if (s.id) {
-      const existing = await pool.query('SELECT advisor FROM services WHERE id = $1', [s.id]);
+      const existing = await pool.query('SELECT advisor, date, time, deal_status FROM services WHERE id = $1', [s.id]);
       if (existing.rows.length > 0) {
+        prevService = existing.rows[0];
         const inScope = svcRole === 'admin' || (scope.names || []).includes(existing.rows[0].advisor);
         if (!inScope) return res.status(403).json({ error: 'No puedes modificar un servicio de otro asesor' });
       }
@@ -7142,6 +7366,18 @@ app.post('/api/services', async (req, res) => {
         }
       }
     } catch (e) { logger.warn(`Google Calendar (crear servicio ${r.rows[0].id}): ${e.message}`); }
+
+    // v5.3.38 Aviso de venta al grupo: solo cuando se agenda (nuevo o
+    // reagendado). No bloquea la respuesta ni rompe el guardado: el
+    // aviso corre en segundo plano y sus fallos quedan en Últimos
+    // eventos (ver notifySaleGroup).
+    try {
+      const fullRes = await pool.query('SELECT * FROM services WHERE id = $1', [r.rows[0].id]);
+      const fullRow = fullRes.rows[0];
+      if (fullRow && shouldNotifySaleGroup({ existed: !!prevService, prevDate: prevService?.date, prevTime: prevService?.time, next: fullRow })) {
+        notifySaleGroup(fullRow).catch((e) => logger.warn(`Aviso de venta al grupo: ${e?.message || e}`));
+      }
+    } catch (e) { logger.warn(`Aviso de venta al grupo (decisión): ${e.message}`); }
 
     res.json({ id: r.rows[0].id });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -7955,7 +8191,7 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     // resolución de facturación. invoice_next_number NO está aquí a propósito:
     // el consecutivo solo lo mueve la creación de facturas, no un formulario.
     // v5 Parte 2B Meta: token y phone number id de WhatsApp Cloud API.
-    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb', 'bot_enabled', 'bot_greeting', 'bot_menu', 'bot_handoff_message', 'bot_quote_ask_type', 'bot_quote_ask_photos', 'bot_quote_ask_details', 'bot_quote_done_message', 'bot_book_ask', 'bot_unknown_message'];
+    const ALLOWED_SETTINGS_KEYS = ['reassignment_timeout', 'daily_capacity', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'meta_wa_token', 'meta_wa_phone_number_id', 'invoice_default_type', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb', 'bot_enabled', 'bot_greeting', 'bot_menu', 'bot_handoff_message', 'bot_quote_ask_type', 'bot_quote_ask_photos', 'bot_quote_ask_details', 'bot_quote_done_message', 'bot_book_ask', 'bot_unknown_message', 'sale_group_enabled', 'sale_group_id', 'sale_group_name'];
     if (!ALLOWED_SETTINGS_KEYS.includes(key)) return res.status(400).json({ error: `Clave no permitida: ${key}` });
     // Las claves de Meta son credenciales: solo el admin las escribe.
     if (key.startsWith('meta_wa_') && (req.user?.role || '').toLowerCase() !== 'admin') {
@@ -7964,7 +8200,7 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     // v5.2 Facturación (B6): el tipo de factura por defecto y los datos de
     // la empresa para facturar son solo admin, aunque el asesor (vendedor)
     // ya puede crear facturas y cobrar.
-    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb', 'bot_enabled', 'bot_greeting', 'bot_menu', 'bot_handoff_message', 'bot_quote_ask_type', 'bot_quote_ask_photos', 'bot_quote_ask_details', 'bot_quote_done_message', 'bot_book_ask', 'bot_unknown_message']);
+    const ADMIN_ONLY_SETTINGS = new Set(['reassignment_timeout', 'daily_capacity', 'invoice_default_type', 'company_nit', 'company_regime', 'dian_resolution_number', 'dian_resolution_range', 'dian_resolution_date', 'google_refresh_token', 'google_calendar_id', 'google_calendar_duration_minutes', 'google_calendar_enabled', 'google_client_id', 'google_client_secret', 'telegram_bot_token', 'telegram_chat_id', 'followup_enabled', 'followup_months', 'followup_message', 'followup_mode', 'followup_hour', 'followup_media_url', 'followup_media_type', 'backup_allow_unencrypted', 'uploads_max_mb', 'uploads_user_day_max_mb', 'bot_enabled', 'bot_greeting', 'bot_menu', 'bot_handoff_message', 'bot_quote_ask_type', 'bot_quote_ask_photos', 'bot_quote_ask_details', 'bot_quote_done_message', 'bot_book_ask', 'bot_unknown_message', 'sale_group_enabled', 'sale_group_id', 'sale_group_name']);
     if (ADMIN_ONLY_SETTINGS.has(key) && normalizeRoleValue(req.user?.role) !== 'admin') {
       return res.status(403).json({ error: 'Solo el administrador puede cambiar esa configuración' });
     }
@@ -8014,6 +8250,14 @@ app.post('/api/settings', settingsLimiter, async (req, res) => {
     }
     if (key === 'uploads_user_day_max_mb' && value && (!/^\d+$/.test(String(value).trim()) || +value < 1 || +value > 10000)) {
       return res.status(400).json({ error: 'uploads_user_day_max_mb debe ser un número entre 1 y 10000 MB' });
+    }
+    // v5.3.38 Aviso de venta al grupo: interruptor true/false y el id
+    // del grupo (siempre termina en @g.us; vacío = sin grupo).
+    if (key === 'sale_group_enabled' && value && !['true', 'false'].includes(String(value).trim())) {
+      return res.status(400).json({ error: "sale_group_enabled debe ser 'true' o 'false'" });
+    }
+    if (key === 'sale_group_id' && value && !String(value).trim().endsWith('@g.us')) {
+      return res.status(400).json({ error: 'sale_group_id debe ser un id de grupo de WhatsApp (termina en @g.us)' });
     }
     await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, value]);
     notifyUpdate('settings');
@@ -8118,4 +8362,4 @@ server.listen(PORT, () => {
 // verificación importan este módulo con su propia DB y llaman a
 // handleBotMessage directamente, sin WhatsApp real. Importar el módulo
 // arranca la app (initDB + listen), como al correr `node server.js`.
-export { handleBotMessage };
+export { handleBotMessage, buildSaleGroupMessage, parseSaleGroupPhoto, shouldNotifySaleGroup };
