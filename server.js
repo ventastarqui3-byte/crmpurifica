@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.36';
+const APP_VERSION = '5.3.37';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -437,7 +437,14 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
             return arr.slice(-5).map((m) => {
               const mid = m && m.id;
               const from = m && m.from;
-              return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, idFromMe: !!(mid && mid.fromMe), sender: (from && (from._serialized || from.$1)) || (typeof from === 'string' ? from : ''), body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0 };
+              // v5.3.37 — ack del mensaje (0 pendiente/reloj, 1 aceptado por
+              // el servidor, 2 entregado, 3 leído). Sin ack no se puede
+              // confirmar el envío: el log de producción 2026-11-09 probó
+              // que 5 respuestas del bot "verificadas por ultimo-mensaje"
+              // nunca llegaron al celular porque estaban atascadas en
+              // ack=0 (la instancia acababa de reiniciarse y su sesión no
+              // estaba viva). Un ack ausente se trata como 0.
+              return { id: mid && (mid._serialized || mid.$1), fromMe: !!m.fromMe, idFromMe: !!(mid && mid.fromMe), sender: (from && (from._serialized || from.$1)) || (typeof from === 'string' ? from : ''), body: m.body || '', caption: m.caption || '', type: m.type || '', t: m.t || 0, ack: (typeof m.ack === 'number' && !Number.isNaN(m.ack)) ? m.ack : 0 };
             });
           }
         } catch (e) { /* sin mensajes legibles */ }
@@ -450,9 +457,12 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         const cusSer = args.phoneDigits + '@c.us';
         return !!info.sender && info.sender !== lidSer && info.sender !== cusSer;
       };
-      const lastMatches = (info) => {
-        if (!isOurs(info)) return false;
-        if (Math.floor(Date.now() / 1000) - (info.t || 0) > 60) return false;
+      // v5.3.37 — Verificación por ACK (ver comentario en recentMsgsInfo):
+      // una coincidencia solo cuenta como envío si ack>=1. El contenido
+      // se comprueba aparte (contentMatches) para que la única diferencia
+      // entre "verificado" y "atascado" sea el ack.
+      const ackOf = (info) => { const a = info && info.ack; return (typeof a === 'number' && !Number.isNaN(a)) ? a : 0; };
+      const contentMatches = (info) => {
         if (args.media) {
           if (args.content && (info.caption === args.content || info.body === args.content)) return true;
           if (!args.content) {
@@ -463,6 +473,28 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         }
         return info.body === args.content;
       };
+      const lastMatches = (info) => {
+        if (!isOurs(info)) return false;
+        if (Math.floor(Date.now() / 1000) - (info.t || 0) > 60) return false;
+        if (ackOf(info) < 1) return false;
+        return contentMatches(info);
+      };
+      // Coincide con lo enviado pero sigue en ack=0: existe en la página
+      // local pero WhatsApp no lo aceptó. NO es éxito (y tampoco es "no
+      // hay mensaje": reenviarlo lo duplicaría si luego se transmite).
+      const lastMatchesStuck = (info) => {
+        if (!isOurs(info)) return false;
+        if (Math.floor(Date.now() / 1000) - (info.t || 0) > 60) return false;
+        if (ackOf(info) >= 1) return false;
+        return contentMatches(info);
+      };
+      // Busca en los últimos 5 (el más reciente manda): hit = coincidencia
+      // con ack>=1 (éxito), stuck = coincidencia con ack=0 (atascado).
+      const findVerified = (recentArr) => {
+        const rev = [...recentArr].reverse();
+        return { hit: rev.find(lastMatches) || null, stuck: rev.find(lastMatchesStuck) || null, checked: recentArr.length };
+      };
+      const sleepInPage = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       // v5.3.23 — Envío MANUAL de media (solo image/video/document): el
       // log de la 5.3.22 probó que processMediaData sale OK (preparación
       // OK, filehash sí) y que el fallo está en la CONSTRUCCIÓN del
@@ -639,13 +671,45 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
         }
       }
       const recent = recentMsgsInfo(chat);
-      const hit = [...recent].reverse().find(lastMatches);
-      if (hit) {
+      let check = findVerified(recent);
+      if (check.hit) {
         out.sent = true;
-        out.messageId = hit.id || (sentMsg && sentMsg.id && (sentMsg.id._serialized || sentMsg.id.$1)) || null;
+        out.messageId = check.hit.id || (sentMsg && sentMsg.id && (sentMsg.id._serialized || sentMsg.id.$1)) || null;
         out.verifiedBy = 'ultimo-mensaje';
-        out.checked = recent.length;
+        out.verifiedAck = ackOf(check.hit);
+        out.checked = check.checked;
         return out;
+      }
+      if (check.stuck) {
+        // v5.3.37 — El mensaje existe pero está en ack=0: puede ser red
+        // lenta (el ack llega en 1-2 s) o sesión muerta (nunca llega). Se
+        // vuelve a comprobar 2 veces con 2 s de espera (comprobar,
+        // esperar 2 s, comprobar, esperar 2 s, comprobar) antes de
+        // declararlo fallo. Si sigue en ack=0, NO se pasa al camino de
+        // mensaje crudo ni a los reintentos: un segundo envío lo
+        // duplicaría si el primero se transmite después.
+        for (let w = 0; w < 2; w++) {
+          await sleepInPage(2000);
+          check = findVerified(recentMsgsInfo(chat));
+          if (check.hit) {
+            out.sent = true;
+            out.messageId = check.hit.id || (sentMsg && sentMsg.id && (sentMsg.id._serialized || sentMsg.id.$1)) || null;
+            out.verifiedBy = 'ultimo-mensaje-tras-espera';
+            out.verifiedAck = ackOf(check.hit);
+            out.checked = check.checked;
+            return out;
+          }
+          if (!check.stuck) break;
+        }
+        if (check.stuck) {
+          out.stuck = true;
+          out.messageId = check.stuck.id || null;
+          out.stuckAck = ackOf(check.stuck);
+          out.error = 'El mensaje quedó pendiente (ack 0): WhatsApp no lo aceptó (sesión no viva o red caída); no se reintenta para no duplicarlo';
+          return out;
+        }
+        // El atascado desapareció sin ack>=1: seguir al flujo normal
+        // (mensaje crudo o reintentos de media manual).
       }
       if (sentMsg) {
         // El mensaje crudo existe: el envío salió (la serialización con
@@ -673,13 +737,20 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
           out.retryError = 'processMediaData falló en el reintento: ' + r2.error;
           out.retryStack = r2.stack;
         } else if (r2 && r2.sentMsg) {
-          const recent2 = recentMsgsInfo(chat);
-          const hit2 = [...recent2].reverse().find(lastMatches);
-          if (hit2) {
+          const check2 = findVerified(recentMsgsInfo(chat));
+          if (check2.hit) {
             out.sent = true;
-            out.messageId = hit2.id || (r2.sentMsg && r2.sentMsg.id && (r2.sentMsg.id._serialized || r2.sentMsg.id.$1)) || null;
+            out.messageId = check2.hit.id || (r2.sentMsg && r2.sentMsg.id && (r2.sentMsg.id._serialized || r2.sentMsg.id.$1)) || null;
             out.verifiedBy = 'ultimo-mensaje-documento';
-            out.checked = recent2.length;
+            out.verifiedAck = ackOf(check2.hit);
+            out.checked = check2.checked;
+            return out;
+          }
+          if (check2.stuck) {
+            out.stuck = true;
+            out.messageId = check2.stuck.id || null;
+            out.stuckAck = ackOf(check2.stuck);
+            out.error = 'El mensaje quedó pendiente (ack 0): WhatsApp no lo aceptó (sesión no viva o red caída); no se reintenta para no duplicarlo';
             return out;
           }
           out.sent = true;
@@ -706,14 +777,21 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
           sendStack = out.fallbackStack;
         }
         if (fbMsg) {
-          const recent3 = recentMsgsInfo(chat);
-          const hit3 = [...recent3].reverse().find(lastMatches);
+          const check3 = findVerified(recentMsgsInfo(chat));
           out.fallbackUsed = true;
-          if (hit3) {
+          if (check3.hit) {
             out.sent = true;
-            out.messageId = hit3.id || (fbMsg && fbMsg.id && (fbMsg.id._serialized || fbMsg.id.$1)) || null;
+            out.messageId = check3.hit.id || (fbMsg && fbMsg.id && (fbMsg.id._serialized || fbMsg.id.$1)) || null;
             out.verifiedBy = 'ultimo-mensaje';
-            out.checked = recent3.length;
+            out.verifiedAck = ackOf(check3.hit);
+            out.checked = check3.checked;
+            return out;
+          }
+          if (check3.stuck) {
+            out.stuck = true;
+            out.messageId = check3.stuck.id || null;
+            out.stuckAck = ackOf(check3.stuck);
+            out.error = 'El mensaje quedó pendiente (ack 0): WhatsApp no lo aceptó (sesión no viva o red caída); no se reintenta para no duplicarlo';
             return out;
           }
           out.sent = true;
@@ -742,8 +820,20 @@ async function sendWaByScan(client, target, { digits, lid, content, media }) {
   logger.info(`WhatsApp (${target}): escaneo de chats: ${scan?.totalChats ?? '?'} chats en lista, ${scan?.matchedIds?.length || 0} coincidencias${scan?.matchedIds?.length ? ` (${scan.matchedIds.join(', ')})` : ''}`);
   if (!scan?.found) return { found: false, ok: false };
   if (scan.sent) {
-    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'}${scan.manualSend ? ', envío manual' : ''}${scan.retriedAsDocument ? ', tras reintento como documento' : ''}${scan.fallbackUsed ? ', último recurso (sendMessage original)' : ''})`);
+    // v5.3.37 — El log de éxito lleva el ack del mensaje coincidente y el
+    // LID/número de la cuenta, para que el próximo diagnóstico sea
+    // definitivo (un éxito con ack>=1 es un envío aceptado por el
+    // servidor; sin ack no se puede distinguir de un falso positivo).
+    logger.info(`WhatsApp (${target}): mensaje enviado por escaneo al chat ${scan.matchedIds[0]} (id: ${scan.messageId || 'sin id'}, verificado por: ${scan.verifiedBy || 'mensaje-crudo'}, ack: ${scan.verifiedAck ?? '?'}; LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}${scan.manualSend ? ', envío manual' : ''}${scan.retriedAsDocument ? ', tras reintento como documento' : ''}${scan.fallbackUsed ? ', último recurso (sendMessage original)' : ''})`);
     return { found: true, ok: true, messageId: scan.messageId || null };
+  }
+  // v5.3.37 — El mensaje existe en el chat pero está atascado en ack=0:
+  // WhatsApp no lo aceptó. Es un FALLO (antes se reportaba como éxito),
+  // pero NO se pasa al reintento por id: el mensaje ya existe y un
+  // segundo envío lo duplicaría si el primero se transmite después.
+  if (scan?.stuck) {
+    logger.warn(`WhatsApp (${target}): envío por escaneo al chat ${scan.matchedIds[0]} ATASCADO en ack=0 (id: ${scan.messageId || 'sin id'}; LID cuenta: ${scan.lidUser || 'sin LID'}; yo: ${scan.meUser || 'sin número'}): WhatsApp no aceptó el mensaje (sesión no viva o red caída); no se reintenta para no duplicarlo`);
+    return { found: true, ok: false, stuck: true, messageId: scan.messageId || null, error: scan.error || 'El mensaje quedó pendiente (ack 0): WhatsApp no lo aceptó (sesión no viva o red caída); no se reintenta para no duplicarlo' };
   }
   // v5.3.22 — La línea de fallo incluye el resultado de la preparación
   // por separado: OK (type/mimetype/filehash) o FALLÓ (error + stack).
@@ -804,27 +894,31 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
       // Últimos 5 mensajes: primero de chat.msgs (en memoria); si no hay
       // ninguno, por lastReceivedKey buscado dentro de chat.msgs (sin
       // Msg.get). v5.3.13: son 5, no solo el último (ver comentario arriba).
-      let cands = [];
-      let via = null;
-      let totalMsgs = 0;
-      try {
-        let arr = null;
-        if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
-        else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
-        totalMsgs = arr ? arr.length : 0;
-        if (arr && arr.length) { cands = arr.slice(-5); via = 'chat.msgs'; }
-      } catch (e) { /* sin mensajes legibles en chat.msgs */ }
-      if (!cands.length && chat.lastReceivedKey) {
+      // v5.3.37 — gather() se llama en cada intento de la espera por ack:
+      // chat.msgs se relee en fresco, por si el ack llega entre intentos.
+      const gather = () => {
+        let cands = [];
+        let via = null;
+        let totalMsgs = 0;
         try {
-          const ser = chat.lastReceivedKey._serialized || chat.lastReceivedKey.$1;
           let arr = null;
           if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
           else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
-          const found = (arr || []).find((m) => { const id = m && m.id; return id && ((id._serialized || id.$1) === ser); }) || null;
-          if (found) { cands = [found]; via = 'lastReceivedKey-en-chat.msgs'; }
-        } catch (e) { /* no se pudo resolver el último mensaje */ }
-      }
-      if (!cands.length) { out.reason = 'sin mensajes legibles en el chat'; out.totalMsgs = totalMsgs; return out; }
+          totalMsgs = arr ? arr.length : 0;
+          if (arr && arr.length) { cands = arr.slice(-5); via = 'chat.msgs'; }
+        } catch (e) { /* sin mensajes legibles en chat.msgs */ }
+        if (!cands.length && chat.lastReceivedKey) {
+          try {
+            const ser = chat.lastReceivedKey._serialized || chat.lastReceivedKey.$1;
+            let arr = null;
+            if (chat.msgs && typeof chat.msgs.getModelsArray === 'function') arr = chat.msgs.getModelsArray();
+            else if (chat.msgs && Array.isArray(chat.msgs.models)) arr = chat.msgs.models;
+            const found = (arr || []).find((m) => { const id = m && m.id; return id && ((id._serialized || id.$1) === ser); }) || null;
+            if (found) { cands = [found]; via = 'lastReceivedKey-en-chat.msgs'; }
+          } catch (e) { /* no se pudo resolver el último mensaje */ }
+        }
+        return { cands, via, totalMsgs };
+      };
 // v5.3.14 — "Nuestro" se decide por REMITENTE, no por fromMe: en este
 // chat LID los mensajes propios guardados en chat.msgs leen fromMe=false
 // (probado en el log de v5.3.13: la verificación siempre decía
@@ -848,9 +942,13 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
         const cusSer = args.phoneDigits + '@c.us';
         return !!sender && sender !== lidSer && sender !== cusSer;
       };
-      const matches = (m) => {
-        if (!isOursMsg(m)) return false;
-        if (now - (m.t || 0) > 60) return false;
+      // v5.3.37 — ack del mensaje (0 pendiente, 1 aceptado por el
+      // servidor, 2 entregado, 3 leído; ausente = 0). matches() exige
+      // ack>=1 para confirmar el envío; matchesStuck() detecta la
+      // coincidencia atascada en ack=0 (existe pero WhatsApp no la
+      // aceptó: falso éxito en el log de producción 2026-11-09).
+      const ackOfMsg = (m) => { const a = m && m.ack; return (typeof a === 'number' && !Number.isNaN(a)) ? a : 0; };
+      const contentMatchesMsg = (m) => {
         const body = m.body || '';
         const caption = m.caption || '';
         const type = m.type || '';
@@ -864,22 +962,68 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
         }
         return body === args.content;
       };
+      const matches = (m) => {
+        if (!isOursMsg(m)) return false;
+        if (now - (m.t || 0) > 60) return false;
+        if (ackOfMsg(m) < 1) return false;
+        return contentMatchesMsg(m);
+      };
+      const matchesStuck = (m) => {
+        if (!isOursMsg(m)) return false;
+        if (now - (m.t || 0) > 60) return false;
+        if (ackOfMsg(m) >= 1) return false;
+        return contentMatchesMsg(m);
+      };
+      const sleepInPage = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       // Info del mensaje más reciente (para el log), aunque no sea el nuestro.
       // v5.3.14: se registra también remitente e idFromMe, para diagnosticar
       // en el próximo log si los propios siguen leyendo fromMe=false.
-      const newest = cands[cands.length - 1];
-      out.last = { fromMe: !!newest.fromMe, idFromMe: !!(newest.id && newest.id.fromMe), sender: msgSender(newest), type: newest.type || '', tDelta: now - (newest.t || 0), bodyMatch: (newest.body || '') === args.content, captionMatch: (newest.caption || '') === args.content, via };
-      out.checked = cands.length;
-      // v5.3.21 — Total de mensajes en chat.msgs, no solo los revisados:
-      // distingue "colección casi vacía" (sesión fresca) de "el mensaje
-      // no está".
-      out.totalMsgs = totalMsgs;
-      let hit = null;
-      for (let i = cands.length - 1; i >= 0; i--) { if (matches(cands[i])) { hit = cands[i]; break; } }
-      if (!hit) { out.reason = 'ninguno de los últimos ' + cands.length + ' mensajes es nuestro y coincide con el enviado'; return out; }
-      const mid = hit.id;
-      out.ok = true;
-      out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+      // v5.3.37: también el ack del más reciente.
+      // Bucle de verificación (hasta 3 comprobaciones: comprobar, esperar
+      // 2 s, comprobar, esperar 2 s, comprobar): si la coincidencia está
+      // en ack=0 puede ser red lenta; solo tras las esperas se declara
+      // atascado. Sin coincidencia no se espera (nada que esperar).
+      let cands = [];
+      let via = null;
+      let totalMsgs = 0;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const g = gather();
+        cands = g.cands; via = g.via; totalMsgs = g.totalMsgs;
+        if (!cands.length) { out.reason = 'sin mensajes legibles en el chat'; out.totalMsgs = totalMsgs; return out; }
+        const newest = cands[cands.length - 1];
+        out.last = { fromMe: !!newest.fromMe, idFromMe: !!(newest.id && newest.id.fromMe), sender: msgSender(newest), type: newest.type || '', tDelta: now - (newest.t || 0), bodyMatch: (newest.body || '') === args.content, captionMatch: (newest.caption || '') === args.content, via, ack: ackOfMsg(newest) };
+        out.checked = cands.length;
+        // v5.3.21 — Total de mensajes en chat.msgs, no solo los revisados:
+        // distingue "colección casi vacía" (sesión fresca) de "el mensaje
+        // no está".
+        out.totalMsgs = totalMsgs;
+        let hit = null;
+        let stuckHit = null;
+        for (let i = cands.length - 1; i >= 0; i--) {
+          if (!hit && matches(cands[i])) hit = cands[i];
+          if (!stuckHit && matchesStuck(cands[i])) stuckHit = cands[i];
+          if (hit && stuckHit) break;
+        }
+        if (hit) {
+          const mid = hit.id;
+          out.ok = true;
+          out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+          out.ack = ackOfMsg(hit);
+          return out;
+        }
+        if (stuckHit) {
+          if (attempt < 2) { await sleepInPage(2000); continue; }
+          const mid = stuckHit.id;
+          out.stuck = true;
+          out.messageId = (mid && (mid._serialized || mid.$1)) || null;
+          out.ack = ackOfMsg(stuckHit);
+          out.reason = 'el mensaje existe pero está atascado en ack=0 (WhatsApp no lo aceptó: sesión no viva o red caída); no se reintenta para no duplicarlo';
+          return out;
+        }
+        out.reason = 'ninguno de los últimos ' + cands.length + ' mensajes es nuestro y coincide con el enviado';
+        return out;
+      }
+      out.reason = out.reason || 'sin resultado tras las comprobaciones';
       return out;
     }, {
       lidDigits,
@@ -893,9 +1037,13 @@ async function verifyWaLastMessage(client, target, { digits, lid, content, media
     return { ok: false, reason: e?.message || String(e) };
   }
   if (res?.ok) {
-    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'}, revisados: ${res.checked ?? '?'}, total en chat: ${res.totalMsgs ?? '?'})`);
+    logger.info(`WhatsApp (${target}): envío verificado por último mensaje (id: ${res.messageId || 'sin id'}, ack: ${res.ack ?? '?'}, type: ${res.last?.type || '?'}, via: ${res.last?.via || '?'}, revisados: ${res.checked ?? '?'}, total en chat: ${res.totalMsgs ?? '?'})`);
+  } else if (res?.stuck) {
+    // v5.3.37 — Aviso distinto para el atasco en ack=0: el mensaje
+    // existe pero WhatsApp no lo aceptó; no se reintenta (duplicaría).
+    logger.warn(`WhatsApp (${target}): envío ATASCADO en ack=0 (id: ${res.messageId || 'sin id'}, ack: ${res.ack ?? 0}): ${res?.reason || 'el mensaje existe pero WhatsApp no lo aceptó'} (último: fromMe=${res?.last?.fromMe}, remitente=${res?.last?.sender || '?'}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'}, total en chat: ${res?.totalMsgs ?? '?'})`);
   } else {
-    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, idFromMe=${res?.last?.idFromMe}, remitente=${res?.last?.sender || '?'}, type=${res?.last?.type || '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'}, total en chat: ${res?.totalMsgs ?? '?'})`);
+    logger.warn(`WhatsApp (${target}): verificación por último mensaje no confirmó el envío: ${res?.reason || 'sin motivo'} (último: fromMe=${res?.last?.fromMe}, idFromMe=${res?.last?.idFromMe}, remitente=${res?.last?.sender || '?'}, type=${res?.last?.type || '?'}, ack del último: ${res?.last?.ack ?? '?'}, hace ${res?.last?.tDelta ?? '?'} s, revisados: ${res?.checked ?? '?'}, total en chat: ${res?.totalMsgs ?? '?'})`);
   }
   return res || { ok: false, reason: 'sin resultado' };
 }
@@ -997,12 +1145,25 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   // ningún otro camino. Solo si no aparece se prueba el siguiente. El
   // error final solo se reporta si TODOS los intentos verificaron que el
   // mensaje no salió.
+  // v5.3.37 — Excepción: si el mensaje SÍ aparece pero en ack=0
+  // (atascado, WhatsApp no lo aceptó), tampoco se prueba el siguiente
+  // camino: el mensaje ya existe en el chat y un segundo envío lo
+  // duplicaría si el primero se transmite después. La verificación exige
+  // ack>=1 para confirmar (ver sendWaByScan y verifyWaLastMessage) y el
+  // atasco se devuelve como fallo con stuck:true (el bot lo deja en
+  // Últimos eventos como aviso, en vez del falso éxito anterior).
   const verifyAfterAttempt = async (tag) => {
     await sleep(2000);
     const v = await verifyWaLastMessage(waClients[target].client, target, { digits, lid, content, media }).catch(() => null);
     if (v?.ok) logger.info(`WhatsApp (${target}): envío confirmado tras intento ${tag} (id: ${v.messageId || 'sin id'})`);
     return v;
   };
+  // v5.3.37 — Un envío atascado en ack=0 NO se reintenta por otro camino:
+  // el mensaje ya existe en el chat y un segundo envío lo duplicaría si
+  // el primero se transmite después. Se devuelve el fallo tal cual para
+  // que el llamador lo registre (botSay lo deja en Últimos eventos como
+  // aviso; el envío manual lo muestra en el chat).
+  const stuckResult = (messageId, error) => ({ ok: false, stuck: true, channel: 'qr', instance: target, messageId: messageId ? waMsgSerializedId({ id: messageId }) : null, error: error || 'El mensaje quedó pendiente (ack 0): WhatsApp no lo aceptó (sesión no viva o red caída); no se reintenta para no duplicarlo' });
   // v5.3.21 — Diagnóstico: con medio, registrar qué archivo es antes de
   // intentar el envío (mimetype y tamaño), para que el próximo log muestre
   // qué foto/video falló.
@@ -1011,10 +1172,13 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   if (scanRes?.ok) {
     return { ok: true, channel: 'qr', instance: target, messageId: scanRes.messageId ? waMsgSerializedId({ id: scanRes.messageId }) : null };
   }
+  // v5.3.37 — Atascado en ack=0: no se verifica ni se reintenta por id.
+  if (scanRes?.stuck) return stuckResult(scanRes.messageId, scanRes.error);
   let v = await verifyAfterAttempt('escaneo');
   if (v?.ok) {
     return { ok: true, channel: 'qr', instance: target, messageId: v.messageId ? waMsgSerializedId({ id: v.messageId }) : null };
   }
+  if (v?.stuck) return stuckResult(v.messageId, v.reason);
   let lastError = null;
   let idAttemptReturnedUndefined = false;
   for (const chatId of chatIds) {
@@ -1045,6 +1209,7 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
       if (v?.ok) {
         return { ok: true, channel: 'qr', instance: target, messageId: v.messageId ? waMsgSerializedId({ id: v.messageId }) : null };
       }
+      if (v?.stuck) return stuckResult(v.messageId, v.reason);
       if (!WA_GETTER_ERROR.test(m)) break; // otro error: probar el otro id no ayudaría
       continue; // error del getter: probar con el otro chatId
     }
@@ -1062,6 +1227,7 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
       if (v?.ok) {
         return { ok: true, channel: 'qr', instance: target, messageId: v.messageId ? waMsgSerializedId({ id: v.messageId }) : null };
       }
+      if (v?.stuck) return stuckResult(v.messageId, v.reason);
       continue; // probar con el otro chatId, si lo hay
     }
     logger.info(`WhatsApp (${target}): mensaje enviado al chat ${chatId}`);
@@ -1075,6 +1241,7 @@ async function sendWhatsAppMessage({ phone, content, channel = 'qr', instanceId 
   if (verified?.ok) {
     return { ok: true, channel: 'qr', instance: target, messageId: verified.messageId ? waMsgSerializedId({ id: verified.messageId }) : null };
   }
+  if (verified?.stuck) return stuckResult(verified.messageId, verified.reason);
   // Error final: los intentos por id devolvieron undefined sin poder
   // confirmar; la verificación por escaneo no encontró el mensaje, así
   // que se reporta como no confirmado (no como "chat no encontrado": el
