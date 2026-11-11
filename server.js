@@ -47,7 +47,7 @@ const logger = {
 // salen por Telegram, que es el único canal que sigue funcionando cuando
 // WhatsApp está caído (avisar por WhatsApp de que WhatsApp está caído
 // no tiene sentido).
-const APP_VERSION = '5.3.38';
+const APP_VERSION = '5.3.39';
 const SERVER_STARTED_AT = Date.now();
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -342,6 +342,52 @@ async function getMetaConfig() {
     verifyTokenConfigured: Boolean(META_WA_VERIFY_TOKEN),
     appSecretConfigured: Boolean(META_WA_APP_SECRET),
   };
+}
+
+// v5.3.39 — Listado de grupos por ESCANEO de la colección de chats
+// (en vez de client.getChats()). El log de producción del 2026-11-10
+// probó que `getChats()` lanza "r" para esta identidad LID: toca
+// getters internos (chat.serialize()/formattedTitle/...) que fallan, y
+// el catch devolvía ese "r" crudo al navegador ("Error: r"). En cambio
+// el escaneo directo de la colección SÍ funciona en esta cuenta (lo
+// usan a diario el envío por escaneo y su verificación). Por eso la
+// lista de grupos se lee igual: `Chat.getModelsArray()` en la página,
+// con cada chat en su propio try/catch (un chat raro nunca tumba la
+// lista) y solo campos seguros: id serializado, nombre y nº de
+// participantes. `scanWaGroupsInPage` no cierra sobre nada de Node
+// (solo `window.require`): se pasa tal cual a pupPage.evaluate y la
+// prueba la extrae del server.js real con un `window` simulado.
+// Devuelve { groups: [{id, name, participants}], totalChats, error }.
+async function scanWaGroupsInPage() {
+  const out = { groups: [], totalChats: 0, error: null };
+  let chats = null;
+  try {
+    chats = window.require('WAWebCollections').Chat.getModelsArray();
+  } catch (e) {
+    out.error = 'escaneo de chats lanzó: ' + (e && e.message);
+    return out;
+  }
+  out.totalChats = chats ? chats.length : 0;
+  for (const c of chats || []) {
+    try {
+      const id = c && c.id;
+      const ser = id && (id._serialized || id.$1);
+      if (!ser || !ser.endsWith('@g.us')) continue;
+      let name = 'Grupo sin nombre';
+      try { const n = c.name; if (typeof n === 'string' && n.trim()) name = n.trim(); } catch (e) { /* nombre ilegible */ }
+      let participants = 0;
+      try {
+        const p = c.groupMetadata && c.groupMetadata.participants;
+        if (Array.isArray(p)) participants = p.length;
+      } catch (e) { participants = 0; }
+      out.groups.push({ id: ser, name, participants });
+    } catch (e) { /* un chat raro no tumba la lista */ }
+  }
+  return out;
+}
+
+async function listWaGroupsByScan(client, target) {
+  return client.pupPage.evaluate(scanWaGroupsInPage);
 }
 
 // v5.3.11 — Envío por ESCANEO de la lista de chats (en vez de buscar el
@@ -4886,22 +4932,34 @@ app.get('/api/wa/instances', requireAdmin, (req, res) => {
 // Solo admin. Sin instancia QR lista, error claro (no lista vacía
 // engañosa: una lista vacía con WhatsApp caído parecería que no
 // hay grupos).
+// v5.3.39 — La lista se lee por ESCANEO de la colección, no con
+// client.getChats(): sus getters lanzan "r" para esta identidad LID y
+// el usuario veía "Error: r". Si el escaneo falla, error legible en
+// español (el error real queda en el log del servidor, nunca el "r"
+// crudo en la pantalla).
 app.get('/api/wa/groups', requireAdmin, async (req, res) => {
   try {
     const target = Object.keys(waClients).find((k) => waClients[k].status === 'ready' && waClients[k].channel !== 'meta' && waClients[k].client);
     if (!target) return res.status(503).json({ error: 'Ninguna instancia de WhatsApp por QR lista: conecta WhatsApp primero' });
-    const chats = await waClients[target].client.getChats();
-    const groups = (chats || [])
-      .filter((c) => c && c.isGroup)
-      .map((c) => ({
-        id: (c.id && (c.id._serialized || c.id.$1)) || '',
-        name: c.name || 'Grupo sin nombre',
-        participants: Array.isArray(c.participants) ? c.participants.length : 0,
-      }))
-      .filter((g) => g.id.endsWith('@g.us'))
+    let scan;
+    try {
+      scan = await listWaGroupsByScan(waClients[target].client, target);
+    } catch (e) {
+      logger.warn(`WhatsApp (${target}): no se pudo escanear los grupos: ${e?.message || e}`);
+      return res.status(500).json({ error: 'WhatsApp no devolvió la lista de grupos; reintenta en unos segundos' });
+    }
+    if (!scan || scan.error) {
+      logger.warn(`WhatsApp (${target}): el escaneo de grupos falló: ${scan?.error || 'sin resultado'}`);
+      return res.status(500).json({ error: 'WhatsApp no devolvió la lista de grupos; reintenta en unos segundos' });
+    }
+    const groups = (scan.groups || [])
+      .filter((g) => g && typeof g.id === 'string' && g.id.endsWith('@g.us'))
       .sort((a, b) => a.name.localeCompare(b.name, 'es'));
     res.json({ groups, instance: target });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    logger.warn(`WhatsApp: error listando grupos: ${err?.message || err}`);
+    res.status(500).json({ error: 'WhatsApp no devolvió la lista de grupos; reintenta en unos segundos' });
+  }
 });
 
 // v5.3.38 Prueba del aviso: envía el mensaje de prueba al grupo
